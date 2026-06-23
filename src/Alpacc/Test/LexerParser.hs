@@ -24,6 +24,7 @@ import Data.ByteString.Internal
 import Data.Either.Extra
 import Data.Foldable
 import Data.List (zip4)
+import Data.Array (Array, listArray, bounds, (!))
 import Data.Map (Map)
 import Data.Map qualified as Map hiding (Map)
 import Data.Maybe
@@ -191,86 +192,94 @@ computeMinTokenBytesMap dfa_lexer =
           visited' = Set.union visited (Set.fromList (fst <$> toList neighbors))
        in go (queue <> neighbors) visited' result'
 
+-- | Precomputed DFA structures shared across all per-token random walks.
+-- Stores per-state valid transitions as arrays for O(1) random access,
+-- and per-token accepting state sets for O(log n) membership tests.
+data WalkEnv s = WalkEnv
+  { weInitial :: s
+  , weTrans :: Map (s, Word8) s
+  , weTokenAccepting :: Map T (Set s)
+  , weValidTrans :: Map s (Array Int (Word8, s))
+  }
+
+mkWalkEnv :: (Ord s) => DFALexer Word8 s T -> WalkEnv s
+mkWalkEnv dfa_lexer = WalkEnv
+  { weInitial = initial dfa
+  , weTrans = tr
+  , weTokenAccepting = Map.fromListWith Set.union
+      [(tok, Set.singleton s) | (s, tok) <- Map.toList (tokenMap dfa_lexer)
+                               , Set.member s (accepting dfa)]
+  , weValidTrans = Map.fromList
+      [ (s, listArray (0, length xs - 1) xs)
+      | (s, xs) <- Map.toList validByState ]
+  }
+  where
+    dfa = fsa dfa_lexer
+    tr  = transitions' dfa
+    prod = producesToken dfa_lexer
+    validByState = Map.fromListWith (++)
+      [ (s, [(sym, s')])
+      | ((s, sym), s') <- Map.toList tr
+      , not ((s, sym) `Set.member` prod)
+      ]
+
 -- | Attempt a single random walk that produces a byte sequence lexing to
 -- @tok@.  To stay within the right DFA subgraph, the walk replays the minimum
 -- path up to (but not including) its last byte, then continues randomly from
--- that interior state.  At each accepting state it accepts early with
--- probability 1/3; otherwise it biases toward non-accepting next states so
--- it explores interior characters rather than immediately re-closing.
+-- that interior state.  Stop probability increases linearly with steps so path
+-- lengths are roughly uniformly distributed up to @maxSteps@.
 randomWalkToToken ::
   (Ord s, RandomGen g) =>
-  DFALexer Word8 s T ->
+  WalkEnv s ->
   T ->
   [Word8] ->
   Int ->
   g ->
   (Maybe [Word8], g)
-randomWalkToToken dfa_lexer tok min_path maxSteps g0 =
+randomWalkToToken env tok min_path maxSteps g0 =
   let prefix = if null min_path then [] else init min_path
-      start_state = foldl' stepDFA initial_state prefix
+      start_state = foldl' stepDFA (weInitial env) prefix
    in walk g0 start_state 0 (reverse prefix)
   where
-    dfa = fsa dfa_lexer
-    initial_state = initial dfa
-    trans = transitions' dfa
-
-    stepDFA s sym = Map.findWithDefault s (s, sym) trans
-    accept_states = accepting dfa
-    token_map = tokenMap dfa_lexer
-    produces = producesToken dfa_lexer
-
-    trans_by_state =
-      Map.fromListWith
-        Map.union
-        [ (s, Map.singleton sym s')
-        | ((s, sym), s') <- Map.toList trans
-        ]
-
-    isAcceptingForTok s =
-      Set.member s accept_states
-        && Map.lookup s token_map == Just tok
+    stepDFA s sym = Map.findWithDefault s (s, sym) (weTrans env)
+    tokAccepting = Map.findWithDefault Set.empty tok (weTokenAccepting env)
+    isOk s = Set.member s tokAccepting
+    emptyArr = listArray (0, -1) []
+    validArr s = Map.findWithDefault emptyArr s (weValidTrans env)
 
     walk g state steps acc
       | steps >= maxSteps =
-          if isAcceptingForTok state
-            then (Just (reverse acc), g)
-            else (Nothing, g)
-      | isAcceptingForTok state =
-          -- Stop with probability steps/maxSteps so short paths are unlikely
-          -- and paths near the budget are almost certain to stop.  This gives a
-          -- roughly uniform distribution over path lengths rather than a
-          -- geometric one.  We bias toward non-accepting next states so the
-          -- walk explores token interiors (e.g. string content) rather than
-          -- closing immediately.
-          let valid = validTransitions state
-           in if null valid
+          if isOk state then (Just (reverse acc), g) else (Nothing, g)
+      | isOk state =
+          let arr = validArr state
+              n   = snd (bounds arr) + 1
+           in if n == 0
                 then (Just (reverse acc), g)
                 else
                   let (r, g') = randomR (0 :: Int, maxSteps - 1) g
                    in if r < steps
                         then (Just (reverse acc), g')
                         else
-                          let nonAccept = filter (not . isAcceptingForTok . snd) valid
-                              candidates = if null nonAccept then valid else nonAccept
-                           in pickAndStep g' acc steps candidates
+                          let (i, g'') = randomR (0, n - 1) g'
+                              (sym, ns)  = arr ! i
+                           in if isOk ns
+                                then
+                                  let nonAcceptIdxs = [j | j <- [0..n-1], not (isOk (snd (arr!j)))]
+                                   in if null nonAcceptIdxs
+                                        then walk g'' ns (steps + 1) (sym : acc)
+                                        else let (j, g''') = randomR (0, length nonAcceptIdxs - 1) g''
+                                                 (sym', ns') = arr ! (nonAcceptIdxs !! j)
+                                              in walk g''' ns' (steps + 1) (sym' : acc)
+                                else walk g'' ns (steps + 1) (sym : acc)
       | otherwise =
-          let valid = validTransitions state
-           in if null valid
+          let arr = validArr state
+              n   = snd (bounds arr) + 1
+           in if n == 0
                 then (Nothing, g)
-                else pickAndStep g acc steps valid
-
-    validTransitions state =
-      [ (sym, s')
-      | (sym, s') <-
-          Map.toList $
-            Map.findWithDefault Map.empty state trans_by_state,
-        not ((state, sym) `Set.member` produces)
-      ]
-
-    pickAndStep g acc steps valid =
-      let (idx, g') = randomR (0, length valid - 1) g
-          (sym, next_state) = valid !! idx
-       in walk g' next_state (steps + 1) (sym : acc)
+                else
+                  let (i, g') = randomR (0, n - 1) g
+                      (sym, ns) = arr ! i
+                   in walk g' ns (steps + 1) (sym : acc)
 
 -- | Generate input bytes for a single token, always using the shortest
 -- (minimum) path.  Used as a fallback when the byte budget is exhausted.
@@ -294,15 +303,12 @@ generateSingleLongLexerParserInput ::
 generateSingleLongLexerParserInput len _alpha dfa_lexer grammar =
   let gen = mkStdGen randomSeed
       min_map = computeMinTokenBytesMap dfa_lexer
+      env = mkWalkEnv dfa_lexer
       maxPathBytes = 16
       (gen2, derivedTerminals) = generateRandomDerivation gen len grammar
       tokens = mapMaybe unaug derivedTerminals
       minCosts = map (length . minTokenBytes min_map) tokens
       totalMin = sum minCosts
-      -- Only enforce a byte budget when the minimum derivation is shorter than
-      -- len (i.e. we need to pad with longer tokens to reach len).  When
-      -- totalMin >= len the grammar already produces enough bytes on its own, so
-      -- we just walk each token freely up to maxPathBytes.
       needsBudget = totalMin < len
       byteTarget = len
       suffixMins = drop 1 $ scanr (+) 0 minCosts
@@ -316,7 +322,7 @@ generateSingleLongLexerParserInput len _alpha dfa_lexer grammar =
                 else
                   let minPath = minTokenBytes min_map tok
                       maxSteps = max (length minPath) maxPathBytes
-                      (mpath, g') = randomWalkToToken dfa_lexer tok minPath maxSteps g
+                      (mpath, g') = randomWalkToToken env tok minPath maxSteps g
                       bs = case mpath of Just p -> p; Nothing -> minPath
                    in (g', used + length bs, bs : acc)
           )
