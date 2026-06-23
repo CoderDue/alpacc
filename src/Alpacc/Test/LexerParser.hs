@@ -236,18 +236,18 @@ randomWalkToToken dfa_lexer tok min_path maxSteps g0 =
             then (Just (reverse acc), g)
             else (Nothing, g)
       | isAcceptingForTok state =
-          -- Accept early with probability 1/3; otherwise prefer transitions
-          -- that lead away from accepting states so we explore token interiors
-          -- (e.g. characters inside a string) rather than terminating again
-          -- immediately.  We only apply this bias from an accepting state —
-          -- from a non-accepting interior state we allow all transitions
-          -- including the one that closes the token.
+          -- Stop with probability steps/maxSteps so short paths are unlikely
+          -- and paths near the budget are almost certain to stop.  This gives a
+          -- roughly uniform distribution over path lengths rather than a
+          -- geometric one.  We bias toward non-accepting next states so the
+          -- walk explores token interiors (e.g. string content) rather than
+          -- closing immediately.
           let valid = validTransitions state
            in if null valid
                 then (Just (reverse acc), g)
                 else
-                  let (r, g') = randomR (0 :: Int, 2) g
-                   in if r == 0
+                  let (r, g') = randomR (0 :: Int, maxSteps - 1) g
+                   in if r < steps
                         then (Just (reverse acc), g')
                         else
                           let nonAccept = filter (not . isAcceptingForTok . snd) valid
@@ -272,53 +272,6 @@ randomWalkToToken dfa_lexer tok min_path maxSteps g0 =
           (sym, next_state) = valid !! idx
        in walk g' next_state (steps + 1) (sym : acc)
 
--- | For each token, precompute @numPaths@ random byte paths through the DFA
--- that lex to that token.  Each path is produced by a random walk; walks
--- that fail (dead-end before reaching an accepting state) are discarded.
--- The minimum (BFS shortest) path is always prepended so every token has at
--- least one entry.
-buildTokenPaths ::
-  (Ord s, RandomGen g) =>
-  DFALexer Word8 s T ->
-  Map T [Word8] ->
-  Int ->
-  g ->
-  (Map T [[Word8]], g)
-buildTokenPaths dfa_lexer min_map numPaths g0 =
-  foldl' step (Map.empty, g0) (Map.keys min_map)
-  where
-    maxSteps = 128
-
-    step (acc, g) tok =
-      let minPath = Map.findWithDefault [] tok min_map
-          (paths, g') = collect tok minPath g numPaths []
-          allPaths = minPath : paths
-       in (Map.insert tok allPaths acc, g')
-
-    collect _tok _minPath g' 0 acc = (acc, g')
-    collect tok minPath g' n acc =
-      let (mpath, g'') = randomWalkToToken dfa_lexer tok minPath maxSteps g'
-       in case mpath of
-            Just p -> collect tok minPath g'' (n - 1) (p : acc)
-            Nothing -> collect tok minPath g'' (n - 1) acc
-
--- | Generate input bytes for a single token.  Picks one of the precomputed
--- random paths at random using the threaded generator.
-pickTokenBytes ::
-  (RandomGen g) =>
-  Map T [[Word8]] ->
-  Map T [Word8] ->
-  g ->
-  T ->
-  ([Word8], g)
-pickTokenBytes paths_map min_map g tok =
-  case Map.lookup tok paths_map of
-    Nothing -> (Map.findWithDefault [] tok min_map, g)
-    Just [] -> (Map.findWithDefault [] tok min_map, g)
-    Just ps ->
-      let (idx, g') = randomR (0, length ps - 1) g
-       in (ps !! idx, g')
-
 -- | Generate input bytes for a single token, always using the shortest
 -- (minimum) path.  Used as a fallback when the byte budget is exhausted.
 minTokenBytes :: Map T [Word8] -> T -> [Word8]
@@ -340,32 +293,31 @@ generateSingleLongLexerParserInput ::
   [Word8]
 generateSingleLongLexerParserInput len _alpha dfa_lexer grammar =
   let gen = mkStdGen randomSeed
-      -- Split so that path generation and derivation use independent streams.
-      (genDerive, genPaths) = split gen
       min_map = computeMinTokenBytesMap dfa_lexer
-      numPaths = 16
-      (gen2, derivedTerminals) = generateRandomDerivation genDerive len grammar
+      maxPathBytes = 16
+      (gen2, derivedTerminals) = generateRandomDerivation gen len grammar
       tokens = mapMaybe unaug derivedTerminals
-      (paths_map, gen3) = buildTokenPaths dfa_lexer min_map numPaths genPaths
-      -- Precompute the minimum byte cost for every token in the sequence so we
-      -- can answer "how many bytes do we still need at minimum" in O(1) via a
-      -- suffix sum.
       minCosts = map (length . minTokenBytes min_map) tokens
       totalMin = sum minCosts
-      -- byteTarget is the desired output byte length.  If the minimum
-      -- derivation already exceeds len, use totalMin so we at least emit
-      -- the minimum without triggering the budget on every token.
-      byteTarget = max len totalMin
+      -- Only enforce a byte budget when the minimum derivation is shorter than
+      -- len (i.e. we need to pad with longer tokens to reach len).  When
+      -- totalMin >= len the grammar already produces enough bytes on its own, so
+      -- we just walk each token freely up to maxPathBytes.
+      needsBudget = totalMin < len
+      byteTarget = len
       suffixMins = drop 1 $ scanr (+) 0 minCosts
       (_, _, bytesRev) =
         foldl'
           ( \(g, used, acc) (tok, remainingMin) ->
-              if used + remainingMin > byteTarget
+              if needsBudget && used + remainingMin > byteTarget
                 then
                   let bs = minTokenBytes min_map tok
                    in (g, used + length bs, bs : acc)
                 else
-                  let (bs, g') = pickTokenBytes paths_map min_map g tok
+                  let minPath = minTokenBytes min_map tok
+                      maxSteps = max (length minPath) maxPathBytes
+                      (mpath, g') = randomWalkToToken dfa_lexer tok minPath maxSteps g
+                      bs = case mpath of Just p -> p; Nothing -> minPath
                    in (g', used + length bs, bs : acc)
           )
           (gen2, 0, [])
