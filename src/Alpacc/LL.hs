@@ -713,37 +713,36 @@ generateRandomDerivation ::
   (g, [t])
 generateRandomDerivation gen targetLen grammar =
   let initialSymbols = [Nonterminal $ start grammar]
-   in derive gen 0 initialSymbols
+      prod_map = toProductionsMap $ productions grammar
+      recursive = canDeriveRecursively grammar
+      minCounts = minTerminalCounts grammar
+   in derive prod_map recursive minCounts gen 0 initialSymbols
   where
-    derive g _ [] = (g, [])
-    derive g termCount (Terminal t : syms) =
-      let (g', rest) = derive g (termCount + 1) syms
+    derive _ _ _ g _ [] = (g, [])
+    derive prod_map recursive minCounts g termCount (Terminal t : syms) =
+      let (g', rest) = derive prod_map recursive minCounts g (termCount + 1) syms
        in (g', t : rest)
-    derive g termCount (Nonterminal nt : syms) =
-      let prod_map = toProductionsMap $ productions grammar
-          recursive = canDeriveRecursively grammar
-          rhss = Map.findWithDefault [] nt prod_map
+    derive prod_map recursive minCounts g termCount (Nonterminal nt : syms) =
+      let rhss = Map.findWithDefault [] nt prod_map
        in if null rhss
-            then derive g termCount syms
+            then derive prod_map recursive minCounts g termCount syms
             else
               let remaining = targetLen - termCount
-                  -- Choose production based on remaining length
                   shouldExpand = remaining > 5 && nt `Set.member` recursive
                   chosen =
                     if shouldExpand
-                      then chooseExpanding g rhss
-                      else chooseContracting g remaining rhss
+                      then chooseExpanding recursive g rhss
+                      else chooseContracting minCounts g remaining rhss
                   (g', rhs) = chosen
                   newSymbols = rhs ++ syms
-               in derive g' termCount newSymbols
+               in derive prod_map recursive minCounts g' termCount newSymbols
 
     -- Choose a production, preferring recursive ones only half the time so
     -- that leaf productions (e.g. string/number/null) are selected regularly.
     -- This prevents unbounded nesting from consuming the entire budget before
     -- sibling nonterminals (e.g. FS1/EL1) have a chance to expand.
-    chooseExpanding g rhss =
-      let recursive = canDeriveRecursively grammar
-          expandable = filter (hasRecursiveNT recursive) rhss
+    chooseExpanding recursive g rhss =
+      let expandable = filter (hasRecursiveNT recursive) rhss
           (r, g') = randomR (0 :: Int, 1) g
           useExpand = r == 1
           candidates = if null expandable || not useExpand then rhss else expandable
@@ -754,9 +753,8 @@ generateRandomDerivation gen targetLen grammar =
     -- randomly among all fitting candidates rather than always the minimum.
     -- This allows multi-element arrays/objects to be generated when budget
     -- permits, instead of always collapsing to epsilon.
-    chooseContracting g remaining rhss =
-      let minCounts = minTerminalCounts grammar
-          countsWithRhs = [(rhsCount minCounts rhs, rhs) | rhs <- rhss]
+    chooseContracting minCounts g remaining rhss =
+      let countsWithRhs = [(rhsCount minCounts rhs, rhs) | rhs <- rhss]
           validCounts = [(c, rhs) | (Just c, rhs) <- countsWithRhs]
           -- Prefer productions that fit within the remaining budget; fall back
           -- to the minimum-count production(s) if nothing fits.

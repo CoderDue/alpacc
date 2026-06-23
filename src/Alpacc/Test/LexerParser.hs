@@ -17,7 +17,6 @@ import Alpacc.Test.Lexer (TestMode (..), randomSeed)
 import Alpacc.Util
 import Codec.Binary.UTF8.String (encodeChar)
 import Control.Monad
-import Data.Array (Array, bounds, listArray, (!))
 import Data.Bifunctor
 import Data.Binary
 import Data.ByteString qualified as ByteString
@@ -30,6 +29,7 @@ import Data.Map qualified as Map hiding (Map)
 import Data.Maybe
 import Data.Sequence (Seq (..))
 import Data.Sequence qualified as Seq hiding (Seq (..), (<|), (><), (|>))
+import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -148,16 +148,13 @@ parse cfg q k str = do
   where
     toTuple (Lexeme t m) = (t, m)
 
--- | Compute the shortest byte sequence that lexes to each token in
--- the DFA.  Uses BFS from the initial state, following only original
--- (non-producing) transitions so that the accumulated bytes never
--- cross a token boundary.
-computeTokenBytesMap ::
+-- | Compute the shortest byte sequence that lexes to each token using BFS.
+-- Used for budget accounting and as a fallback when the byte budget is tight.
+computeMinTokenBytesMap ::
   (Ord s) =>
-  Set.Set Word8 ->
   DFALexer Word8 s T ->
   Map T [Word8]
-computeTokenBytesMap _alpha dfa_lexer =
+computeMinTokenBytesMap dfa_lexer =
   go (Seq.singleton (initial_state, [])) (Set.singleton initial_state) Map.empty
   where
     dfa = fsa dfa_lexer
@@ -194,114 +191,189 @@ computeTokenBytesMap _alpha dfa_lexer =
           visited' = Set.union visited (Set.fromList (fst <$> toList neighbors))
        in go (queue <> neighbors) visited' result'
 
--- | Compute the per-token budget for extra self-loop characters.
--- Distributes the total target length evenly across the token list.
-calculateMaxExtra :: Int -> [a] -> Int
-calculateMaxExtra len tokens = max 1 (len `div` max 1 (length tokens))
-
--- | Generate a varied-length byte sequence that the DFA lexer will
--- lex as the given token. The minimum (shortest) path to the
--- accepting state is taken as a baseline; at each intermediate state
--- that has self-loop transitions (i.e. transitions on some symbol
--- that lead back to the same state) extra characters are randomly
--- inserted. This produces non-trivial token values such as non-empty
--- strings, multi-digit numbers, etc.
---
--- The @maxExtra@ parameter bounds the total number of inserted
--- characters so the function always terminates. The updated generator
--- is also returned so callers can thread randomness across multiple
--- tokens.
-generateVariedTokenBytes ::
+-- | Attempt a single random walk that produces a byte sequence lexing to
+-- @tok@.  To stay within the right DFA subgraph, the walk replays the minimum
+-- path up to (but not including) its last byte, then continues randomly from
+-- that interior state.  At each accepting state it accepts early with
+-- probability 1/3; otherwise it biases toward non-accepting next states so
+-- it explores interior characters rather than immediately re-closing.
+randomWalkToToken ::
   (Ord s, RandomGen g) =>
-  Map T [Word8] ->
-  Map s (Array Int Word8) ->
-  g ->
-  Int ->
-  T ->
-  Set.Set Word8 ->
   DFALexer Word8 s T ->
-  ([Word8], g)
-generateVariedTokenBytes token_bytes_map self_loop_map gen maxExtra tok _alpha dfa_lexer =
-  go gen initial_state 0 [] min_bytes
+  T ->
+  [Word8] ->
+  Int ->
+  g ->
+  (Maybe [Word8], g)
+randomWalkToToken dfa_lexer tok min_path maxSteps g0 =
+  let prefix = if null min_path then [] else init min_path
+      start_state = foldl' stepDFA initial_state prefix
+   in walk g0 start_state 0 (reverse prefix)
   where
-    min_bytes = Map.findWithDefault [] tok token_bytes_map
-    dfa_fsa = fsa dfa_lexer
-    trans = transitions' dfa_fsa
+    dfa = fsa dfa_lexer
+    initial_state = initial dfa
+    trans = transitions' dfa
 
-    initial_state = initial dfa_fsa
+    stepDFA s sym = Map.findWithDefault s (s, sym) trans
+    accept_states = accepting dfa
+    token_map = tokenMap dfa_lexer
+    produces = producesToken dfa_lexer
 
-    emptyArr = listArray (0, -1) []
+    trans_by_state =
+      Map.fromListWith
+        Map.union
+        [ (s, Map.singleton sym s')
+        | ((s, sym), s') <- Map.toList trans
+        ]
 
-    selfLoops state = Map.findWithDefault emptyArr state self_loop_map
+    isAcceptingForTok s =
+      Set.member s accept_states
+        && Map.lookup s token_map == Just tok
 
-    go g _state _extraSoFar acc [] = (reverse acc, g)
-    go g state extraSoFar acc (sym : rest) =
-      let loops = selfLoops state
-          (g', new_count, extra) = addLoops g extraSoFar loops
-          next_state = Map.findWithDefault state (state, sym) trans
-          new_acc = sym : foldl' (flip (:)) acc extra
-       in go g' next_state new_count new_acc rest
-
-    addLoops g count loops
-      | count >= maxExtra = (g, count, [])
-      | n == 0 = (g, count, [])
+    walk g state steps acc
+      | steps >= maxSteps =
+          if isAcceptingForTok state
+            then (Just (reverse acc), g)
+            else (Nothing, g)
+      | isAcceptingForTok state =
+          -- Accept early with probability 1/3; otherwise prefer transitions
+          -- that lead away from accepting states so we explore token interiors
+          -- (e.g. characters inside a string) rather than terminating again
+          -- immediately.  We only apply this bias from an accepting state —
+          -- from a non-accepting interior state we allow all transitions
+          -- including the one that closes the token.
+          let valid = validTransitions state
+           in if null valid
+                then (Just (reverse acc), g)
+                else
+                  let (r, g') = randomR (0 :: Int, 2) g
+                   in if r == 0
+                        then (Just (reverse acc), g')
+                        else
+                          let nonAccept = filter (not . isAcceptingForTok . snd) valid
+                              candidates = if null nonAccept then valid else nonAccept
+                           in pickAndStep g' acc steps candidates
       | otherwise =
-          let (r, g') = randomR (0 :: Int, 2) g
-           in if r == 0
-                then
-                  let (idx, g'') = randomR (0, n - 1) g'
-                      sym = loops ! idx
-                      (g''', new_count, more) = addLoops g'' (count + 1) loops
-                   in (g''', new_count, sym : more)
-                else (g', count, [])
-      where
-        (lo, hi) = bounds loops
-        n = hi - lo + 1
+          let valid = validTransitions state
+           in if null valid
+                then (Nothing, g)
+                else pickAndStep g acc steps valid
 
--- | DFS based approach to generating input. This generates a valid
--- token sequence efficiently and then generates byte sequences that
--- will lex to those tokens.
+    validTransitions state =
+      [ (sym, s')
+      | (sym, s') <-
+          Map.toList $
+            Map.findWithDefault Map.empty state trans_by_state,
+        not ((state, sym) `Set.member` produces)
+      ]
+
+    pickAndStep g acc steps valid =
+      let (idx, g') = randomR (0, length valid - 1) g
+          (sym, next_state) = valid !! idx
+       in walk g' next_state (steps + 1) (sym : acc)
+
+-- | For each token, precompute @numPaths@ random byte paths through the DFA
+-- that lex to that token.  Each path is produced by a random walk; walks
+-- that fail (dead-end before reaching an accepting state) are discarded.
+-- The minimum (BFS shortest) path is always prepended so every token has at
+-- least one entry.
+buildTokenPaths ::
+  (Ord s, RandomGen g) =>
+  DFALexer Word8 s T ->
+  Map T [Word8] ->
+  Int ->
+  g ->
+  (Map T [[Word8]], g)
+buildTokenPaths dfa_lexer min_map numPaths g0 =
+  foldl' step (Map.empty, g0) (Map.keys min_map)
+  where
+    maxSteps = 128
+
+    step (acc, g) tok =
+      let minPath = Map.findWithDefault [] tok min_map
+          (paths, g') = collect tok minPath g numPaths []
+          allPaths = minPath : paths
+       in (Map.insert tok allPaths acc, g')
+
+    collect _tok _minPath g' 0 acc = (acc, g')
+    collect tok minPath g' n acc =
+      let (mpath, g'') = randomWalkToToken dfa_lexer tok minPath maxSteps g'
+       in case mpath of
+            Just p -> collect tok minPath g'' (n - 1) (p : acc)
+            Nothing -> collect tok minPath g'' (n - 1) acc
+
+-- | Generate input bytes for a single token.  Picks one of the precomputed
+-- random paths at random using the threaded generator.
+pickTokenBytes ::
+  (RandomGen g) =>
+  Map T [[Word8]] ->
+  Map T [Word8] ->
+  g ->
+  T ->
+  ([Word8], g)
+pickTokenBytes paths_map min_map g tok =
+  case Map.lookup tok paths_map of
+    Nothing -> (Map.findWithDefault [] tok min_map, g)
+    Just [] -> (Map.findWithDefault [] tok min_map, g)
+    Just ps ->
+      let (idx, g') = randomR (0, length ps - 1) g
+       in (ps !! idx, g')
+
+-- | Generate input bytes for a single token, always using the shortest
+-- (minimum) path.  Used as a fallback when the byte budget is exhausted.
+minTokenBytes :: Map T [Word8] -> T -> [Word8]
+minTokenBytes min_map tok = Map.findWithDefault [] tok min_map
+
+-- | DFS based approach to generating input. Derives a random token sequence
+-- from the grammar, then assigns byte sequences to each token.
+--
+-- Before assigning bytes to each token a budget check is performed:
+-- if the bytes already generated plus the minimum bytes still needed for the
+-- remaining tokens would exceed @len@, the rest of the tokens are given their
+-- minimum byte representation so the total stays within budget.
 generateSingleLongLexerParserInput ::
   (Ord s, Ord nt, Show nt) =>
   Int ->
-  Set.Set Word8 ->
+  Set Word8 ->
   DFALexer Word8 s T ->
   Grammar (AugmentedNonterminal (Symbol nt T)) (AugmentedTerminal (Unused T)) ->
   [Word8]
-generateSingleLongLexerParserInput len alpha dfa_lexer grammar =
+generateSingleLongLexerParserInput len _alpha dfa_lexer grammar =
   let gen = mkStdGen randomSeed
-      token_bytes_map = computeTokenBytesMap alpha dfa_lexer
-      trans = transitions' $ fsa dfa_lexer
-      produces = producesToken dfa_lexer
-      self_loop_map =
-        Map.map (\xs -> listArray (0, length xs - 1) xs) $
-          Map.fromListWith
-            (++)
-            [ (s, [sym])
-            | ((s, sym), s') <- Map.toList trans,
-              s == s',
-              not ((s, sym) `Set.member` produces)
-            ]
-
-      unaug (AugmentedTerminal (Used t)) = Just t
-      unaug _ = Nothing
-
-      -- Find terminals that are in both the lexer and the grammar
-      (gen2, derivedTerminals) = generateRandomDerivation gen len grammar
+      -- Split so that path generation and derivation use independent streams.
+      (genDerive, genPaths) = split gen
+      min_map = computeMinTokenBytesMap dfa_lexer
+      numPaths = 16
+      (gen2, derivedTerminals) = generateRandomDerivation genDerive len grammar
       tokens = mapMaybe unaug derivedTerminals
-
-      -- Generate varied bytes for each token, threading the generator
-      -- so each occurrence gets different content (e.g. non-empty strings).
-      maxExtra = calculateMaxExtra len tokens
-      (_, bytesRev) =
-        foldl
-          ( \(g, acc) tok ->
-              let (bs, g') = generateVariedTokenBytes token_bytes_map self_loop_map g maxExtra tok alpha dfa_lexer
-               in (g', bs : acc)
+      (paths_map, gen3) = buildTokenPaths dfa_lexer min_map numPaths genPaths
+      -- Precompute the minimum byte cost for every token in the sequence so we
+      -- can answer "how many bytes do we still need at minimum" in O(1) via a
+      -- suffix sum.
+      minCosts = map (length . minTokenBytes min_map) tokens
+      totalMin = sum minCosts
+      -- byteTarget is the desired output byte length.  If the minimum
+      -- derivation already exceeds len, use totalMin so we at least emit
+      -- the minimum without triggering the budget on every token.
+      byteTarget = max len totalMin
+      suffixMins = drop 1 $ scanr (+) 0 minCosts
+      (_, _, bytesRev) =
+        foldl'
+          ( \(g, used, acc) (tok, remainingMin) ->
+              if used + remainingMin > byteTarget
+                then
+                  let bs = minTokenBytes min_map tok
+                   in (g, used + length bs, bs : acc)
+                else
+                  let (bs, g') = pickTokenBytes paths_map min_map g tok
+                   in (g', used + length bs, bs : acc)
           )
-          (gen2, [])
-          tokens
+          (gen2, 0, [])
+          (zip tokens suffixMins)
    in concat (reverse bytesRev)
+  where
+    unaug (AugmentedTerminal (Used t)) = Just t
+    unaug _ = Nothing
 
 lexerParserTests :: TestMode -> CFG -> Int -> Either Text (ByteString, ByteString)
 lexerParserTests mode cfg n = do
