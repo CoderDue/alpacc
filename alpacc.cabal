@@ -22,6 +22,10 @@ extra-source-files:
   cuda/scan.cu
   cuda/pse.cu
   cuda/parser.cu
+  cuda/cli.cu
+  c/parser.c
+  c/lexer.c
+  c/cli.c
 
 library
   default-language:   GHC2021
@@ -76,6 +80,9 @@ library
     Alpacc.Generator.Futhark.Parser
     Alpacc.Generator.Futhark.Futharkify
     Alpacc.Generator.Futhark.Generator
+    Alpacc.Generator.C.Generator
+    Alpacc.Generator.C.Lexer
+    Alpacc.Generator.C.Parser
     Alpacc.Generator.Cuda.Cudafy
     Alpacc.Generator.Cuda.Generator
     Alpacc.Generator.Cuda.Lexer

@@ -34,28 +34,30 @@ using bracket_t = #{cudafy bracket_type};
 const size_t Q = #{cudafy q};
 const size_t K = #{cudafy k};
 const terminal_t EMPTY_TERMINAL = #{cudafy $ terminalCast empty_terminal};
+const terminal_t START_TERMINAL = #{cudafy $ terminalCast start_terminal};
+const terminal_t END_TERMINAL = #{cudafy $ terminalCast end_terminal};
 const size_t NUMBER_OF_PRODUCTIONS = #{cudafy number_of_productions};
-const terminal_t PRODUCTION_TO_TERMINAL[NUMBER_OF_PRODUCTIONS] =
+__device__ const terminal_t PRODUCTION_TO_TERMINAL[NUMBER_OF_PRODUCTIONS] =
   #{cudafy $ map terminalCast production_to_tertminal};
-const bool PRODUCTION_TO_TERMINAL_IS_VALID[NUMBER_OF_PRODUCTIONS] =
+__device__ const bool PRODUCTION_TO_TERMINAL_IS_VALID[NUMBER_OF_PRODUCTIONS] =
   #{cudafy production_to_tertminal_is_valid};
-const size_t PRODUCTION_TO_ARITY[NUMBER_OF_PRODUCTIONS] =
+__device__ const size_t PRODUCTION_TO_ARITY[NUMBER_OF_PRODUCTIONS] =
   #{ari};
 const size_t HASH_TABLE_SIZE = #{cudafy $ length $ oaArray oa};
 const size_t MAX_ITERS = #{cudafy $ oaMaxIters oa};
 const size_t PRODUCTIONS_SIZE = #{cudafy productions_size};
 const size_t STACKS_SIZE = #{cudafy stacks_size};
-const bracket_t STACKS[STACKS_SIZE] =
+__device__ const bracket_t STACKS[STACKS_SIZE] =
   #{cudafy stacks};
-const size_t PRODUCTIONS[STACKS_SIZE] =
+__device__ const production_t PRODUCTIONS[PRODUCTIONS_SIZE] =
   #{cudafy productions};
-const bool HASH_TABLE_IS_VALID[HASH_TABLE_SIZE] =
+__device__ const bool HASH_TABLE_IS_VALID[HASH_TABLE_SIZE] =
   #{cudafy hash_table_is_valid};
-const terminal_t HASH_TABLE_KEYS[HASH_TABLE_SIZE][Q + K] =
+__device__ const terminal_t HASH_TABLE_KEYS[HASH_TABLE_SIZE][Q + K] =
   #{cudafy $ map (map terminalCast) hash_table_keys};
-const size_t HASH_TABLE_STACKS_SPAN[HASH_TABLE_SIZE][2] =
+__device__ const int64_t HASH_TABLE_STACKS_SPAN[HASH_TABLE_SIZE][2] =
   #{cudafy hash_table_stacks_span};
-const size_t HASH_TABLE_PRODUCTIONS_SPAN[HASH_TABLE_SIZE][2] =
+__device__ const int64_t HASH_TABLE_PRODUCTIONS_SPAN[HASH_TABLE_SIZE][2] =
   #{cudafy hash_table_productions_span};
 |]
     <> cudaParser
@@ -65,6 +67,8 @@ const size_t HASH_TABLE_PRODUCTIONS_SPAN[HASH_TABLE_SIZE][2] =
     q = lookback parser
     k = lookahead parser
     empty_terminal = emptyTerminal parser
+    start_terminal = startTerminal parser
+    end_terminal = endTerminal parser
     number_of_productions = numberOfProductions parser
     production_to_tertminal = fromMaybe 0 <$> productionToTerminal parser
     production_to_tertminal_is_valid = isJust <$> productionToTerminal parser

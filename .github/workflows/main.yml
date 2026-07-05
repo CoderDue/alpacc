@@ -116,6 +116,9 @@ jobs:
       - name: Futhark parser tests (3 3)
         run: bash tests/testfuthark.sh 3 3 50 10 --parser
 
+      - name: Futhark end-to-end tests (0 1)
+        run: bash tests/testfuthark.sh 0 1 50 10
+
       - name: Futhark end-to-end tests (1 1)
         run: bash tests/testfuthark.sh 1 1 50 10
 
@@ -124,6 +127,33 @@ jobs:
 
       - name: Futhark end-to-end tests (3 3)
         run: bash tests/testfuthark.sh 3 3 50 10
+
+      - name: C lexer tests
+        run: bash tests/testc.sh 0 0 50 10 --lexer
+
+      - name: C parser tests (0 1)
+        run: bash tests/testc.sh 0 1 50 10 --parser
+
+      - name: C parser tests (1 1)
+        run: bash tests/testc.sh 1 1 50 10 --parser
+
+      - name: C parser tests (2 2)
+        run: bash tests/testc.sh 2 2 50 10 --parser
+
+      - name: C parser tests (3 3)
+        run: bash tests/testc.sh 3 3 50 10 --parser
+
+      - name: C end-to-end tests (0 1)
+        run: bash tests/testc.sh 0 1 50 10
+
+      - name: C end-to-end tests (1 1)
+        run: bash tests/testc.sh 1 1 50 10
+
+      - name: C end-to-end tests (2 2)
+        run: bash tests/testc.sh 2 2 50 10
+
+      - name: C end-to-end tests (3 3)
+        run: bash tests/testc.sh 3 3 50 10
 
       - name: JSON grammar tests with multicore backend
         run: |

@@ -9,7 +9,6 @@ import Alpacc.Generator.Cuda.Lexer qualified as Lexer
 import Alpacc.Generator.Cuda.Parser qualified as Parser
 import Alpacc.Types
 import Data.FileEmbed
-import Data.String.Interpolate (i)
 import Data.Text (Text)
 import Data.Text qualified as Text hiding (Text)
 
@@ -19,6 +18,9 @@ common =
     [ $(embedStringFile "cuda/common.cu"),
       $(embedStringFile "cuda/scan.cu")
     ]
+
+cudaCli :: Text
+cudaCli = $(embedStringFile "cuda/cli.cu")
 
 generateTerminals :: UInt -> [Text] -> Text
 generateTerminals terminal_type terminal_names =
@@ -32,48 +34,32 @@ auxiliary analyzer =
     Lex lexer ->
       Text.unlines
         [ Text.unlines (("// " <>) <$> meta analyzer),
+          "#define HAS_LEXER",
           common,
           generateTerminals terminal_type terminal_names,
           Lexer.generateLexer lexer,
-          Text.pack
-            [i|
-int main(int32_t argc, char *argv[]) {
-  constexpr uint32_t SHARED_MEMORY = 49152;
-  
-  #ifdef DEBUG
-    constexpr uint32_t BLOCK_SIZE = 32;
-    constexpr uint32_t CHUNK_SIZE = 64;
-    constexpr uint32_t ITEMS_PER_THREAD = 2;
-  #else
-    constexpr uint32_t BLOCK_SIZE = 256;
-    constexpr uint32_t CHUNK_SIZE = 100 * (1 << 20); // 100 MiB
-    constexpr uint32_t ITEMS_PER_THREAD = 
-        calculate_lexer_max_items_per_thread<uint32_t, state_t, BLOCK_SIZE, SHARED_MEMORY>();
-  #endif
-  
-  return lexer_stream<WriteAscii, CHUNK_SIZE, BLOCK_SIZE, ITEMS_PER_THREAD>(WriteAscii());
-}|]
+          cudaCli
         ]
     Parse parser ->
       Text.unlines
         [ Text.unlines (("// " <>) <$> meta analyzer),
+          "#define HAS_PARSER",
           common,
           generateTerminals terminal_type terminal_names,
           Parser.generateParser parser,
-          Text.pack
-            [i|
-|]
+          cudaCli
         ]
     Both lexer parser ->
       Text.unlines
         [ Text.unlines (("// " <>) <$> meta analyzer),
+          "#define HAS_LEXER",
+          "#define HAS_PARSER",
+          "#define HAS_RAW_INPUT",
           common,
           generateTerminals terminal_type terminal_names,
           Lexer.generateLexer lexer,
           Parser.generateParser parser,
-          Text.pack
-            [i|
-|]
+          cudaCli
         ]
   where
     terminal_type = terminalType analyzer

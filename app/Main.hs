@@ -7,6 +7,7 @@ import Alpacc.Generator.Analyzer
     mkLexerParser,
     mkParser,
   )
+import Alpacc.Generator.C.Generator qualified as C
 import Alpacc.Generator.Cuda.Generator qualified as Cuda
 import Alpacc.Generator.Futhark.Generator qualified as Futhark
 import Alpacc.Random qualified as Random
@@ -25,6 +26,7 @@ import Prelude hiding (last)
 data Backend
   = Futhark
   | CUDA
+  | C
   deriving (Show)
 
 data Input
@@ -290,6 +292,7 @@ commands =
   subparser
     ( command "futhark" (info (generatorParameters Futhark) (progDesc "Generate parsers written in Futhark."))
         <> command "cuda" (info (generatorParameters CUDA) (progDesc "Generate parsers written in CUDA."))
+        <> command "c" (info (generatorParameters C) (progDesc "Generate parsers written in C."))
         <> command "random" (info randomParameters (progDesc "Generate random parser that can be used for testing."))
         <> command "test" (info testCommands (progDesc "Test related commands."))
     )
@@ -313,6 +316,7 @@ extension backend =
   case backend of
     CUDA -> ".cu"
     Futhark -> ".fut"
+    C -> ".c"
 
 outputPath :: Backend -> Maybe String -> Input -> String
 outputPath backend output input =
@@ -335,6 +339,9 @@ readContents input =
     FileInput path -> TextIO.readFile path
 
 generateProgram :: Backend -> Gen -> CFG -> Either Text Text
+generateProgram C GenParser cfg = generate C.generator <$> mkParser cfg
+generateProgram C GenLexer cfg = generate C.generator <$> mkLexer cfg
+generateProgram C GenBoth cfg = generate C.generator <$> mkLexerParser cfg
 generateProgram backend generator cfg =
   case generator of
     GenBoth -> generate gen <$> mkLexerParser cfg
