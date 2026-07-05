@@ -14,6 +14,9 @@ import Data.String.Interpolate (i)
 import Data.Text (Text)
 import Data.Text qualified as Text
 
+cudaPse :: Text
+cudaPse = $(embedStringFile "cuda/pse.cu")
+
 cudaParser :: Text
 cudaParser = $(embedStringFile "cuda/parser.cu")
 
@@ -23,7 +26,8 @@ terminalCast a =
 
 generateParser :: Parser -> Text
 generateParser parser =
-  (Text.strip . Text.pack)
+  cudaPse
+    <> (Text.strip . Text.pack)
     [i|
 using production_t = #{cudafy production_type};
 using bracket_t = #{cudafy bracket_type};

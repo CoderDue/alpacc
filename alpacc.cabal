@@ -19,6 +19,8 @@ extra-source-files:
   futhark/test.fut
   cuda/lexer.cu
   cuda/common.cu
+  cuda/scan.cu
+  cuda/pse.cu
   cuda/parser.cu
 
 library

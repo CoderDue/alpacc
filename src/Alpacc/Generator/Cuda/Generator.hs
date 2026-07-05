@@ -14,7 +14,11 @@ import Data.Text (Text)
 import Data.Text qualified as Text hiding (Text)
 
 common :: Text
-common = $(embedStringFile "cuda/common.cu")
+common =
+  Text.unlines
+    [ $(embedStringFile "cuda/common.cu"),
+      $(embedStringFile "cuda/scan.cu")
+    ]
 
 generateTerminals :: UInt -> [Text] -> Text
 generateTerminals terminal_type terminal_names =
