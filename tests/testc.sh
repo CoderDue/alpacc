@@ -20,6 +20,8 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     show_usage; exit 0
 fi
 
+export PATH="$HOME/bin:$PATH"
+
 q_value="${1:-1}"
 k_value="${2:-1}"
 target="${3:-10}"
