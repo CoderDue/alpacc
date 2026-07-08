@@ -1,17 +1,26 @@
-// parser.cu — staged LLP parser kernels (Stages 1–3), appended by the code
-// generator after common.cu, scan.cu, pse.cu, and the grammar constants.
+// parser.cu — fused single-kernel LLP parser, appended by the code generator
+// after common.cu, scan.cu, pse.cu, and the grammar constants.
 //
-// Stage 1: per-position hash-table key lookup (FNV-1a + linear probe),
-//          produces (stack_len, prod_len) pairs and a validity flag.
-//          Two separate inclusive scans (one per component) give offsets.
-// Stage 2: segmented copy of STACKS spans (brackets), ±1 depth inclusive
-//          scan with validity check, PSE(<=) via runSPT for bracket matching,
-//          bracket symbol comparison.
-// Stage 3: segmented copy of PRODUCTIONS spans into the output array.
+// The whole pipeline runs in ONE cooperative kernel (parserFusedKernel),
+// launched via cudaLaunchCooperativeKernel with grid.sync() between phases:
 //
-// All kernels are templated on an index type I (uint32_t or size_t).
-// Span values (HASH_TABLE_{STACKS,PRODUCTIONS}_SPAN) are int64_t to match
-// the -1 sentinel used by the Futhark and C backends.
+//   Phase A: per-position hash-table key lookup (FNV-1a + linear probe)
+//            → per-position stack/production lengths and spans.
+//   Phase B: cooperative exclusive scans of both length arrays
+//            (tile-hierarchical: per-tile block scan → single-block scan of
+//            tile aggregates → add prefixes) → offsets and totals.
+//   Phase C: segmented copies of STACKS spans (brackets + ±1 deltas) and
+//            PRODUCTIONS spans into their compacted output arrays.
+//   Phase D: cooperative inclusive scan of the deltas → depths; validity
+//            check (no negative prefix, last must be 0).
+//   Phase E: PSE(<=) over depths via apsepDeviceSPT (pse.cu), which is
+//            itself structured as grid.sync() phases.
+//   Phase F: bracket symbol check of each right bracket against its match.
+//
+// Compacted layout: buffer capacity is bounded by
+// m * MAX_BRACKETS_PER_POSITION / m * MAX_PRODS_PER_POSITION (the maximal
+// hash-table span sizes emitted by the generator), but all per-element work
+// runs over the exact totals computed in Phase B.
 //
 // Binary I/O (same protocol as c/parser.c and `alpacc test compare --parser`):
 //   inputs:  u64 BE num_tests; per test: u64 BE n + n×u64 BE terminal ids
@@ -22,35 +31,42 @@
 #include <limits>
 #include <cstdint>
 #include <cstring>
+#include <climits>
+#include <algorithm>
 
 // ---------------------------------------------------------------------------
-// Stage 1: combined key-lookup + span materialisation kernel
+// Fused kernel configuration
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t FUSED_BS  = 256;  // block size (also the scan tile size)
+constexpr int      FUSED_IPT = 4;    // SPT items per thread (logical B = 1024)
+
+// ---------------------------------------------------------------------------
+// Bracket helpers
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ bool bracket_is_left(bracket_t b) {
+    return (b >> (8 * (int)sizeof(bracket_t) - 1)) & 1;
+}
+
+__device__ __forceinline__ bracket_t bracket_unpack(bracket_t b) {
+    return b & (bracket_t)~((bracket_t)1 << (8 * (int)sizeof(bracket_t) - 1));
+}
+
+// ---------------------------------------------------------------------------
+// Phase A helper: hash-table lookup for position i.
 //
-// One thread per position i in [0, m), m = n + 2.
 // Builds the Q+K window key with sentinel-extended addressing:
 //   d_arr[0] = START_TERMINAL, d_arr[1..n] = tokens, d_arr[n+1] = END_TERMINAL.
 // FNV-1a hash, linear probe up to MAX_ITERS slots.
-// Writes stack_len into d_slens[i], prod_len into d_plens[i], and the raw
-// int64_t spans d_ss/d_se/d_ps/d_pe (needed for Stages 2 & 3 segmented copies).
-// Sets *d_valid = 0 atomically on any miss or invalid span.
+// Returns true iff a key with valid spans was found.
 // ---------------------------------------------------------------------------
 
 template<typename I>
-__global__ void
-parserKeysSpans(const terminal_t* __restrict__ d_arr,
-                I                              m,
-                I*                             d_slens,   // stack segment lengths
-                I*                             d_plens,   // prod segment lengths
-                int64_t* __restrict__          d_ss,
-                int64_t* __restrict__          d_se,
-                int64_t* __restrict__          d_ps,
-                int64_t* __restrict__          d_pe,
-                int*                           d_valid)
+__device__ bool
+lookupSpans(const terminal_t* __restrict__ d_arr, I m, I i,
+            int64_t& ss, int64_t& se, int64_t& ps, int64_t& pe)
 {
-    I i = (I)blockIdx.x * (I)blockDim.x + (I)threadIdx.x;
-    if (i >= m) return;
-
-    // Build key with sentinel padding
     terminal_t key[Q + K];
 #pragma unroll
     for (size_t j = 0; j < Q + K; j++) {
@@ -58,15 +74,12 @@ parserKeysSpans(const terminal_t* __restrict__ d_arr,
         key[j] = (idx < 0 || idx >= (int64_t)m) ? EMPTY_TERMINAL : d_arr[(I)idx];
     }
 
-    // FNV-1a
     uint64_t h = 14695981039346656037ULL;
     for (size_t j = 0; j < Q + K; j++)
         h = (h ^ (uint64_t)key[j]) * 1099511628211ULL;
     h %= (uint64_t)HASH_TABLE_SIZE;
 
-    // Linear probe
-    bool    found = false;
-    int64_t ss = -1, se = -1, ps = -1, pe = -1;
+    ss = se = ps = pe = -1;
     for (size_t it = 0; it < MAX_ITERS; it++) {
         size_t slot = (size_t)h;
         if (HASH_TABLE_IS_VALID[slot]) {
@@ -80,218 +93,207 @@ parserKeysSpans(const terminal_t* __restrict__ d_arr,
                 se = HASH_TABLE_STACKS_SPAN[slot][1];
                 ps = HASH_TABLE_PRODUCTIONS_SPAN[slot][0];
                 pe = HASH_TABLE_PRODUCTIONS_SPAN[slot][1];
-                found = true;
-                break;
+                return ss >= 0 && se >= 0 && ps >= 0 && pe >= 0;
             }
         }
         h = (h + 1) % (uint64_t)HASH_TABLE_SIZE;
     }
-
-    bool valid = found && ss >= 0 && se >= 0 && ps >= 0 && pe >= 0;
-    if (!valid) atomicAnd(d_valid, 0);
-
-    d_slens[i] = valid ? (I)(se - ss) : (I)0;
-    d_plens[i] = valid ? (I)(pe - ps) : (I)0;
-    d_ss[i] = ss; d_se[i] = se;
-    d_ps[i] = ps; d_pe[i] = pe;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
-// Stage 1: inclusive scan of I-typed lengths using scan.cu's Add<I> operator.
-// One kernel per array (stack lengths and prod lengths scanned separately).
-// ---------------------------------------------------------------------------
-
-// inclusiveScanIKernel: scan T-typed data using uint32_t for block indices.
-// T is the element type (uint32_t or size_t), must be compatible with Add<T>
-// and assignable through volatile pointers (primitives only).
-template<typename T, uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
-__global__ void
-inclusiveScanIKernel(T*                          d_data,
-                     States<uint32_t, T>          states,
-                     volatile uint32_t*            d_dyn_idx,
-                     uint64_t                      total64)
-{
-    constexpr uint32_t N = BLOCK_SIZE * ITEMS_PER_THREAD;
-    __shared__ volatile T shmem[N];
-    __shared__ volatile T shmem_aux[BLOCK_SIZE];
-
-    uint32_t dyn_idx = dynamicIndex(d_dyn_idx);
-    uint64_t glb_offs = (uint64_t)dyn_idx * N;
-
-    for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
-        uint32_t lid = i * BLOCK_SIZE + threadIdx.x;
-        uint64_t gid = glb_offs + lid;
-        shmem[lid] = (gid < total64) ? d_data[gid] : (T)0;
-    }
-    __syncthreads();
-
-    scan<T, uint32_t, Add<T>, (uint32_t)ITEMS_PER_THREAD>(
-        shmem, shmem_aux, states, Add<T>(), (T)0, dyn_idx);
-
-    for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
-        uint32_t lid = i * BLOCK_SIZE + threadIdx.x;
-        uint64_t gid = glb_offs + lid;
-        if (gid < total64) d_data[gid] = shmem[lid];
-    }
-}
-
-// Specialisation for uint32_t (used by runInclusiveScanI32 for depths scan)
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
-__global__ void
-inclusiveScanI32Kernel(int32_t*                    d_data,
-                       States<uint32_t, int32_t>   states,
-                       volatile uint32_t*           d_dyn_idx,
-                       uint32_t                     total)
-{
-    constexpr uint32_t N = BLOCK_SIZE * ITEMS_PER_THREAD;
-    __shared__ volatile int32_t shmem[N];
-    __shared__ volatile int32_t shmem_aux[BLOCK_SIZE];
-
-    uint32_t dyn_idx = dynamicIndex(d_dyn_idx);
-    uint32_t glb_offs = dyn_idx * N;
-
-    for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
-        uint32_t lid = i * BLOCK_SIZE + threadIdx.x;
-        uint32_t gid = glb_offs + lid;
-        shmem[lid] = (gid < total) ? d_data[gid] : (int32_t)0;
-    }
-    __syncthreads();
-
-    scan<int32_t, uint32_t, Add<int32_t>, (uint32_t)ITEMS_PER_THREAD>(
-        shmem, shmem_aux, states, Add<int32_t>(), (int32_t)0, dyn_idx);
-
-    for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
-        uint32_t lid = i * BLOCK_SIZE + threadIdx.x;
-        uint32_t gid = glb_offs + lid;
-        if (gid < total) d_data[gid] = shmem[lid];
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Stage 1: convert inclusive scan → exclusive offsets, capture total
-// ---------------------------------------------------------------------------
-
-template<typename I>
-__global__ void
-inclusiveToExclusive(const I* __restrict__ d_inc,
-                     I*                    d_exc,
-                     I                     total,
-                     I*                    d_last)
-{
-    I i = (I)blockIdx.x * (I)blockDim.x + (I)threadIdx.x;
-    if (i >= total) return;
-    d_exc[i] = (i == (I)0) ? (I)0 : d_inc[i - (I)1];
-    if (i == total - (I)1) *d_last = d_inc[i];
-}
-
-// ---------------------------------------------------------------------------
-// Stage 2a: segmented copy of STACKS spans → d_brackets
+// Cooperative scan building blocks (tile-hierarchical, grid.sync() driven).
 //
-// One thread per position i; copies STACKS[ss..se) to d_brackets[offset..].
+// A tile is FUSED_BS consecutive elements, one tile per block iteration.
+// Pass 1: per-tile inclusive block scan of d_in into d_out (tile-local
+//         values only) and the tile aggregate into d_agg[tile].
+//         Safe with d_in == d_out (in-place).
+// Pass 2: block 0 turns d_agg into its inclusive scan, chunk by chunk with a
+//         sequential carry (num_tiles is small: n / FUSED_BS).
+// The caller grid.sync()s between and after the passes and then combines
+// tile-local values with d_agg[tile-1] element-wise.
+// ---------------------------------------------------------------------------
+
+template<typename T, typename N>
+__device__ void
+coopScanPass1(const T* __restrict__ d_in, T* d_out, T* d_agg, N n)
+{
+    __shared__ volatile T sh[FUSED_BS];
+    const N num_tiles = (n + (N)FUSED_BS - (N)1) / (N)FUSED_BS;
+    for (N tile = (N)blockIdx.x; tile < num_tiles; tile += (N)gridDim.x) {
+        N gid = tile * (N)FUSED_BS + (N)threadIdx.x;
+        sh[threadIdx.x] = (gid < n) ? d_in[gid] : (T)0;
+        __syncthreads();
+        scanBlock<T, uint32_t, Add<T>>(sh, Add<T>());
+        if (gid < n) d_out[gid] = sh[threadIdx.x];
+        if (threadIdx.x == FUSED_BS - 1) d_agg[tile] = sh[threadIdx.x];
+        __syncthreads();
+    }
+}
+
+template<typename T, typename N>
+__device__ void
+coopScanPass2(T* d_agg, N num_tiles)
+{
+    if (blockIdx.x != 0) return;
+    __shared__ volatile T sh[FUSED_BS];
+    T carry = (T)0;
+    for (N base = (N)0; base < num_tiles; base += (N)FUSED_BS) {
+        N idx = base + (N)threadIdx.x;
+        sh[threadIdx.x] = (idx < num_tiles) ? d_agg[idx] : (T)0;
+        __syncthreads();
+        scanBlock<T, uint32_t, Add<T>>(sh, Add<T>());
+        if (idx < num_tiles) d_agg[idx] = carry + sh[threadIdx.x];
+        T chunk_total = sh[FUSED_BS - 1];
+        __syncthreads();
+        carry += chunk_total;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fused kernel parameter block (passed by value through
+// cudaLaunchCooperativeKernel).  Capacities:
+//   max_bk = m * MAX_BRACKETS_PER_POSITION   (brackets, deltas, match)
+//   max_pr = m * MAX_PRODS_PER_POSITION      (productions)
+// ---------------------------------------------------------------------------
+
+template<typename I>
+struct FusedBufs {
+    const terminal_t* d_arr;        // [m] sentinel-extended tokens
+    I                 m;
+
+    I*       d_slens;               // [m] per-position stack lengths
+    I*       d_plens;               // [m] per-position production lengths
+    int64_t* d_ss;                  // [m] STACKS span begin (end = begin + slen)
+    int64_t* d_ps;                  // [m] PRODUCTIONS span begin (end = begin + plen)
+    I*       d_soffsets;            // [m] exclusive bracket offsets
+    I*       d_poffsets;            // [m] exclusive production offsets
+    I*       d_agg_s;               // [ceil(m/FUSED_BS)] scan scratch
+    I*       d_agg_p;               // [ceil(m/FUSED_BS)] scan scratch
+    I*       d_totals;              // [2] num_brackets, num_prods
+
+    bracket_t* d_brackets;          // [max_bk]
+    int32_t*   d_scan32;            // [max_bk] deltas → inclusive scan → depths
+    int32_t*   d_agg_d;             // [ceil(max_bk/FUSED_BS)] scan scratch
+    int*       d_match;             // [max_bk] PSE result
+
+    production_t* d_productions;    // [max_pr]
+
+    int* d_valid;
+
+    // SPT (PSE) scratch, sized for max_bk elements
+    unsigned* d_unres;
+    int32_t*  d_block_mins;
+    int32_t*  d_block_warp_mins;
+    int32_t*  d_tree;
+    int32_t*  d_prefix_min;
+};
+
+// ---------------------------------------------------------------------------
+// The fused cooperative kernel
 // ---------------------------------------------------------------------------
 
 template<typename I>
 __global__ void
-parserStacks(const I* __restrict__          d_soffsets,  // exclusive scan of stack lens
-             const int64_t* __restrict__    d_ss,
-             const int64_t* __restrict__    d_se,
-             bracket_t*                     d_brackets,
-             I                              m)
+parserFusedKernel(FusedBufs<I> b)
 {
-    I i = (I)blockIdx.x * (I)blockDim.x + (I)threadIdx.x;
-    if (i >= m) return;
-    I   off = d_soffsets[i];
-    int64_t ss = d_ss[i], se = d_se[i];
-    for (int64_t j = ss; j < se; j++)
-        d_brackets[off + (I)(j - ss)] = STACKS[j];
+    cg::grid_group grid = cg::this_grid();
+    const I m     = b.m;
+    const I grank = (I)grid.thread_rank();
+    const I gsz   = (I)grid.size();
+
+    // ---- Phase A: key lookup + span materialisation ----
+    for (I i = grank; i < m; i += gsz) {
+        int64_t ss, se, ps, pe;
+        bool valid = lookupSpans<I>(b.d_arr, m, i, ss, se, ps, pe);
+        if (!valid) atomicAnd(b.d_valid, 0);
+        b.d_slens[i] = valid ? (I)(se - ss) : (I)0;
+        b.d_plens[i] = valid ? (I)(pe - ps) : (I)0;
+        b.d_ss[i] = ss;
+        b.d_ps[i] = ps;
+    }
+    grid.sync();
+
+    // ---- Phase B: cooperative scans of both length arrays ----
+    const I num_tiles_m = (m + (I)FUSED_BS - (I)1) / (I)FUSED_BS;
+    coopScanPass1<I, I>(b.d_slens, b.d_soffsets, b.d_agg_s, m);
+    coopScanPass1<I, I>(b.d_plens, b.d_poffsets, b.d_agg_p, m);
+    grid.sync();
+    coopScanPass2<I, I>(b.d_agg_s, num_tiles_m);
+    coopScanPass2<I, I>(b.d_agg_p, num_tiles_m);
+    grid.sync();
+
+    const I num_brackets = b.d_agg_s[num_tiles_m - 1];
+    const I num_prods    = b.d_agg_p[num_tiles_m - 1];
+    if (grank == 0) {
+        b.d_totals[0] = num_brackets;
+        b.d_totals[1] = num_prods;
+    }
+
+    // ---- Phase C: segmented copies (brackets + deltas, productions) ----
+    // Exclusive offsets computed on the fly from the inclusive per-tile scan
+    // values and the tile aggregate prefix (saves a full fixup sweep + sync).
+    for (I i = grank; i < m; i += gsz) {
+        I tile  = i / (I)FUSED_BS;
+        I slen  = b.d_slens[i];
+        I plen  = b.d_plens[i];
+        I soff  = ((tile > 0) ? b.d_agg_s[tile - 1] : (I)0) + b.d_soffsets[i] - slen;
+        int64_t ss = b.d_ss[i];
+        for (I j = 0; j < slen; j++) {
+            bracket_t bk = STACKS[ss + (int64_t)j];
+            I k = soff + j;
+            b.d_brackets[k] = bk;
+            b.d_scan32[k]   = bracket_is_left(bk) ? (int32_t)1 : (int32_t)-1;
+        }
+        I poff  = ((tile > 0) ? b.d_agg_p[tile - 1] : (I)0) + b.d_poffsets[i] - plen;
+        int64_t ps = b.d_ps[i];
+        for (I j = 0; j < plen; j++)
+            b.d_productions[poff + j] = PRODUCTIONS[ps + (int64_t)j];
+    }
+    grid.sync();
+
+    if (num_brackets == (I)0) return;   // grid-uniform: no bracket work
+
+    // ---- Phase D: inclusive delta scan → depths + validity ----
+    const I num_tiles_b = (num_brackets + (I)FUSED_BS - (I)1) / (I)FUSED_BS;
+    coopScanPass1<int32_t, I>(b.d_scan32, b.d_scan32, b.d_agg_d, num_brackets);
+    grid.sync();
+    coopScanPass2<int32_t, I>(b.d_agg_d, num_tiles_b);
+    grid.sync();
+    for (I i = grank; i < num_brackets; i += gsz) {
+        I tile = i / (I)FUSED_BS;
+        int32_t s = b.d_scan32[i] + ((tile > 0) ? b.d_agg_d[tile - 1] : 0);
+        if (s < 0) atomicAnd(b.d_valid, 0);
+        if (i == num_brackets - (I)1 && s != 0) atomicAnd(b.d_valid, 0);
+        b.d_scan32[i] = s - (bracket_is_left(b.d_brackets[i]) ? 1 : 0);  // depth
+    }
+    grid.sync();
+
+    // ---- Phase E: PSE(<=) over depths (apsepDeviceSPT, pse.cu) ----
+    {
+        constexpr int B = (int)FUSED_BS * FUSED_IPT;
+        const int nb         = (int)num_brackets;   // host guarantees ≤ INT_MAX
+        const int spt_blocks = (nb + B - 1) / B;
+        int M = 1;
+        while (M < spt_blocks) M <<= 1;
+        apsepDeviceSPT<int32_t, (int)FUSED_BS, FUSED_IPT, true>(
+            grid, b.d_scan32, b.d_match, nb, spt_blocks, M, M - 1,
+            b.d_unres, b.d_block_mins, b.d_block_warp_mins,
+            b.d_tree, b.d_prefix_min);
+    }
+    grid.sync();
+
+    // ---- Phase F: bracket symbol check ----
+    for (I i = grank; i < num_brackets; i += gsz) {
+        if (bracket_is_left(b.d_brackets[i])) continue;
+        int j = b.d_match[i];
+        if (j < 0 || bracket_unpack(b.d_brackets[(I)j]) != bracket_unpack(b.d_brackets[i]))
+            atomicAnd(b.d_valid, 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Stage 2b: map brackets → ±1 depth deltas
-// ---------------------------------------------------------------------------
-
-__device__ __forceinline__ bool bracket_is_left(bracket_t b) {
-    return (b >> (8 * (int)sizeof(bracket_t) - 1)) & 1;
-}
-
-__device__ __forceinline__ bracket_t bracket_unpack(bracket_t b) {
-    return b & (bracket_t)~((bracket_t)1 << (8 * (int)sizeof(bracket_t) - 1));
-}
-
-template<typename I>
-__global__ void
-bracketsToDeltas(const bracket_t* __restrict__ d_brackets,
-                 int32_t*                      d_deltas,
-                 I                             num_brackets)
-{
-    I i = (I)blockIdx.x * (I)blockDim.x + (I)threadIdx.x;
-    if (i >= num_brackets) return;
-    d_deltas[i] = bracket_is_left(d_brackets[i]) ? (int32_t)1 : (int32_t)-1;
-}
-
-// ---------------------------------------------------------------------------
-// Stage 2b: compute depths + validity from inclusive scan
-//   depth_i = inclusive_scan_i - is_left_i
-//   validity: any prefix < 0, or last != 0 → invalid
-// ---------------------------------------------------------------------------
-
-template<typename I>
-__global__ void
-depthsAndValidate(const int32_t* __restrict__  d_scan,
-                  const bracket_t* __restrict__ d_brackets,
-                  int32_t*                      d_depths,
-                  int*                          d_valid,
-                  I                             num_brackets)
-{
-    I i = (I)blockIdx.x * (I)blockDim.x + (I)threadIdx.x;
-    if (i >= num_brackets) return;
-    int32_t s = d_scan[i];
-    if (s < 0) atomicAnd(d_valid, 0);
-    if (i == num_brackets - (I)1 && s != 0) atomicAnd(d_valid, 0);
-    d_depths[i] = s - (bracket_is_left(d_brackets[i]) ? 1 : 0);
-}
-
-// ---------------------------------------------------------------------------
-// Stage 2c: bracket symbol match check using PSE result
-// ---------------------------------------------------------------------------
-
-template<typename I>
-__global__ void
-checkBracketMatches(const bracket_t* __restrict__ d_brackets,
-                    const int* __restrict__        d_match,
-                    int*                           d_valid,
-                    I                              num_brackets)
-{
-    I i = (I)blockIdx.x * (I)blockDim.x + (I)threadIdx.x;
-    if (i >= num_brackets) return;
-    if (bracket_is_left(d_brackets[i])) return;
-    int j = d_match[i];
-    if (j < 0 || bracket_unpack(d_brackets[(I)j]) != bracket_unpack(d_brackets[i]))
-        atomicAnd(d_valid, 0);
-}
-
-// ---------------------------------------------------------------------------
-// Stage 3: segmented copy of PRODUCTIONS spans → d_productions
-// ---------------------------------------------------------------------------
-
-template<typename I>
-__global__ void
-parserProductions(const I* __restrict__          d_poffsets,  // exclusive scan of prod lens
-                  const int64_t* __restrict__    d_ps,
-                  const int64_t* __restrict__    d_pe,
-                  production_t*                  d_productions,
-                  I                              m)
-{
-    I i = (I)blockIdx.x * (I)blockDim.x + (I)threadIdx.x;
-    if (i >= m) return;
-    I   off = d_poffsets[i];
-    int64_t ps = d_ps[i], pe = d_pe[i];
-    for (int64_t j = ps; j < pe; j++)
-        d_productions[off + (I)(j - ps)] = PRODUCTIONS[j];
-}
-
-// ---------------------------------------------------------------------------
-// RAII wrapper for a device allocation
+// Host side: allocation, launch, readback
 // ---------------------------------------------------------------------------
 
 template<typename T>
@@ -308,210 +310,151 @@ struct DevBuf {
     const T* get() const { return ptr; }
 };
 
+template<typename I>
+struct ParserFused {
+    FusedBufs<I> bufs{};
+    terminal_t*  d_arr   = nullptr;   // owned; bufs.d_arr aliases it
+    uint32_t     P       = 0;         // cooperative grid size
+    I            max_m   = 0;
+    size_t       max_bk  = 0;
+    size_t       max_pr  = 0;
+};
 
-// ---------------------------------------------------------------------------
-// Helper: run inclusive scan of I in-place on a device array of length m.
-// Uses States<uint32_t, I> so the number of scan blocks must fit in uint32_t.
-// ---------------------------------------------------------------------------
+template<typename I>
+static ParserFused<I> allocParserFused(I max_m) {
+    constexpr size_t B = (size_t)FUSED_BS * FUSED_IPT;
+    constexpr size_t W = B / 32;
 
-template<typename T>
-static void runInclusiveScanI(T* d_data, uint64_t m) {
-    constexpr uint32_t BS  = 256;
-    constexpr uint32_t IPT = 4;
-    if (m == 0) return;
-    uint64_t nb64 = (m + (uint64_t)(BS * IPT) - 1) / (uint64_t)(BS * IPT);
-    uint32_t nb = (uint32_t)nb64;  // guarded by caller: num scan blocks fits in uint32_t
+    ParserFused<I> p;
+    p.max_m  = max_m;
+    p.max_bk = std::max<size_t>((size_t)max_m * MAX_BRACKETS_PER_POSITION, 1);
+    p.max_pr = std::max<size_t>((size_t)max_m * MAX_PRODS_PER_POSITION, 1);
 
-    DevBuf<uint32_t> dyn(1);
-    gpuAssert(cudaMemset(dyn.get(), 0, sizeof(uint32_t)));
+    const size_t tiles_m    = ((size_t)max_m + FUSED_BS - 1) / FUSED_BS;
+    const size_t tiles_bk   = (p.max_bk + FUSED_BS - 1) / FUSED_BS;
+    const size_t spt_blocks = (p.max_bk + B - 1) / B;
+    const size_t M          = (size_t)nextPow2((int)spt_blocks);
 
-    States<uint32_t, T> st(nb);
-    inclusiveScanIKernel<T, BS, IPT>
-        <<<nb, BS>>>(d_data, st, (volatile uint32_t*)dyn.get(), m);
+    FusedBufs<I>& b = p.bufs;
+    gpuAssert(cudaMalloc(&p.d_arr,        (size_t)max_m * sizeof(terminal_t)));
+    gpuAssert(cudaMalloc(&b.d_slens,      (size_t)max_m * sizeof(I)));
+    gpuAssert(cudaMalloc(&b.d_plens,      (size_t)max_m * sizeof(I)));
+    gpuAssert(cudaMalloc(&b.d_ss,         (size_t)max_m * sizeof(int64_t)));
+    gpuAssert(cudaMalloc(&b.d_ps,         (size_t)max_m * sizeof(int64_t)));
+    gpuAssert(cudaMalloc(&b.d_soffsets,   (size_t)max_m * sizeof(I)));
+    gpuAssert(cudaMalloc(&b.d_poffsets,   (size_t)max_m * sizeof(I)));
+    gpuAssert(cudaMalloc(&b.d_agg_s,      tiles_m * sizeof(I)));
+    gpuAssert(cudaMalloc(&b.d_agg_p,      tiles_m * sizeof(I)));
+    gpuAssert(cudaMalloc(&b.d_totals,     2 * sizeof(I)));
+    gpuAssert(cudaMalloc(&b.d_brackets,   p.max_bk * sizeof(bracket_t)));
+    gpuAssert(cudaMalloc(&b.d_scan32,     p.max_bk * sizeof(int32_t)));
+    gpuAssert(cudaMalloc(&b.d_agg_d,      tiles_bk * sizeof(int32_t)));
+    gpuAssert(cudaMalloc(&b.d_match,      p.max_bk * sizeof(int)));
+    gpuAssert(cudaMalloc(&b.d_productions, p.max_pr * sizeof(production_t)));
+    gpuAssert(cudaMalloc(&b.d_valid,      sizeof(int)));
+    gpuAssert(cudaMalloc(&b.d_unres,      spt_blocks * (B / 32) * sizeof(unsigned)));
+    gpuAssert(cudaMalloc(&b.d_block_mins, spt_blocks * sizeof(int32_t)));
+    gpuAssert(cudaMalloc(&b.d_block_warp_mins, spt_blocks * W * sizeof(int32_t)));
+    gpuAssert(cudaMalloc(&b.d_tree,       (2 * M - 1) * sizeof(int32_t)));
+    gpuAssert(cudaMalloc(&b.d_prefix_min, spt_blocks * sizeof(int32_t)));
+    b.d_arr = p.d_arr;
+
+    int bps = 0, sms = 0;
+    gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &bps, parserFusedKernel<I>, FUSED_BS, 0));
+    gpuAssert(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+    size_t needed = std::max<size_t>(std::max(tiles_m, tiles_bk), 1);
+    size_t resident = std::max<size_t>((size_t)bps * (size_t)sms, 1);
+    p.P = (uint32_t)std::min(resident, needed);
+    return p;
+}
+
+template<typename I>
+static void freeParserFused(ParserFused<I>& p) {
+    FusedBufs<I>& b = p.bufs;
+    cudaFree(p.d_arr);
+    cudaFree(b.d_slens);    cudaFree(b.d_plens);
+    cudaFree(b.d_ss);
+    cudaFree(b.d_ps);
+    cudaFree(b.d_soffsets); cudaFree(b.d_poffsets);
+    cudaFree(b.d_agg_s);    cudaFree(b.d_agg_p);
+    cudaFree(b.d_totals);
+    cudaFree(b.d_brackets); cudaFree(b.d_scan32);
+    cudaFree(b.d_agg_d);    cudaFree(b.d_match);
+    cudaFree(b.d_productions);
+    cudaFree(b.d_valid);
+    cudaFree(b.d_unres);
+    cudaFree(b.d_block_mins);
+    cudaFree(b.d_block_warp_mins);
+    cudaFree(b.d_tree);
+    cudaFree(b.d_prefix_min);
+    p = ParserFused<I>{};
+}
+
+// Launch the fused kernel for m ≤ max_m positions (input already on device).
+template<typename I>
+static void launchParserFused(ParserFused<I>& p, I m) {
+    p.bufs.m = m;
+    void* args[] = { (void*)&p.bufs };
+    gpuAssert(cudaLaunchCooperativeKernel(
+        (void*)parserFusedKernel<I>, p.P, FUSED_BS, args, 0, nullptr));
     gpuAssert(cudaGetLastError());
+}
+
+// Copy input, run, read back validity and productions.
+template<typename I>
+static bool runParserFused(ParserFused<I>& p, const terminal_t* h_arr, I m,
+                           std::vector<uint64_t>& out_prods)
+{
+    gpuAssert(cudaMemcpy(p.d_arr, h_arr, (size_t)m * sizeof(terminal_t),
+                         cudaMemcpyHostToDevice));
+    int one = 1;
+    gpuAssert(cudaMemcpy(p.bufs.d_valid, &one, sizeof(int), cudaMemcpyHostToDevice));
+
+    launchParserFused<I>(p, m);
     gpuAssert(cudaDeviceSynchronize());
-    st.cleanUp();
+
+    int h_valid = 0;
+    gpuAssert(cudaMemcpy(&h_valid, p.bufs.d_valid, sizeof(int), cudaMemcpyDeviceToHost));
+    out_prods.clear();
+    if (!h_valid) return false;
+
+    I totals[2];
+    gpuAssert(cudaMemcpy(totals, p.bufs.d_totals, 2 * sizeof(I), cudaMemcpyDeviceToHost));
+    I num_prods = totals[1];
+    if (num_prods > (I)0) {
+        std::vector<production_t> h_prods((size_t)num_prods);
+        gpuAssert(cudaMemcpy(h_prods.data(), p.bufs.d_productions,
+                             (size_t)num_prods * sizeof(production_t),
+                             cudaMemcpyDeviceToHost));
+        out_prods.assign(h_prods.begin(), h_prods.end());
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
-// Helper: run inclusive scan of int32_t in-place (for bracket depths)
-// ---------------------------------------------------------------------------
-
-static void runInclusiveScanI32(int32_t* d_data, uint32_t n) {
-    constexpr uint32_t BS  = 256;
-    constexpr uint32_t IPT = 4;
-    if (n == 0) return;
-    uint32_t nb = (n + BS * IPT - 1) / (BS * IPT);
-
-    DevBuf<uint32_t> dyn(1);
-    gpuAssert(cudaMemset(dyn.get(), 0, sizeof(uint32_t)));
-
-    States<uint32_t, int32_t> st(nb);
-    inclusiveScanI32Kernel<BS, IPT>
-        <<<nb, BS>>>(d_data, st, (volatile uint32_t*)dyn.get(), n);
-    gpuAssert(cudaGetLastError());
-    gpuAssert(cudaDeviceSynchronize());
-    st.cleanUp();
-}
-
-// ---------------------------------------------------------------------------
-// Full pipeline, templated on index type I
+// One-shot pipeline used by the CLI
 // ---------------------------------------------------------------------------
 
 template<typename I>
 static bool runParserPipeline(const uint64_t* h_tokens_u64, uint64_t n,
                               std::vector<uint64_t>& out_prods)
 {
-    constexpr uint32_t BS = 256;
-
     if (n > (uint64_t)(std::numeric_limits<I>::max() - 2)) return false;
     I m = (I)(n + 2);
 
-    // ---- Build extended token array on device ----
-    DevBuf<terminal_t> d_arr(m);
-    {
-        std::vector<terminal_t> h_arr(m);
-        h_arr[0] = START_TERMINAL;
-        for (uint64_t i = 0; i < n; i++) h_arr[i + 1] = (terminal_t)h_tokens_u64[i];
-        h_arr[m - 1] = END_TERMINAL;
-        gpuAssert(cudaMemcpy(d_arr.get(), h_arr.data(), m * sizeof(terminal_t),
-                             cudaMemcpyHostToDevice));
-    }
+    // PSE indices (and SPT sizes) are ints: reject inputs whose bracket
+    // capacity bound cannot be guaranteed to fit.
+    if ((uint64_t)m * (uint64_t)MAX_BRACKETS_PER_POSITION > (uint64_t)INT_MAX)
+        return false;
 
-    // ---- Validity flag ----
-    DevBuf<int> d_valid(1);
-    {
-        int one = 1;
-        gpuAssert(cudaMemcpy(d_valid.get(), &one, sizeof(int), cudaMemcpyHostToDevice));
-    }
+    std::vector<terminal_t> h_arr((size_t)m);
+    h_arr[0] = START_TERMINAL;
+    for (uint64_t i = 0; i < n; i++) h_arr[i + 1] = (terminal_t)h_tokens_u64[i];
+    h_arr[(size_t)m - 1] = END_TERMINAL;
 
-    // ---- Stage 1a: key lookup + span materialisation ----
-    DevBuf<I>       d_slens(m), d_plens(m);
-    DevBuf<int64_t> d_ss(m), d_se(m), d_ps(m), d_pe(m);
-    {
-        uint32_t g = (uint32_t)((m + (I)(BS - 1)) / (I)BS);
-        parserKeysSpans<I><<<g, BS>>>(
-            d_arr.get(), m,
-            d_slens.get(), d_plens.get(),
-            d_ss.get(), d_se.get(), d_ps.get(), d_pe.get(),
-            d_valid.get());
-        gpuAssert(cudaGetLastError());
-        gpuAssert(cudaDeviceSynchronize());
-    }
-    {
-        int h_valid;
-        gpuAssert(cudaMemcpy(&h_valid, d_valid.get(), sizeof(int), cudaMemcpyDeviceToHost));
-        if (!h_valid) return false;
-    }
-
-    // ---- Stage 1b: inclusive scan of stack and prod lengths separately ----
-    runInclusiveScanI<I>(d_slens.get(), (uint64_t)m);
-    runInclusiveScanI<I>(d_plens.get(), (uint64_t)m);
-
-    // ---- Stage 1c: inclusive → exclusive offsets, capture totals ----
-    DevBuf<I> d_soffsets(m), d_poffsets(m);
-    I num_brackets = 0, num_prods = 0;
-    {
-        DevBuf<I> d_stotal(1), d_ptotal(1);
-        uint32_t g = (uint32_t)((m + (I)(BS - 1)) / (I)BS);
-        inclusiveToExclusive<I><<<g, BS>>>(d_slens.get(), d_soffsets.get(), m, d_stotal.get());
-        inclusiveToExclusive<I><<<g, BS>>>(d_plens.get(), d_poffsets.get(), m, d_ptotal.get());
-        gpuAssert(cudaGetLastError());
-        gpuAssert(cudaMemcpy(&num_brackets, d_stotal.get(), sizeof(I), cudaMemcpyDeviceToHost));
-        gpuAssert(cudaMemcpy(&num_prods,    d_ptotal.get(), sizeof(I), cudaMemcpyDeviceToHost));
-    }
-    // d_slens / d_plens no longer needed; freed at end of scope.
-
-    // ---- Stage 2: brackets ----
-    {
-        DevBuf<bracket_t> d_brackets(num_brackets > (I)0 ? (size_t)num_brackets : 1);
-        DevBuf<int32_t>   d_scan32(num_brackets > (I)0 ? (size_t)num_brackets : 1);
-        DevBuf<int32_t>   d_depths(num_brackets > (I)0 ? (size_t)num_brackets : 1);
-        DevBuf<int>       d_match(num_brackets > (I)0 ? (size_t)num_brackets : 1);
-
-        if (num_brackets > (I)0) {
-            // 2a: segmented copy of STACKS spans
-            {
-                uint32_t g = (uint32_t)((m + (I)(BS - 1)) / (I)BS);
-                parserStacks<I><<<g, BS>>>(
-                    d_soffsets.get(), d_ss.get(), d_se.get(),
-                    d_brackets.get(), m);
-                gpuAssert(cudaGetLastError());
-                gpuAssert(cudaDeviceSynchronize());
-            }
-
-            // 2b: ±1 delta map
-            {
-                uint32_t g = (uint32_t)((num_brackets + (I)(BS - 1)) / (I)BS);
-                bracketsToDeltas<I><<<g, BS>>>(d_brackets.get(), d_scan32.get(), num_brackets);
-                gpuAssert(cudaGetLastError());
-                gpuAssert(cudaDeviceSynchronize());
-            }
-
-            // 2b: inclusive scan of ±1 deltas
-            if ((uint64_t)num_brackets > (uint64_t)INT_MAX) return false;
-            runInclusiveScanI32(d_scan32.get(), (uint32_t)num_brackets);
-
-            // 2b: depths + validity
-            {
-                uint32_t g = (uint32_t)((num_brackets + (I)(BS - 1)) / (I)BS);
-                depthsAndValidate<I><<<g, BS>>>(
-                    d_scan32.get(), d_brackets.get(), d_depths.get(),
-                    d_valid.get(), num_brackets);
-                gpuAssert(cudaGetLastError());
-                gpuAssert(cudaDeviceSynchronize());
-            }
-            {
-                int h_valid;
-                gpuAssert(cudaMemcpy(&h_valid, d_valid.get(), sizeof(int), cudaMemcpyDeviceToHost));
-                if (!h_valid) return false;
-            }
-
-            // 2c: PSE(<=) over depths for bracket matching
-            {
-                SPTScratch<int32_t, 128, 4> spt =
-                    allocSPTScratch<int32_t, 128, 4, true>((int)num_brackets);
-                runSPT<int32_t, 128, 4, true>(
-                    d_depths.get(), d_match.get(), (int)num_brackets, spt);
-                gpuAssert(cudaDeviceSynchronize());
-                freeSPTScratch<int32_t, 128, 4>(spt);
-            }
-
-            // 2d: bracket symbol check
-            {
-                uint32_t g = (uint32_t)((num_brackets + (I)(BS - 1)) / (I)BS);
-                checkBracketMatches<I><<<g, BS>>>(
-                    d_brackets.get(), d_match.get(), d_valid.get(), num_brackets);
-                gpuAssert(cudaGetLastError());
-                gpuAssert(cudaDeviceSynchronize());
-            }
-            {
-                int h_valid;
-                gpuAssert(cudaMemcpy(&h_valid, d_valid.get(), sizeof(int), cudaMemcpyDeviceToHost));
-                if (!h_valid) return false;
-            }
-        }
-    }  // bracket buffers freed here
-
-    // ---- Stage 3: productions ----
-    if (num_prods > (I)0) {
-        DevBuf<production_t> d_productions(num_prods);
-        {
-            uint32_t g = (uint32_t)((m + (I)(BS - 1)) / (I)BS);
-            parserProductions<I><<<g, BS>>>(
-                d_poffsets.get(), d_ps.get(), d_pe.get(),
-                d_productions.get(), m);
-            gpuAssert(cudaGetLastError());
-            gpuAssert(cudaDeviceSynchronize());
-        }
-        std::vector<production_t> h_prods(num_prods);
-        gpuAssert(cudaMemcpy(h_prods.data(), d_productions.get(),
-                             num_prods * sizeof(production_t),
-                             cudaMemcpyDeviceToHost));
-        out_prods.resize(num_prods);
-        for (I i = 0; i < num_prods; i++) out_prods[i] = (uint64_t)h_prods[i];
-    }
-
-    return true;
+    ParserFused<I> p = allocParserFused<I>(m);
+    bool ok = runParserFused<I>(p, h_arr.data(), m, out_prods);
+    freeParserFused<I>(p);
+    return ok;
 }
-

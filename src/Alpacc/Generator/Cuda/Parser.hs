@@ -47,6 +47,8 @@ const size_t HASH_TABLE_SIZE = #{cudafy $ length $ oaArray oa};
 const size_t MAX_ITERS = #{cudafy $ oaMaxIters oa};
 const size_t PRODUCTIONS_SIZE = #{cudafy productions_size};
 const size_t STACKS_SIZE = #{cudafy stacks_size};
+const size_t MAX_BRACKETS_PER_POSITION = #{cudafy max_brackets_per_pos};
+const size_t MAX_PRODS_PER_POSITION = #{cudafy max_prods_per_pos};
 __device__ const bracket_t STACKS[STACKS_SIZE] =
   #{cudafy stacks};
 __device__ const production_t PRODUCTIONS[PRODUCTIONS_SIZE] =
@@ -86,3 +88,7 @@ __device__ const int64_t HASH_TABLE_PRODUCTIONS_SPAN[HASH_TABLE_SIZE][2] =
     ( hash_table_stacks_span,
       hash_table_productions_span
       ) = unzip hash_table_spans
+    max_brackets_per_pos =
+      maximum $ 0 : [se - ss | ((ss, se), _) <- hash_table_spans, ss >= 0]
+    max_prods_per_pos =
+      maximum $ 0 : [pe - ps | (_, (ps, pe)) <- hash_table_spans, ps >= 0]

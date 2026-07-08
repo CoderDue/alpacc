@@ -104,10 +104,10 @@ enum Status: uint8_t {
 
 template<typename I, typename T>
 struct States {
-  T* aggregates;
-  T* prefixes;
-  Status* statuses;
-  I num_blocks;
+  volatile T*      aggregates = nullptr;
+  volatile T*      prefixes   = nullptr;
+  volatile Status* statuses   = nullptr;
+  I num_blocks = 0;
 
   States(I num_blocks) : num_blocks(num_blocks) {
     cudaMalloc((void**)&aggregates, num_blocks * sizeof(T));
@@ -123,6 +123,7 @@ struct States {
     if (aggregates) cudaFree((void*) aggregates);
     if (prefixes) cudaFree((void*) prefixes);
     if (statuses) cudaFree((void*) statuses);
+    aggregates = nullptr; prefixes = nullptr; statuses = nullptr;
   }
 };
 

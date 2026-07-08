@@ -5,6 +5,11 @@
 // or in[j] <= in[i] (INCL=true), else -1.  The LLP parser uses INCL=true for
 // bracket matching (over depths) and parent vectors (over the arity scan).
 //
+// The algorithm lives in apsepDeviceSPT, a __device__ function taking the
+// cooperative grid handle, so it can run either standalone (apsepKernelSPT
+// wrapper, one cooperative launch) or as a phase of a larger cooperative
+// kernel (the fused LLP parser in parser.cu).
+//
 // Single cooperative launch (grid.sync()), three phases:
 //   Phase 1: blocked layout, in-register sequential ANSV per thread, warp
 //            prefix-min + pointer-jumping chain, unresolved bitmask d_unres.
@@ -54,8 +59,9 @@ static inline int nextPow2(int x) {
 }
 
 template <typename T, int BLOCK_SIZE, int IPT, bool INCL = false>
-__global__
-void apsepKernelSPT(
+__device__
+void apsepDeviceSPT(
+        cg::grid_group          grid,
         const T* __restrict__   d_in,
         int*                    d_out,
         int                     n,
@@ -68,8 +74,6 @@ void apsepKernelSPT(
         T* __restrict__         d_tree,       // 2*M-1 nodes
         T* __restrict__         d_prefix_min) // prefix_min[b] = min(block_min[0..b-1]), INF for b=0
 {
-    cg::grid_group grid = cg::this_grid();
-
     constexpr int B         = BLOCK_SIZE * IPT;
     constexpr int NUM_WARPS = BLOCK_SIZE / 32;
     constexpr int W         = B / 32;
@@ -421,6 +425,27 @@ void apsepKernelSPT(
     }
     }
     #undef lt
+}
+
+// Thin standalone wrapper: one cooperative launch running only the PSE.
+template <typename T, int BLOCK_SIZE, int IPT, bool INCL = false>
+__global__
+void apsepKernelSPT(
+        const T* __restrict__   d_in,
+        int*                    d_out,
+        int                     n,
+        int                     num_blocks,
+        int                     M,
+        int                     leaf_offset,
+        unsigned* __restrict__  d_unres,
+        T* __restrict__         d_block_mins,
+        T* __restrict__         d_block_warp_mins,
+        T* __restrict__         d_tree,
+        T* __restrict__         d_prefix_min)
+{
+    apsepDeviceSPT<T, BLOCK_SIZE, IPT, INCL>(
+        cg::this_grid(), d_in, d_out, n, num_blocks, M, leaf_offset,
+        d_unres, d_block_mins, d_block_warp_mins, d_tree, d_prefix_min);
 }
 
 template <typename T, int BLOCK_SIZE = 128, int IPT = 4>

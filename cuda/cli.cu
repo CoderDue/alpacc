@@ -38,6 +38,8 @@ static void usage(const char* prog) {
         "  --shared-memory N    shared memory budget bytes (default: device)\n"
         "  --timeit             print kernel time to stderr\n"
         "  --server             length-prefixed binary frame loop mode\n"
+        "  --benchmark N        time N runs (GPU-only, pre-alloc, no I/O in loop)\n"
+        "  --warmup N           warmup runs before timing (default: 3)\n"
 #ifdef HAS_RAW_INPUT
         "  --raw-input          raw bytes -> full lexer+parser pipeline\n"
 #endif
@@ -53,6 +55,8 @@ struct CliArgs {
     bool        timeit       = false;
     bool        server       = false;
     bool        raw_input    = false;
+    uint32_t    benchmark    = 0;    // 0 = off; >0 = number of timed runs
+    uint32_t    warmup       = 3;    // warmup runs before timing (used when benchmark > 0)
 };
 
 static bool parse_uint32(const char* s, uint32_t* out) {
@@ -93,6 +97,16 @@ static CliArgs parse_args(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--shared-memory") == 0 && i + 1 < argc) {
             if (!parse_uint32(argv[++i], &a.shared_mem)) {
                 fprintf(stderr, "error: --shared-memory must be a positive integer\n");
+                exit(1);
+            }
+        } else if (strcmp(argv[i], "--benchmark") == 0 && i + 1 < argc) {
+            if (!parse_uint32(argv[++i], &a.benchmark) || a.benchmark == 0) {
+                fprintf(stderr, "error: --benchmark must be a positive integer\n");
+                exit(1);
+            }
+        } else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
+            if (!parse_uint32(argv[++i], &a.warmup)) {
+                fprintf(stderr, "error: --warmup must be a non-negative integer\n");
                 exit(1);
             }
         } else {
@@ -245,26 +259,38 @@ static void run_one_parser_test(const uint64_t* tokens, uint64_t n,
 }
 
 // Batch mode: read num_tests-prefixed stream
+// Decode a big-endian u64 from a byte pointer (no alignment requirement).
+static inline uint64_t decode_be64(const uint8_t* p) {
+    return ((uint64_t)p[0]<<56)|((uint64_t)p[1]<<48)|((uint64_t)p[2]<<40)|
+           ((uint64_t)p[3]<<32)|((uint64_t)p[4]<<24)|((uint64_t)p[5]<<16)|
+           ((uint64_t)p[6]<< 8)|((uint64_t)p[7]);
+}
+
+// Bulk-read the entire input into memory, then decode, to avoid per-token fread overhead.
 static int parser_batch(FILE* in, FILE* out) {
-    uint64_t num_tests = read_u64_be(in);
-    if (num_tests == (uint64_t)-1) {
+    size_t buf_len = 0;
+    uint8_t* buf = slurp(in, &buf_len);
+    if (!buf || buf_len < 8) {
+        free(buf);
         fprintf(stderr, "error: truncated input\n"); return 1;
     }
+    const uint8_t* p   = buf;
+    const uint8_t* end = buf + buf_len;
+
+    uint64_t num_tests = decode_be64(p); p += 8;
     write_u64_be(out, num_tests);
 
     std::vector<uint64_t> tokens;
     for (uint64_t t = 0; t < num_tests; t++) {
-        uint64_t n = read_u64_be(in);
-        if (n == (uint64_t)-1) { fprintf(stderr, "truncated\n"); return 1; }
+        if (p + 8 > end) { free(buf); fprintf(stderr, "truncated\n"); return 1; }
+        uint64_t n = decode_be64(p); p += 8;
+        if (p + n * 8 > end) { free(buf); fprintf(stderr, "truncated\n"); return 1; }
         tokens.resize(n);
-        for (uint64_t i = 0; i < n; i++) {
-            tokens[i] = read_u64_be(in);
-            if (tokens[i] == (uint64_t)-1 && ferror(in)) {
-                fprintf(stderr, "truncated\n"); return 1;
-            }
-        }
+        for (uint64_t i = 0; i < n; i++, p += 8)
+            tokens[i] = decode_be64(p);
         run_one_parser_test(tokens.data(), n, out);
     }
+    free(buf);
     fflush(out);
     return 0;
 }
@@ -305,6 +331,116 @@ static int parser_server(FILE* in, FILE* out) {
         run_one_parser_test(tokens.data(), n, out);
         fflush(out);
     }
+    return 0;
+}
+
+// Benchmark mode: read all tests from `in`, pre-allocate GPU buffers once,
+// run warmup passes, then time `n_runs` passes with CUDA events.
+// Only the first test in the input file is used (single long test).
+// Reports mean/stddev/min/max GPU time and throughput to stderr.
+static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
+    // Slurp input
+    size_t buf_len = 0;
+    uint8_t* buf = slurp(in, &buf_len);
+    if (!buf || buf_len < 16) {
+        free(buf);
+        fprintf(stderr, "error: benchmark input too short\n");
+        return 1;
+    }
+    const uint8_t* p = buf;
+    // uint64_t num_tests = decode_be64(p);  // use only first test
+    p += 8;
+    uint64_t n = decode_be64(p); p += 8;
+    if (buf_len < 16 + n * 8) {
+        free(buf); fprintf(stderr, "error: input truncated\n"); return 1;
+    }
+
+    if (n >= (uint64_t)0x7FFFFFFF) {
+        free(buf);
+        fprintf(stderr, "error: --benchmark only supports inputs fitting uint32_t index\n");
+        return 1;
+    }
+    uint32_t ni = (uint32_t)n;
+    uint32_t m  = ni + 2;
+
+    // Build host-side extended token array (terminal_t)
+    std::vector<terminal_t> h_arr(m);
+    h_arr[0] = START_TERMINAL;
+    for (uint32_t i = 0; i < ni; i++) h_arr[i + 1] = (terminal_t)decode_be64(p + i * 8);
+    h_arr[m - 1] = END_TERMINAL;
+    free(buf);
+
+    fprintf(stderr, "Benchmark: %u tokens, m=%u\n", ni, m);
+    fprintf(stderr, "  MAX_BRACKETS_PER_POSITION=%zu  MAX_PRODS_PER_POSITION=%zu\n",
+            (size_t)MAX_BRACKETS_PER_POSITION, (size_t)MAX_PRODS_PER_POSITION);
+
+    if ((uint64_t)m * (uint64_t)MAX_BRACKETS_PER_POSITION > (uint64_t)INT_MAX) {
+        fprintf(stderr, "error: bracket capacity bound exceeds INT_MAX\n");
+        return 1;
+    }
+
+    // Pre-allocate GPU buffers and upload the input once
+    ParserFused<uint32_t> pre = allocParserFused<uint32_t>(m);
+    gpuAssert(cudaMemcpy(pre.d_arr, h_arr.data(),
+                         (size_t)m * sizeof(terminal_t), cudaMemcpyHostToDevice));
+    fprintf(stderr, "  Cooperative grid: %u blocks x %u threads\n",
+            pre.P, (uint32_t)FUSED_BS);
+
+    // Warmup (full runs, checks the parse succeeds)
+    fprintf(stderr, "  Warmup (%u runs)...\n", warmup_runs);
+    std::vector<uint64_t> dummy_prods;
+    for (uint32_t i = 0; i < warmup_runs; i++) {
+        bool ok = runParserFused<uint32_t>(pre, h_arr.data(), m, dummy_prods);
+        fprintf(stderr, "    run %u: %s\n", i + 1, ok ? "OK" : "PARSE FAILED");
+    }
+
+    // Timed runs using CUDA events (kernel only)
+    fprintf(stderr, "  Timing (%u runs)...\n", n_runs);
+    std::vector<float> times_ms(n_runs);
+    cudaEvent_t ev0, ev1;
+    gpuAssert(cudaEventCreate(&ev0));
+    gpuAssert(cudaEventCreate(&ev1));
+
+    for (uint32_t i = 0; i < n_runs; i++) {
+        int one = 1;
+        gpuAssert(cudaMemcpy(pre.bufs.d_valid, &one, sizeof(int), cudaMemcpyHostToDevice));
+
+        gpuAssert(cudaEventRecord(ev0));
+        launchParserFused<uint32_t>(pre, m);
+        gpuAssert(cudaEventRecord(ev1));
+        gpuAssert(cudaEventSynchronize(ev1));
+        gpuAssert(cudaEventElapsedTime(&times_ms[i], ev0, ev1));
+    }
+
+    gpuAssert(cudaEventDestroy(ev0));
+    gpuAssert(cudaEventDestroy(ev1));
+    freeParserFused<uint32_t>(pre);
+
+    // Statistics
+    double sum = 0, mn = times_ms[0], mx = times_ms[0];
+    for (float t : times_ms) {
+        sum += t;
+        if (t < mn) mn = t;
+        if (t > mx) mx = t;
+    }
+    double mean = sum / n_runs;
+    double var = 0;
+    for (float t : times_ms) var += (t - mean) * (t - mean);
+    double stddev = n_runs > 1 ? sqrt(var / (n_runs - 1)) : 0;
+
+    fprintf(stderr, "\n");
+    fprintf(stderr, "============================================================\n");
+    fprintf(stderr, " --benchmark results (GPU time only, pre-alloc buffers)\n");
+    fprintf(stderr, " Tokens: %u   m: %u   Warmup: %u   Runs: %u\n",
+            ni, m, warmup_runs, n_runs);
+    fprintf(stderr, "------------------------------------------------------------\n");
+    fprintf(stderr, " Mean:       %.3f ms\n", mean);
+    fprintf(stderr, " Stddev:     %.3f ms\n", stddev);
+    fprintf(stderr, " Min:        %.3f ms\n", mn);
+    fprintf(stderr, " Max:        %.3f ms\n", mx);
+    fprintf(stderr, " Throughput: %.0f Mtok/s\n", (double)ni / (mean * 1e-3) / 1e6);
+    fprintf(stderr, "============================================================\n");
+
     return 0;
 }
 
@@ -353,7 +489,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     int ret;
-    if (a.server)
+    if (a.benchmark > 0)
+        ret = parser_benchmark(in, a.warmup, a.benchmark);
+    else if (a.server)
         ret = parser_server(in, out);
     else
         ret = parser_batch(in, out);
@@ -371,7 +509,9 @@ int main(int argc, char* argv[]) {
     } else {
         // Binary token-ID protocol (same as parse-only)
         int ret;
-        if (a.server)
+        if (a.benchmark > 0)
+            ret = parser_benchmark(in, a.warmup, a.benchmark);
+        else if (a.server)
             ret = parser_server(in, out);
         else
             ret = parser_batch(in, out);
