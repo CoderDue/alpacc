@@ -13,8 +13,6 @@ module load futhark
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-export PATH="$HOME/bin:$PATH"
-
 INPUT_SIZE=104857600
 
 make -C "$SCRIPT_DIR/benchmarks" build         FUTHARK_BACKEND=cuda INPUT_SIZE=$INPUT_SIZE
