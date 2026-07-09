@@ -3,10 +3,19 @@ INPUT_SIZE?=104857600
 
 .PHONY: bench build clean \
         bench-json bench-lisp \
+        bench-cuda bench-cuda-json bench-cuda-lisp \
         build-json build-lisp \
         clean-json clean-lisp
 
 bench: bench-json bench-lisp
+
+bench-cuda: bench-cuda-json bench-cuda-lisp
+
+bench-cuda-json:
+	$(MAKE) -C lexer/json bench-cuda INPUT_SIZE=$(INPUT_SIZE)
+
+bench-cuda-lisp:
+	$(MAKE) -C lexer/lisp bench-cuda INPUT_SIZE=$(INPUT_SIZE)
 
 build: build-json build-lisp
 

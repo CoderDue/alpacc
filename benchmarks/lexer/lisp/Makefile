@@ -51,7 +51,7 @@ bench-c: lexer-c data.in
 
 bench-cuda: lexer-cuda data.in
 	@printf "$(H)Benchmarking CUDA (alpacc) implementation:$(E)\n"
-	@./lexer-cuda --timeit < data.in > /dev/null
+	-@./lexer-cuda --timeit < data.in > /dev/null
 
 bench-futhark: sexp.fut data.in data.out
 	@printf "$(H)Benchmarking Futhark implementation:$(E)\n"
@@ -67,7 +67,7 @@ bench: lexer-rust lexer-c lexer-cuda sexp.fut data.in
 	@./lexer-c data.in
 
 	@printf "$(H)CUDA (alpacc) implementation:$(E)\n"
-	@./lexer-cuda --timeit < data.in > /dev/null
+	-@./lexer-cuda --timeit < data.in > /dev/null
 
 	@printf "$(H)Futhark implementation:$(E)\n"
 	futhark bench --backend $(FUTHARK_BACKEND) sexp.fut

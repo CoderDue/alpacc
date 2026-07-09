@@ -47,7 +47,7 @@ bench-rust: lexer-rust data.json
 
 bench-cuda: lexer-cuda data.json
 	@printf "$(H)Benchmarking CUDA (alpacc) implementation:$(E)\n"
-	@./lexer-cuda --timeit < data.json > /dev/null
+	-@./lexer-cuda --timeit < data.json > /dev/null
 
 bench-futhark: json.fut data.json data.out
 	@printf "$(H)Benchmarking Futhark implementation:$(E)\n"
@@ -59,7 +59,7 @@ bench: lexer-rust lexer-cuda json.fut data.json
 	@./lexer-rust data.json
 
 	@printf "$(H)CUDA (alpacc) implementation:$(E)\n"
-	@./lexer-cuda --timeit < data.json > /dev/null
+	-@./lexer-cuda --timeit < data.json > /dev/null
 
 	@printf "$(H)Futhark implementation:$(E)\n"
 	futhark bench --backend $(FUTHARK_BACKEND) json.fut
