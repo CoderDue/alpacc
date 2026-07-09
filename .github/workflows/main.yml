@@ -155,6 +155,9 @@ jobs:
       - name: C end-to-end tests (3 3)
         run: bash tests/testc.sh 3 3 50 10
 
+      - name: JSON grammar tests with c backend
+        run: bash tests/testjson.sh c
+
       - name: JSON grammar tests with multicore backend
         run: |
           export CFLAGS="-fsanitize=undefined -fno-sanitize-recover -O"
