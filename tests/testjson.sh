@@ -1,48 +1,52 @@
 #!/bin/bash
 
-# Test script for the JSON grammar with a configurable Futhark backend.
+# Test script for the JSON grammar with a configurable backend.
 # Runs lexer, parser, and combined (lexer+parser) tests using a single
 # parseable input of length 10000.
+#
+# Supported backends: c, multicore, opencl, cuda, ispc
+# The 'cuda' backend compiles with nvcc and runs the generated CUDA binary.
+# All other backends use futhark script.
 
-# Function to show usage
 show_usage() {
     echo "Usage: $0 [backend]"
-    echo "  backend: Futhark backend to use (default: c)"
+    echo "  backend: backend to use (default: c)"
     echo "           Options: c, multicore, opencl, cuda, ispc"
     echo "Example: $0 multicore"
 }
 
-# Check for help flag
 if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     show_usage
     exit 0
 fi
+
+export PATH="$HOME/bin:$PATH"
 
 backend="${1:-c}"
 length=100000
 
 echo "Testing JSON grammar with backend '$backend' and length $length..."
 
-# Resolve the repo root from the script's own location
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 GRAMMAR="$REPO_ROOT/grammars/json.alp"
 
-# Create a temporary directory for this run
 temp_dir=$(mktemp -d)
 trap "rm -rf \"$temp_dir\"" EXIT
 
-# Set up Futhark packages once
-echo "Setting up Futhark packages..."
-cd "$temp_dir"
-futhark pkg add github.com/diku-dk/containers
-futhark pkg add github.com/diku-dk/sorts
-futhark pkg sync
-if [ $? -ne 0 ]; then
-    echo "Failed to set up Futhark packages"
-    exit 1
+# Set up Futhark packages once (only needed for Futhark backends)
+if [ "$backend" != "cuda" ]; then
+    echo "Setting up Futhark packages..."
+    cd "$temp_dir"
+    futhark pkg add github.com/diku-dk/containers
+    futhark pkg add github.com/diku-dk/sorts
+    futhark pkg sync
+    if [ $? -ne 0 ]; then
+        echo "Failed to set up Futhark packages"
+        exit 1
+    fi
+    echo "Futhark packages ready"
 fi
-echo "Futhark packages ready"
 
 # Run tests for a specific mode.
 # Arguments:
@@ -65,17 +69,6 @@ run_json_test() {
     mkdir -p "$work_dir"
     cd "$work_dir"
 
-    # Copy Futhark package files into the work directory
-    cp -r "$temp_dir/lib" .
-    cp "$temp_dir/futhark.pkg" .
-
-    # Generate Futhark source for the JSON grammar
-    # shellcheck disable=SC2086
-    if ! alpacc futhark "$GRAMMAR" $mode_flag; then
-        echo "ERROR: alpacc futhark failed for $mode_name mode"
-        return 1
-    fi
-
     # Generate the test input/output files
     # shellcheck disable=SC2086
     if ! alpacc test generate "$GRAMMAR" --single-long --length $length $mode_flag; then
@@ -83,13 +76,38 @@ run_json_test() {
         return 1
     fi
 
-    # Run the Futhark script with the selected backend.
-    # `futhark script -b` produces binary output with a 16-byte header that
-    # encodes the result type; strip it before passing to `alpacc test compare`.
-    futhark script --backend="$backend" -b json.fut 'test ($loadbytes "json.inputs")' \
-        | tail -c +16 > json.results
+    if [ "$backend" = "cuda" ]; then
+        # CUDA backend: compile the generated .cu file with nvcc and run it.
+        # shellcheck disable=SC2086
+        if ! alpacc cuda "$GRAMMAR" $mode_flag -o json.cu; then
+            echo "ERROR: alpacc cuda failed for $mode_name mode"
+            return 1
+        fi
 
-    # Compare expected vs actual results
+        local arch="${CUDA_ARCH:-native}"
+        if ! nvcc -O3 -std=c++17 -arch="$arch" -o json json.cu &>/dev/null; then
+            echo "ERROR: nvcc compilation failed for $mode_name mode"
+            return 1
+        fi
+
+        ./json < json.inputs > json.results
+    else
+        # Futhark backend: generate .fut and run via futhark script.
+        cp -r "$temp_dir/lib" .
+        cp "$temp_dir/futhark.pkg" .
+
+        # shellcheck disable=SC2086
+        if ! alpacc futhark "$GRAMMAR" $mode_flag; then
+            echo "ERROR: alpacc futhark failed for $mode_name mode"
+            return 1
+        fi
+
+        # `futhark script -b` produces binary output with a 16-byte header;
+        # strip it before passing to `alpacc test compare`.
+        futhark script --backend="$backend" -b json.fut 'test ($loadbytes "json.inputs")' \
+            | tail -c +16 > json.results
+    fi
+
     # shellcheck disable=SC2086
     if ! alpacc test compare "$GRAMMAR" json.inputs json.outputs json.results $mode_flag; then
         echo "ERROR: Test FAILED for JSON $mode_name mode"

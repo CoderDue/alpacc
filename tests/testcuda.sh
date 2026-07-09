@@ -39,6 +39,11 @@ if ! [[ "$q_value" =~ ^[0-9]+$ ]] || ! [[ "$k_value" =~ ^[0-9]+$ ]] || ! [[ "$ta
     show_usage; exit 1
 fi
 
+if ! [[ "$parallel_jobs" =~ ^[0-9]+$ ]]; then
+    echo "Error: parallel_jobs must be a positive integer"
+    show_usage; exit 1
+fi
+
 echo "Starting alpacc CUDA parser testing..."
 echo "Target: $target successful grammars"
 echo "Using -q $q_value -k $k_value --parser"
