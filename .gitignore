@@ -1,6 +1,7 @@
 # Ignore non-directories in root, so you can use it as scratch space.
 /*
 !/*/
+!Makefile
 # Do not include futhark test files.
 
 #########

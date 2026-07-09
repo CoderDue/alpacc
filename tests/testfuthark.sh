@@ -2,13 +2,14 @@
 
 # Function to show usage
 show_usage() {
-    echo "Usage: $0 [q_value] [k_value] [target_runs] [parallel_jobs] [type_flag]"
+    echo "Usage: $0 [q_value] [k_value] [target_runs] [parallel_jobs] [type_flag] [backend]"
     echo "  q_value: -q parameter for alpacc (default: 1)"
     echo "  k_value: -k parameter for alpacc (default: 1)"
     echo "  target_runs: number of successful runs needed (default: 10)"
     echo "  parallel_jobs: number of parallel jobs (default: number of CPU cores)"
     echo "  type_flag: either empty, --lexer, or --parser (default: empty)"
-    echo "Example: $0 2 3 50 4 --lexer"
+    echo "  backend: futhark backend (default: multicore)"
+    echo "Example: $0 2 3 50 4 --lexer multicore"
 }
 
 # Check for help flag
@@ -23,6 +24,7 @@ k_value="${2:-1}"
 target="${3:-10}"
 parallel_jobs="${4:-$(nproc)}"
 type_flag="${5:-}"
+backend="${6:-multicore}"
 
 # Validate that arguments are numbers
 if ! [[ "$q_value" =~ ^[0-9]+$ ]] || ! [[ "$k_value" =~ ^[0-9]+$ ]] || ! [[ "$target" =~ ^[0-9]+$ ]]; then
@@ -39,7 +41,7 @@ fi
 
 echo "Starting alpacc testing script..."
 echo "Target: $target successful runs"
-echo "Using -q $q_value -k $k_value $type_flag"
+echo "Using -q $q_value -k $k_value $type_flag (backend=$backend)"
 echo "Running with $parallel_jobs parallel jobs"
 
 # Create a temporary directory for this run
@@ -75,6 +77,7 @@ run_test() {
     local counter_file=$6
     local target=$7
     local done_file=$8
+    local backend=$9
     
     # Create unique work directory for this job
     local work_dir="$temp_dir/job_$job_id"
@@ -117,7 +120,7 @@ EOF
         
         # Now we have a valid Futhark conversion, run the test
         alpacc test generate random.alp $type_flag &> /dev/null
-        futhark script -b random.fut 'test ($loadbytes "random.inputs")' | tail -c +16 > random.results
+        futhark script --backend="$backend" -b random.fut 'test ($loadbytes "random.inputs")' | tail -c +16 > random.results
         
         if alpacc test compare random.alp random.inputs random.outputs random.results $type_flag &> /dev/null; then
             # Success! Increment counter atomically
@@ -163,7 +166,7 @@ export -f run_test
 # Run enough parallel jobs to reach the target
 # Each job will complete one successful test
 seq 1 $target | parallel --no-notice -j "$parallel_jobs" --halt soon,fail=1 --line-buffer \
-    "run_test {} $q_value $k_value '$type_flag' $temp_dir $counter_file $target $done_file"
+    "run_test {} $q_value $k_value '$type_flag' $temp_dir $counter_file $target $done_file '$backend'"
 
 # Check final count
 final_count=$(cat "$counter_file")
