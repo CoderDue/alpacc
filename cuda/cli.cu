@@ -41,9 +41,7 @@ static void usage(const char* prog) {
         "  --server             length-prefixed binary frame loop mode\n"
         "  --benchmark N        time N runs (GPU-only, pre-alloc, no I/O in loop)\n"
         "  --warmup N           warmup runs before timing (default: 3)\n"
-#ifdef HAS_RAW_INPUT
-        "  --raw-input          raw bytes -> full lexer+parser pipeline\n"
-#endif
+        "  --inputs             read framed .inputs file (from alpacc test generate)\n"
         , prog);
 }
 
@@ -77,7 +75,8 @@ static CliArgs parse_args(int argc, char* argv[]) {
             a.timeit = true;
         } else if (strcmp(argv[i], "--server") == 0) {
             a.server = true;
-        } else if (strcmp(argv[i], "--raw-input") == 0) {
+        } else if (strcmp(argv[i], "--raw-input") == 0 ||
+                   strcmp(argv[i], "--inputs") == 0) {
             a.raw_input = true;
         } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
             a.input_file = argv[++i];
@@ -221,6 +220,71 @@ static int run_lexer_stream_impl(bool timeit) {
     constexpr uint32_t CHUNK_SIZE = 100u * (1u << 20);  // 100 MiB
     return lexer_stream<WriteAscii, CHUNK_SIZE, BLOCK_SIZE, ITEMS_PER_THREAD>(
         WriteAscii(), timeit);
+}
+
+// Framed lexer mode: reads the binary format produced by `alpacc test generate --lexer`
+// (u64 BE num_tests; per test: u64 BE n + n raw bytes). Times the full batch.
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+static int run_lexer_batch_impl(FILE* in, bool timeit) {
+    size_t buf_len = 0;
+    uint8_t* buf = slurp(in, &buf_len);
+    if (!buf || buf_len < 8) { free(buf); fprintf(stderr, "error: truncated input\n"); return 1; }
+
+    cudaEvent_t t0, t1;
+    if (timeit) {
+        cudaEventCreate(&t0);
+        cudaEventCreate(&t1);
+        cudaEventRecord(t0);
+    }
+
+    const uint8_t* p   = buf;
+    const uint8_t* end = buf + buf_len;
+    uint64_t num_tests = decode_be64(p); p += 8;
+    int ret = 0;
+
+    for (uint64_t t = 0; t < num_tests; t++) {
+        if (p + 8 > end) { ret = 1; break; }
+        uint64_t n = decode_be64(p); p += 8;
+        if (n > (uint64_t)(end - p)) { ret = 1; break; }
+
+        constexpr uint32_t CHUNK_SIZE = 100u * (1u << 20);
+        // Re-use lexer_stream by feeding bytes through a memory buffer via tmpfile approach
+        // is complex; instead directly invoke the lexer kernel on the chunk.
+        if (n > 0) {
+            uint8_t*    d_str  = nullptr;
+            terminal_t* d_tok  = nullptr;
+            index_t*    d_s    = nullptr;
+            index_t*    d_e    = nullptr;
+            gpuAssert(cudaMalloc(&d_str, n));
+            gpuAssert(cudaMalloc(&d_tok, n * sizeof(terminal_t)));
+            gpuAssert(cudaMalloc(&d_s,   n * sizeof(index_t)));
+            gpuAssert(cudaMalloc(&d_e,   n * sizeof(index_t)));
+            gpuAssert(cudaMemcpy(d_str, p, n, cudaMemcpyHostToDevice));
+
+            LexerCtx<uint32_t, index_t> ctx((uint32_t)n, BLOCK_SIZE, ITEMS_PER_THREAD);
+            const uint32_t nblocks = numBlocks((uint32_t)n, BLOCK_SIZE, ITEMS_PER_THREAD);
+            lexer<uint32_t, index_t, BLOCK_SIZE, ITEMS_PER_THREAD>
+                <<<nblocks, BLOCK_SIZE>>>(ctx, d_str, d_tok, d_s, d_e, (uint32_t)n, true);
+            gpuAssert(cudaDeviceSynchronize());
+            gpuAssert(cudaPeekAtLastError());
+            if (!ctx.isAccept()) ret = 255;
+            ctx.cleanUp();
+            cudaFree(d_str); cudaFree(d_tok); cudaFree(d_s); cudaFree(d_e);
+        }
+        p += n;
+    }
+    free(buf);
+
+    if (timeit) {
+        cudaEventRecord(t1);
+        cudaEventSynchronize(t1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, t0, t1);
+        cudaEventDestroy(t0);
+        cudaEventDestroy(t1);
+        fprintf(stderr, "Time: %.2fms\n", ms);
+    }
+    return ret;
 }
 
 #endif // HAS_LEXER
@@ -563,8 +627,10 @@ int main(int argc, char* argv[]) {
 #if defined(HAS_LEXER) && !defined(HAS_PARSER)
     // ---- Lex-only mode ----
     if (a.raw_input) {
-        fprintf(stderr, "error: --raw-input requires both lexer and parser\n");
-        return 1;
+        // --inputs: read framed format from alpacc test generate --lexer
+        int ret = DISPATCH_BS_IPT(bs, ipt, run_lexer_batch_impl, in, a.timeit);
+        if (in != stdin) fclose(in);
+        return ret;
     }
     // lexer_stream reads from stdin; redirect fd if user gave -i FILE
     if (in != stdin) {
