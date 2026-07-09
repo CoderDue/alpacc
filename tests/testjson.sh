@@ -2,16 +2,17 @@
 
 # Test script for the JSON grammar with a configurable backend.
 # Runs lexer, parser, and combined (lexer+parser) tests using a single
-# parseable input of length 10000.
+# parseable input of length 100000.
 #
-# Supported backends: c, multicore, opencl, cuda, ispc
-# The 'cuda' backend compiles with nvcc and runs the generated CUDA binary.
-# All other backends use futhark script.
+# Supported backends:
+#   c          – alpacc c backend, compiled with cc
+#   cuda       – alpacc cuda backend, compiled with nvcc (requires GPU)
+#   multicore, opencl, ispc, <any>  – alpacc futhark backend, run via futhark script
 
 show_usage() {
     echo "Usage: $0 [backend]"
     echo "  backend: backend to use (default: c)"
-    echo "           Options: c, multicore, opencl, cuda, ispc"
+    echo "           c, cuda, or any futhark backend (multicore, opencl, ispc, ...)"
     echo "Example: $0 multicore"
 }
 
@@ -35,7 +36,7 @@ temp_dir=$(mktemp -d)
 trap "rm -rf \"$temp_dir\"" EXIT
 
 # Set up Futhark packages once (only needed for Futhark backends)
-if [ "$backend" != "cuda" ]; then
+if [ "$backend" != "c" ] && [ "$backend" != "cuda" ]; then
     echo "Setting up Futhark packages..."
     cd "$temp_dir"
     futhark pkg add github.com/diku-dk/containers
@@ -76,7 +77,22 @@ run_json_test() {
         return 1
     fi
 
-    if [ "$backend" = "cuda" ]; then
+    if [ "$backend" = "c" ]; then
+        # C backend: compile the generated .c file with cc and run it.
+        # shellcheck disable=SC2086
+        if ! alpacc c "$GRAMMAR" $mode_flag -o json.c; then
+            echo "ERROR: alpacc c failed for $mode_name mode"
+            return 1
+        fi
+
+        if ! cc -std=c99 -O2 -o json json.c &>/dev/null; then
+            echo "ERROR: cc compilation failed for $mode_name mode"
+            return 1
+        fi
+
+        ./json < json.inputs > json.results
+
+    elif [ "$backend" = "cuda" ]; then
         # CUDA backend: compile the generated .cu file with nvcc and run it.
         # shellcheck disable=SC2086
         if ! alpacc cuda "$GRAMMAR" $mode_flag -o json.cu; then
@@ -91,6 +107,7 @@ run_json_test() {
         fi
 
         ./json < json.inputs > json.results
+
     else
         # Futhark backend: generate .fut and run via futhark script.
         cp -r "$temp_dir/lib" .
