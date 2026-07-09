@@ -33,12 +33,16 @@ generateTerminals terminal_type terminal_names =
 indexTypeAlias :: Text
 indexTypeAlias = "using index_t = int64_t;"
 
+compileHint :: Text
+compileHint = "// Compile: nvcc -O3 -std=c++17 -arch=native <this-file>.cu -o <output>"
+
 auxiliary :: Analyzer [Text] -> Text
 auxiliary analyzer =
   case analyzerKind analyzer of
     Lex lexer ->
       Text.unlines
-        [ Text.unlines (("// " <>) <$> meta analyzer),
+        [ compileHint,
+          Text.unlines (("// " <>) <$> meta analyzer),
           "#define HAS_LEXER",
           common,
           indexTypeAlias,
@@ -48,7 +52,8 @@ auxiliary analyzer =
         ]
     Parse parser ->
       Text.unlines
-        [ Text.unlines (("// " <>) <$> meta analyzer),
+        [ compileHint,
+          Text.unlines (("// " <>) <$> meta analyzer),
           "#define HAS_PARSER",
           common,
           indexTypeAlias,
@@ -58,7 +63,8 @@ auxiliary analyzer =
         ]
     Both lexer parser ->
       Text.unlines
-        [ Text.unlines (("// " <>) <$> meta analyzer),
+        [ compileHint,
+          Text.unlines (("// " <>) <$> meta analyzer),
           "#define HAS_LEXER",
           "#define HAS_PARSER",
           "#define HAS_RAW_INPUT",
