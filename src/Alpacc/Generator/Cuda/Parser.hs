@@ -15,10 +15,10 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 
 cudaPse :: Text
-cudaPse = $(embedStringFile "cuda/pse.cu")
+cudaPse = $(embedStringFile "backends/cuda/pse.cu")
 
 cudaParser :: Text
-cudaParser = $(embedStringFile "cuda/parser.cu")
+cudaParser = $(embedStringFile "backends/cuda/parser.cu")
 
 terminalCast :: (Cudafy a) => a -> RawString
 terminalCast a =

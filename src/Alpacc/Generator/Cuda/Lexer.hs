@@ -12,7 +12,7 @@ import Data.Text qualified as Text
 import Prelude hiding (lex)
 
 cudaLexer :: Text
-cudaLexer = $(embedStringFile "cuda/lexer.cu")
+cudaLexer = $(embedStringFile "backends/cuda/lexer.cu")
 
 generateLexer :: Lexer -> Text
 generateLexer lex =

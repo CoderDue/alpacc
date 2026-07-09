@@ -14,7 +14,7 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 
 futharkTest :: Text
-futharkTest = $(embedStringFile "futhark/test.fut")
+futharkTest = $(embedStringFile "backends/futhark/test.fut")
 
 bothFunction :: UInt -> UInt -> Text
 bothFunction terminal_type production_type =

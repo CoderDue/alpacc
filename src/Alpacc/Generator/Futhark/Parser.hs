@@ -15,7 +15,7 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 
 futharkParser :: Text
-futharkParser = $(embedStringFile "futhark/parser.fut")
+futharkParser = $(embedStringFile "backends/futhark/parser.fut")
 
 productionNameType :: [Text] -> Text
 productionNameType names =

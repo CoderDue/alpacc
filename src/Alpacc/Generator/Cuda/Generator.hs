@@ -15,12 +15,12 @@ import Data.Text qualified as Text hiding (Text)
 common :: Text
 common =
   Text.unlines
-    [ $(embedStringFile "cuda/common.cu"),
-      $(embedStringFile "cuda/scan.cu")
+    [ $(embedStringFile "backends/cuda/common.cu"),
+      $(embedStringFile "backends/cuda/scan.cu")
     ]
 
 cudaCli :: Text
-cudaCli = $(embedStringFile "cuda/cli.cu")
+cudaCli = $(embedStringFile "backends/cuda/cli.cu")
 
 generateTerminals :: UInt -> [Text] -> Text
 generateTerminals terminal_type terminal_names =

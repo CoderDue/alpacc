@@ -14,18 +14,18 @@ maintainer:         williamhenrichdue@gmail.com
 category:           Language
 extra-source-files:
   CHANGELOG.md
-  futhark/parser.fut
-  futhark/lexer.fut
-  futhark/test.fut
-  cuda/lexer.cu
-  cuda/common.cu
-  cuda/scan.cu
-  cuda/pse.cu
-  cuda/parser.cu
-  cuda/cli.cu
-  c/parser.c
-  c/lexer.c
-  c/cli.c
+  backends/futhark/parser.fut
+  backends/futhark/lexer.fut
+  backends/futhark/test.fut
+  backends/cuda/lexer.cu
+  backends/cuda/common.cu
+  backends/cuda/scan.cu
+  backends/cuda/pse.cu
+  backends/cuda/parser.cu
+  backends/cuda/cli.cu
+  backends/c/parser.c
+  backends/c/lexer.c
+  backends/c/cli.c
 
 library
   default-language:   GHC2021

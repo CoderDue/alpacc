@@ -12,13 +12,13 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 
 cCli :: Text
-cCli = $(embedStringFile "c/cli.c")
+cCli = $(embedStringFile "backends/c/cli.c")
 
 cParser :: Text
-cParser = $(embedStringFile "c/parser.c")
+cParser = $(embedStringFile "backends/c/parser.c")
 
 cLexer :: Text
-cLexer = $(embedStringFile "c/lexer.c")
+cLexer = $(embedStringFile "backends/c/lexer.c")
 
 includes :: Text
 includes =
