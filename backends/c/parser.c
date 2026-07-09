@@ -109,6 +109,7 @@ done:
   return ok;
 }
 
+#ifdef ALPACC_WITH_TREE
 // Compute the parent index of each production node.  Mirrors `parents` in
 // futhark/parser.fut.  Used by the combined lexer+parser run_test_case().
 static void compute_parents(const uint64_t *prods, uint64_t np,
@@ -127,3 +128,4 @@ static void compute_parents(const uint64_t *prods, uint64_t np,
   free(remaining);
   free(stk);
 }
+#endif /* ALPACC_WITH_TREE */

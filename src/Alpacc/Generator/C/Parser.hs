@@ -76,6 +76,7 @@ generateParserWithTree parser =
     <> "\n"
     <> (Text.strip . Text.pack)
       [i|
+#define ALPACC_WITH_TREE
 #define NUMBER_OF_PRODUCTIONS #{cudafy number_of_productions}
 static const uint64_t PRODUCTION_TO_ARITY[NUMBER_OF_PRODUCTIONS] =
   #{cudafy ari};
