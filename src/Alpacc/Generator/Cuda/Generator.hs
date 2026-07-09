@@ -28,6 +28,11 @@ generateTerminals terminal_type terminal_names =
     [ cudafyEnum "terminal_t" terminal_type terminal_names
     ]
 
+-- | Type alias for byte-position indices (lexer spans, CST node spans).
+-- Switch to int32_t for inputs guaranteed to be smaller than 2 GiB.
+indexTypeAlias :: Text
+indexTypeAlias = "using index_t = int64_t;"
+
 auxiliary :: Analyzer [Text] -> Text
 auxiliary analyzer =
   case analyzerKind analyzer of
@@ -36,6 +41,7 @@ auxiliary analyzer =
         [ Text.unlines (("// " <>) <$> meta analyzer),
           "#define HAS_LEXER",
           common,
+          indexTypeAlias,
           generateTerminals terminal_type terminal_names,
           Lexer.generateLexer lexer,
           cudaCli
@@ -45,6 +51,7 @@ auxiliary analyzer =
         [ Text.unlines (("// " <>) <$> meta analyzer),
           "#define HAS_PARSER",
           common,
+          indexTypeAlias,
           generateTerminals terminal_type terminal_names,
           Parser.generateParser parser,
           cudaCli
@@ -56,6 +63,7 @@ auxiliary analyzer =
           "#define HAS_PARSER",
           "#define HAS_RAW_INPUT",
           common,
+          indexTypeAlias,
           generateTerminals terminal_type terminal_names,
           Lexer.generateLexer lexer,
           Parser.generateParser parser,
