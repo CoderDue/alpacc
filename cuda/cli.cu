@@ -4,8 +4,9 @@
 // and the grammar constants).  Provides a unified CLI for all three modes:
 //   Lex-only:    reads raw bytes from stdin/file, emits token spans
 //   Parse-only:  reads binary token-ID frames, emits production IDs
-//   Both:        --raw-input → raw bytes → lexer → parser → productions
-//                default    → binary token-ID frames → parser → productions
+//   Both:        default → raw-byte test frames → lexer → fused parser with
+//                parents/parse_int phases → CST nodes (C backend format);
+//                --server / --benchmark keep the token-ID frame protocol
 //
 // Flags (all optional):
 //   -i FILE              input file (default: stdin)
@@ -238,17 +239,12 @@ static int run_lexer_stream_impl(bool timeit) {
 #ifdef HAS_PARSER
 
 // Forward declarations from parser.cu (already defined above this file):
-// template<typename I> static bool runParserPipeline(const uint64_t*, uint64_t, std::vector<uint64_t>&);
+// static bool runParserPipeline(const uint64_t*, uint64_t, std::vector<uint64_t>&);
 
 static void run_one_parser_test(const uint64_t* tokens, uint64_t n,
                                 FILE* out) {
     std::vector<uint64_t> prods;
-    bool ok;
-    if (n < (uint64_t)0x7FFFFFFF)
-        ok = runParserPipeline<uint32_t>(tokens, n, prods);
-    else
-        ok = runParserPipeline<size_t>(tokens, n, prods);
-
+    bool ok = runParserPipeline(tokens, n, prods);
     if (ok) {
         fputc(1, out);
         write_u64_be(out, (uint64_t)prods.size());
@@ -355,22 +351,17 @@ static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
         free(buf); fprintf(stderr, "error: input truncated\n"); return 1;
     }
 
-    if (n >= (uint64_t)0x7FFFFFFF) {
-        free(buf);
-        fprintf(stderr, "error: --benchmark only supports inputs fitting uint32_t index\n");
-        return 1;
-    }
-    uint32_t ni = (uint32_t)n;
-    uint32_t m  = ni + 2;
+    index_t ni = (index_t)n;
+    index_t m  = ni + (index_t)2;
 
     // Build host-side extended token array (terminal_t)
-    std::vector<terminal_t> h_arr(m);
+    std::vector<terminal_t> h_arr((size_t)m);
     h_arr[0] = START_TERMINAL;
-    for (uint32_t i = 0; i < ni; i++) h_arr[i + 1] = (terminal_t)decode_be64(p + i * 8);
-    h_arr[m - 1] = END_TERMINAL;
+    for (index_t i = 0; i < ni; i++) h_arr[i + 1] = (terminal_t)decode_be64(p + i * 8);
+    h_arr[(size_t)m - 1] = END_TERMINAL;
     free(buf);
 
-    fprintf(stderr, "Benchmark: %u tokens, m=%u\n", ni, m);
+    fprintf(stderr, "Benchmark: %zu tokens, m=%zu\n", (size_t)ni, (size_t)m);
     fprintf(stderr, "  MAX_BRACKETS_PER_POSITION=%zu  MAX_PRODS_PER_POSITION=%zu\n",
             (size_t)MAX_BRACKETS_PER_POSITION, (size_t)MAX_PRODS_PER_POSITION);
 
@@ -380,7 +371,7 @@ static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
     }
 
     // Pre-allocate GPU buffers and upload the input once
-    ParserFused<uint32_t> pre = allocParserFused<uint32_t>(m);
+    ParserFused pre = allocParserFused(m);
     gpuAssert(cudaMemcpy(pre.d_arr, h_arr.data(),
                          (size_t)m * sizeof(terminal_t), cudaMemcpyHostToDevice));
     fprintf(stderr, "  Cooperative grid: %u blocks x %u threads\n",
@@ -390,7 +381,7 @@ static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
     fprintf(stderr, "  Warmup (%u runs)...\n", warmup_runs);
     std::vector<uint64_t> dummy_prods;
     for (uint32_t i = 0; i < warmup_runs; i++) {
-        bool ok = runParserFused<uint32_t>(pre, h_arr.data(), m, dummy_prods);
+        bool ok = runParserFused(pre, h_arr.data(), m, dummy_prods);
         fprintf(stderr, "    run %u: %s\n", i + 1, ok ? "OK" : "PARSE FAILED");
     }
 
@@ -406,7 +397,7 @@ static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
         gpuAssert(cudaMemcpy(pre.bufs.d_valid, &one, sizeof(int), cudaMemcpyHostToDevice));
 
         gpuAssert(cudaEventRecord(ev0));
-        launchParserFused<uint32_t>(pre, m);
+        launchParserFused(pre, m);
         gpuAssert(cudaEventRecord(ev1));
         gpuAssert(cudaEventSynchronize(ev1));
         gpuAssert(cudaEventElapsedTime(&times_ms[i], ev0, ev1));
@@ -414,7 +405,7 @@ static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
 
     gpuAssert(cudaEventDestroy(ev0));
     gpuAssert(cudaEventDestroy(ev1));
-    freeParserFused<uint32_t>(pre);
+    freeParserFused(pre);
 
     // Statistics
     double sum = 0, mn = times_ms[0], mx = times_ms[0];
@@ -431,8 +422,8 @@ static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
     fprintf(stderr, "\n");
     fprintf(stderr, "============================================================\n");
     fprintf(stderr, " --benchmark results (GPU time only, pre-alloc buffers)\n");
-    fprintf(stderr, " Tokens: %u   m: %u   Warmup: %u   Runs: %u\n",
-            ni, m, warmup_runs, n_runs);
+    fprintf(stderr, " Tokens: %zu   m: %zu   Warmup: %u   Runs: %u\n",
+            (size_t)ni, (size_t)m, warmup_runs, n_runs);
     fprintf(stderr, "------------------------------------------------------------\n");
     fprintf(stderr, " Mean:       %.3f ms\n", mean);
     fprintf(stderr, " Stddev:     %.3f ms\n", stddev);
@@ -445,6 +436,106 @@ static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
 }
 
 #endif // HAS_PARSER
+
+// ---------------------------------------------------------------------------
+// Both mode: full pipeline (raw bytes → lexer → fused parser with parents)
+//
+// Input:  u64 BE num_tests; per test: u64 BE n + n raw bytes
+// Output: u64 BE num_tests; per test: u8 valid; if valid:
+//         u64 BE num_nodes; per node: u8 is_terminal, u64 BE parent,
+//         u64 BE id (terminal id for terminal nodes, else production id),
+//         u64 BE span start, u64 BE span end (0, 0 for nonterminal nodes)
+// Same format as the generated C backend's combined mode.
+// ---------------------------------------------------------------------------
+
+#if defined(HAS_LEXER) && defined(HAS_PARSER)
+
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+static void run_one_both_test(const uint8_t* bytes, uint64_t n, FILE* out) {
+    bool valid = true;
+    uint32_t num_lex = 0;
+    uint8_t*    d_string    = nullptr;
+    terminal_t* d_terminals = nullptr;
+    index_t*    d_starts    = nullptr;
+    index_t*    d_ends      = nullptr;
+
+    if (n > 0) {
+        gpuAssert(cudaMalloc(&d_string,    n * sizeof(uint8_t)));
+        gpuAssert(cudaMalloc(&d_terminals, n * sizeof(terminal_t)));
+        gpuAssert(cudaMalloc(&d_starts,    n * sizeof(index_t)));
+        gpuAssert(cudaMalloc(&d_ends,      n * sizeof(index_t)));
+        gpuAssert(cudaMemcpy(d_string, bytes, n, cudaMemcpyHostToDevice));
+
+        // Single-chunk launch on a fresh context (no streaming carry-over).
+        LexerCtx<uint32_t, index_t> ctx((uint32_t)n, BLOCK_SIZE, ITEMS_PER_THREAD);
+        const uint32_t num_blocks = numBlocks((uint32_t)n, BLOCK_SIZE, ITEMS_PER_THREAD);
+        lexer<uint32_t, index_t, BLOCK_SIZE, ITEMS_PER_THREAD><<<num_blocks, BLOCK_SIZE>>>(
+            ctx, d_string, d_terminals, d_starts, d_ends, (uint32_t)n, true);
+        gpuAssert(cudaDeviceSynchronize());
+        gpuAssert(cudaPeekAtLastError());
+        num_lex = ctx.terminalsSize();
+        valid   = ctx.isAccept();
+        ctx.cleanUp();
+    }
+
+    BothNodes nodes;
+    if (valid) {
+        index_t m = (index_t)num_lex + (index_t)2;
+        if ((uint64_t)m * (uint64_t)MAX_BRACKETS_PER_POSITION > (uint64_t)INT_MAX ||
+            (uint64_t)m * (uint64_t)MAX_PRODS_PER_POSITION    > (uint64_t)INT_MAX) {
+            valid = false;
+        } else {
+            ParserFused p = allocParserFused(m);
+            valid = runBothFused(p, d_terminals, (index_t)num_lex,
+                                 d_starts, d_ends, nodes);
+            freeParserFused(p);
+        }
+    }
+
+    if (d_string)    cudaFree(d_string);
+    if (d_terminals) cudaFree(d_terminals);
+    if (d_starts)    cudaFree(d_starts);
+    if (d_ends)      cudaFree(d_ends);
+
+    if (!valid) { fputc(0, out); return; }
+    fputc(1, out);
+    write_u64_be(out, (uint64_t)nodes.ids.size());
+    for (size_t i = 0; i < nodes.ids.size(); i++) {
+        fputc(nodes.is_term[i] ? 1 : 0, out);
+        write_u64_be(out, nodes.parents[i]);
+        write_u64_be(out, nodes.ids[i]);
+        write_u64_be(out, nodes.starts[i]);
+        write_u64_be(out, nodes.ends[i]);
+    }
+}
+
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+static int both_batch_impl(FILE* in, FILE* out) {
+    size_t buf_len = 0;
+    uint8_t* buf = slurp(in, &buf_len);
+    if (!buf || buf_len < 8) {
+        free(buf);
+        fprintf(stderr, "error: truncated input\n"); return 1;
+    }
+    const uint8_t* p   = buf;
+    const uint8_t* end = buf + buf_len;
+
+    uint64_t num_tests = decode_be64(p); p += 8;
+    write_u64_be(out, num_tests);
+
+    for (uint64_t t = 0; t < num_tests; t++) {
+        if (p + 8 > end) { free(buf); fprintf(stderr, "truncated\n"); return 1; }
+        uint64_t n = decode_be64(p); p += 8;
+        if (n > (uint64_t)(end - p)) { free(buf); fprintf(stderr, "truncated\n"); return 1; }
+        run_one_both_test<BLOCK_SIZE, ITEMS_PER_THREAD>(p, n, out);
+        p += n;
+    }
+    free(buf);
+    fflush(out);
+    return 0;
+}
+
+#endif // HAS_LEXER && HAS_PARSER
 
 // ---------------------------------------------------------------------------
 // main
@@ -500,25 +591,18 @@ int main(int argc, char* argv[]) {
     return ret;
 
 #elif defined(HAS_LEXER) && defined(HAS_PARSER)
-    // ---- Both mode ----
-    if (a.raw_input) {
-        // Full pipeline: raw bytes -> lexer -> tokens -> parser -> productions
-        // Not yet implemented; placeholder.
-        fprintf(stderr, "error: --raw-input (full pipeline) not yet implemented\n");
-        return 1;
-    } else {
-        // Binary token-ID protocol (same as parse-only)
-        int ret;
-        if (a.benchmark > 0)
-            ret = parser_benchmark(in, a.warmup, a.benchmark);
-        else if (a.server)
-            ret = parser_server(in, out);
-        else
-            ret = parser_batch(in, out);
-        if (in  != stdin)  fclose(in);
-        if (out != stdout) fclose(out);
-        return ret;
-    }
+    // ---- Both mode: raw bytes → lexer → parser → CST nodes (default) ----
+    // --server and --benchmark keep the token-ID protocol of parse-only mode.
+    int ret;
+    if (a.benchmark > 0)
+        ret = parser_benchmark(in, a.warmup, a.benchmark);
+    else if (a.server)
+        ret = parser_server(in, out);
+    else
+        ret = DISPATCH_BS_IPT(bs, ipt, both_batch_impl, in, out);
+    if (in  != stdin)  fclose(in);
+    if (out != stdout) fclose(out);
+    return ret;
 #else
     fprintf(stderr, "error: no lexer or parser compiled in\n");
     return 1;

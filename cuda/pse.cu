@@ -42,6 +42,9 @@ template <> struct ApsepInfinity<int> {
 template <> struct ApsepInfinity<unsigned> {
     __host__ __device__ static unsigned value() { return UINT_MAX; }
 };
+template <> struct ApsepInfinity<long> {
+    __host__ __device__ static long value() { return LONG_MAX; }
+};
 template <> struct ApsepInfinity<long long> {
     __host__ __device__ static long long value() { return LLONG_MAX; }
 };
@@ -63,7 +66,7 @@ __device__
 void apsepDeviceSPT(
         cg::grid_group          grid,
         const T* __restrict__   d_in,
-        int*                    d_out,
+        T*                      d_out,
         int                     n,
         int                     num_blocks,
         int                     M,            // next pow2 >= num_blocks
@@ -89,7 +92,7 @@ void apsepDeviceSPT(
     __shared__ T s_warp_min[NUM_WARPS];
 
     static_assert(IPT == 4, "blocked Phase 1 assumes IPT == 4");
-    static_assert(sizeof(T) == 4, "blocked Phase 1 assumes 4-byte T (int4 loads)");
+    static_assert(sizeof(T) == 4 || sizeof(T) == 8, "blocked Phase 1 assumes 4- or 8-byte T");
     static_assert(W <= 32, "warp-cooperative Phase 3 assumes W <= 32");
 
     // lt(a, b): "a qualifies as the answer for query value b".  INCL=false
@@ -114,9 +117,17 @@ void apsepDeviceSPT(
 
         T v[IPT];
         if (full) {
-            int4 raw = *reinterpret_cast<const int4*>(d_in + glb_offs + tbase);
-            v[0] = raw.x; v[1] = raw.y; v[2] = raw.z; v[3] = raw.w;
-            *reinterpret_cast<int4*>(s_elems + tbase) = raw;
+            if constexpr (sizeof(T) == 4) {
+                int4 raw = *reinterpret_cast<const int4*>(d_in + glb_offs + tbase);
+                v[0] = raw.x; v[1] = raw.y; v[2] = raw.z; v[3] = raw.w;
+                *reinterpret_cast<int4*>(s_elems + tbase) = raw;
+            } else {
+                longlong2 r0 = *reinterpret_cast<const longlong2*>(d_in + glb_offs + tbase);
+                longlong2 r1 = *reinterpret_cast<const longlong2*>(d_in + glb_offs + tbase + 2);
+                v[0] = (T)r0.x; v[1] = (T)r0.y; v[2] = (T)r1.x; v[3] = (T)r1.y;
+                *reinterpret_cast<longlong2*>(s_elems + tbase)     = r0;
+                *reinterpret_cast<longlong2*>(s_elems + tbase + 2) = r1;
+            }
         } else {
             #pragma unroll
             for (int i = 0; i < IPT; i++) {
@@ -228,7 +239,7 @@ void apsepDeviceSPT(
                 }
             }
 
-            if (active && res[i] >= 0) d_out[glb_offs + tbase + i] = glb_offs + res[i];
+            if (active && res[i] >= 0) d_out[glb_offs + tbase + i] = (T)(glb_offs + res[i]);
             bal[i] = __ballot_sync(0xffffffff, active && res[i] < 0);
         }
 
@@ -342,14 +353,22 @@ void apsepDeviceSPT(
         const bool eo_l  = !lt(pm_l, __ldg(&d_in[(size_t)bid_l * B]));
 
         // Dense fast path (descending worst case): every word in the group
-        // fully unresolved and early-out — the whole 4 KB span is -1.
-        // Coalesced int4 stores, no per-word loop.
+        // fully unresolved and early-out — the whole span is -1.
+        // Coalesced 16-byte vector stores, no per-word loop.
         if (__all_sync(0xffffffff, eo_l && um_l == 0xffffffffu)) {
-            int4* out4 = reinterpret_cast<int4*>(d_out) + (size_t)wbase * 8 + lane;
-            const int4 m1 = make_int4(-1, -1, -1, -1);
-            #pragma unroll
-            for (int i = 0; i < 8; i++)
-                out4[i * 32] = m1;
+            if constexpr (sizeof(T) == 4) {
+                int4* out4 = reinterpret_cast<int4*>(d_out) + (size_t)wbase * 8 + lane;
+                const int4 m1 = make_int4(-1, -1, -1, -1);
+                #pragma unroll
+                for (int i = 0; i < 8; i++) out4[i * 32] = m1;
+            } else {
+                // sizeof(T)==8: each longlong2 covers 2 elements; need 16 stores
+                // to cover the same 32 words × 32 elements/word = 1024 elements.
+                longlong2* out2 = reinterpret_cast<longlong2*>(d_out) + (size_t)wbase * 16 + lane;
+                const longlong2 m1 = make_longlong2(-1LL, -1LL);
+                #pragma unroll
+                for (int i = 0; i < 16; i++) out2[i * 32] = m1;
+            }
             continue;
         }
 
@@ -368,14 +387,14 @@ void apsepDeviceSPT(
         const bool mine         = (um >> mybit) & 1u;
 
         if (eo) {
-            if (mine) d_out[base + lane] = -1;
+            if (mine) d_out[base + lane] = (T)-1;
             continue;
         }
 
         const int gid = base + lane;
         T val = mine ? __ldg(&d_in[gid]) : INF;    // coalesced masked load
         const bool need = mine && lt(prefix_min_b, val);
-        if (mine && !need) d_out[gid] = -1;
+        if (mine && !need) d_out[gid] = (T)-1;
 
         // Warp-cooperative lookup for each remaining bit, one at a time.
         unsigned pend = __ballot_sync(0xffffffff, need);
@@ -420,7 +439,7 @@ void apsepDeviceSPT(
                 unsigned lmask = __ballot_sync(0xffffffff, lt(__ldg(&bl[lane]), qval));
                 result = found_block * B + wstar * 32 + (31 - __clz(lmask));
             }
-            if (lane == 0) d_out[base + bit] = result;
+            if (lane == 0) d_out[base + bit] = (T)result;
         }
     }
     }
@@ -432,7 +451,7 @@ template <typename T, int BLOCK_SIZE, int IPT, bool INCL = false>
 __global__
 void apsepKernelSPT(
         const T* __restrict__   d_in,
-        int*                    d_out,
+        T*                      d_out,
         int                     n,
         int                     num_blocks,
         int                     M,
@@ -500,7 +519,7 @@ void freeSPTScratch(SPTScratch<T, BLOCK_SIZE, IPT>& s) {
 }
 
 template <typename T, int BLOCK_SIZE = 128, int IPT = 4, bool INCL = false>
-void runSPT(const T* d_in, int* d_out, int n, SPTScratch<T, BLOCK_SIZE, IPT>& s) {
+void runSPT(const T* d_in, T* d_out, int n, SPTScratch<T, BLOCK_SIZE, IPT>& s) {
     if (n <= 0) return;
 
     void* args[] = {
@@ -517,7 +536,7 @@ void runSPT(const T* d_in, int* d_out, int n, SPTScratch<T, BLOCK_SIZE, IPT>& s)
 }
 
 template <typename T, int BLOCK_SIZE = 128, int IPT = 4, bool INCL = false>
-void launchSPT(const T* d_in, int* d_out, int n) {
+void launchSPT(const T* d_in, T* d_out, int n) {
     if (n <= 0) return;
     SPTScratch<T, BLOCK_SIZE, IPT> s = allocSPTScratch<T, BLOCK_SIZE, IPT, INCL>(n);
     runSPT<T, BLOCK_SIZE, IPT, INCL>(d_in, d_out, n, s);

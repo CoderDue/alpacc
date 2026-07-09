@@ -190,7 +190,7 @@ public:
   }
 
   __device__ __host__ __forceinline__
-  state_t toState(const char &a) const {
+  state_t toState(const uint8_t &a) const {
     return d_to_state[a];
   }
 
@@ -261,9 +261,12 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   volatile I* indices = (volatile I*) shared_buffer;
   volatile state_t* states_aux = (volatile state_t*) shared_buffer;
   __shared__ state_t next_block_first_state;
-  const I REG_MEM = 1 + ITEMS_PER_THREAD / sizeof(uint64_t);
-  uint64_t copy_reg[REG_MEM];
-  uint8_t *chars_reg = (uint8_t*) copy_reg;
+  // Main slots: ceil(ITEMS_PER_THREAD / 8) uint64_t registers per thread.
+  // One extra slot is added to cover the single byte past the block boundary
+  // needed for the boundary produce check (same as the original +1 trick).
+  constexpr uint32_t VPT = vecPerThread<uint8_t, uint64_t, ITEMS_PER_THREAD>() + 1;
+  uint64_t copy_reg[VPT];
+  uint8_t* chars_reg = reinterpret_cast<uint8_t*>(copy_reg);
   uint32_t is_produce_state = 0;
 
   uint32_t dyn_index = ctx.getDynamicIndex();
@@ -273,32 +276,36 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     next_block_first_state = IDENTITY;
   }
 
-#pragma unroll
-  for (I i = 0; i < REG_MEM; i++) {
-    I uint64_lid = i * blockDim.x + threadIdx.x;
-    I lid = sizeof(uint64_t) * uint64_lid;
-    I gid = glb_offs + lid;
-    if (gid + sizeof(uint64_t) < size) {
-      copy_reg[i] = *((uint64_t*) (gid + (uint8_t*) d_string));
+  // Vectorized global → registers.  glbToReg covers the first VPT-1 slots
+  // (ITEMS_PER_THREAD bytes).  The last slot is loaded separately to reach the
+  // one byte immediately past the block boundary.
+  glbToReg<uint8_t, uint64_t, BLOCK_SIZE, ITEMS_PER_THREAD>(glb_offs, size, d_string, copy_reg);
+  {
+    constexpr uint32_t EPV = (uint32_t)sizeof(uint64_t);
+    constexpr uint32_t v   = VPT - 1;
+    I elem0       = (I)(v * BLOCK_SIZE + threadIdx.x) * EPV;
+    I n_remaining = size - glb_offs;
+    if (elem0 + EPV <= n_remaining) {
+      copy_reg[v] = *reinterpret_cast<const uint64_t*>(d_string + glb_offs + elem0);
     } else {
-      for (I j = 0; j < sizeof(uint64_t); j++) {
-        I loc_gid = gid + j;
-        if (loc_gid < size) {
-          chars_reg[sizeof(uint64_t) * i + j] = d_string[loc_gid];
-        }
+      uint8_t* bytes = reinterpret_cast<uint8_t*>(&copy_reg[v]);
+#pragma unroll
+      for (uint32_t b = 0; b < EPV; b++) {
+        I gid = elem0 + (I)b;
+        bytes[b] = (gid < n_remaining) ? d_string[glb_offs + gid] : 0;
       }
     }
   }
-    
+
 #pragma unroll
-  for (I i = 0; i < REG_MEM; i++) {
-    I lid = i * blockDim.x + threadIdx.x;
-    I _gid = glb_offs + sizeof(uint64_t) * lid;
-    for (I j = 0; j < sizeof(uint64_t); j++) {
-      I gid = _gid + j;
-      I lid_off = sizeof(uint64_t) * lid + j;
-      I reg_off = sizeof(uint64_t) * i + j;
-      bool is_in_block = lid_off < ITEMS_PER_THREAD * BLOCK_SIZE; 
+  for (uint32_t i = 0; i < VPT; i++) {
+    I lid = (I)i * BLOCK_SIZE + threadIdx.x;
+    I _gid = glb_offs + (I)sizeof(uint64_t) * lid;
+    for (uint32_t j = 0; j < sizeof(uint64_t); j++) {
+      I gid = _gid + (I)j;
+      I lid_off = (I)sizeof(uint64_t) * lid + (I)j;
+      uint32_t reg_off = sizeof(uint64_t) * i + j;
+      bool is_in_block = lid_off < (I)(ITEMS_PER_THREAD * BLOCK_SIZE);
       if (gid < size && is_in_block) {
           if (gid == 0) {
             states[lid_off] = ctx(ctx.getLastState(), reinterpret_cast<state_t>(ctx.toState(chars_reg[reg_off])));
@@ -307,7 +314,11 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
           }
       } else if (is_in_block) {
           states[lid_off] = IDENTITY;
-      } else if (lid_off == ITEMS_PER_THREAD * BLOCK_SIZE && !is_last_chunk) {
+      } else if (lid_off == (I)(ITEMS_PER_THREAD * BLOCK_SIZE) && gid < size) {
+          // First byte of the next block, needed for the boundary produce
+          // test.  Guarded by gid < size (not is_last_chunk): interior block
+          // boundaries exist in the last chunk too, and for the final block
+          // the byte is out of range regardless of chunk position.
           next_block_first_state = ctx.toState(chars_reg[reg_off]);
       }
     }
@@ -324,8 +335,8 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     bool is_next_produce = false;
     if (gid < size) {
       state_t state = states[lid];
-#ifdef IGNORE_TERMINAL
-      bool is_not_ignore = get_terminal(state) != IGNORE_TERMINAL;
+#ifdef IGNORE_TOKEN
+      bool is_not_ignore = get_terminal(state) != IGNORE_TOKEN;
 #else
       bool is_not_ignore = true;
 #endif
@@ -409,24 +420,24 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
 
 
 struct WriteBinary {
-  void operator()(size_t i, size_t j, terminal_t s) const {
-    uint8_t* buffer[2 * sizeof(size_t) + sizeof(terminal_t)];
-    memcpy(buffer, &i, sizeof(size_t));
-    memcpy(buffer + sizeof(size_t), &j, sizeof(size_t));
-    memcpy(buffer + 2 * sizeof(size_t), &s, sizeof(terminal_t));
-    fwrite(buffer, 2 * sizeof(size_t) + sizeof(terminal_t), 1, stdout);
+  void operator()(index_t i, index_t j, terminal_t s) const {
+    uint8_t buffer[2 * sizeof(index_t) + sizeof(terminal_t)];
+    memcpy(buffer, &i, sizeof(index_t));
+    memcpy(buffer + sizeof(index_t), &j, sizeof(index_t));
+    memcpy(buffer + 2 * sizeof(index_t), &s, sizeof(terminal_t));
+    fwrite(buffer, 2 * sizeof(index_t) + sizeof(terminal_t), 1, stdout);
   }
 };
 
 struct WriteAscii {
-  void operator()(size_t i, size_t j, terminal_t s) const {
-    printf("%lu %lu %lu\n", i, j, (size_t) s);
+  void operator()(index_t i, index_t j, terminal_t s) const {
+    printf("%lld %lld %lu\n", (long long)i, (long long)j, (size_t)s);
   }
 };
 
 
 struct NoWrite {
-  void operator()(size_t i, size_t j, terminal_t s) const {
+  void operator()(index_t i, index_t j, terminal_t s) const {
     // No operation
   }
 };
@@ -454,35 +465,35 @@ int lexer_stream(PRINT print, bool timeit = false) {
   
   uint8_t* h_string = (uint8_t*) malloc(CHUNK_SIZE * sizeof(uint8_t));
   terminal_t* h_terminals = (terminal_t*) malloc(CHUNK_SIZE * sizeof(terminal_t));
-  size_t* h_starts = (size_t*) malloc(CHUNK_SIZE * sizeof(size_t));
-  size_t* h_ends = (size_t*) malloc(CHUNK_SIZE * sizeof(size_t));
+  index_t* h_starts = (index_t*) malloc(CHUNK_SIZE * sizeof(index_t));
+  index_t* h_ends = (index_t*) malloc(CHUNK_SIZE * sizeof(index_t));
   assert(h_string != NULL);
   assert(h_terminals != NULL);
   assert(h_starts != NULL);
   assert(h_ends != NULL);
 
-  constexpr size_t required_shmem = 
+  constexpr size_t required_shmem =
       calculate_lexer_shared_memory_usage<uint32_t, state_t, BLOCK_SIZE, ITEMS_PER_THREAD>();
-  
+
   int device;
   cudaGetDevice(&device);
   cudaDeviceProp prop;
   cudaGetDeviceProperties(&prop, device);
-  
-  assert(required_shmem <= prop.sharedMemPerBlock && 
+
+  assert(required_shmem <= prop.sharedMemPerBlock &&
           "Kernel requires more shared memory than available on device!");
 
   uint8_t* d_string;
   terminal_t* d_terminals;
-  size_t* d_starts;
-  size_t* d_ends;
+  index_t* d_starts;
+  index_t* d_ends;
   gpuAssert(cudaMalloc((void**)&d_string, CHUNK_SIZE * sizeof(uint8_t)));
   gpuAssert(cudaMalloc((void**)&d_terminals, CHUNK_SIZE * sizeof(terminal_t)));
-  gpuAssert(cudaMalloc((void**)&d_starts, CHUNK_SIZE * sizeof(size_t)));
-  gpuAssert(cudaMalloc((void**)&d_ends, CHUNK_SIZE * sizeof(size_t)));
+  gpuAssert(cudaMalloc((void**)&d_starts, CHUNK_SIZE * sizeof(index_t)));
+  gpuAssert(cudaMalloc((void**)&d_ends, CHUNK_SIZE * sizeof(index_t)));
 
   assert(WARP <= BLOCK_SIZE);
-  LexerCtx ctx = LexerCtx<uint32_t, size_t>(CHUNK_SIZE, BLOCK_SIZE, ITEMS_PER_THREAD);
+  LexerCtx ctx = LexerCtx<uint32_t, index_t>(CHUNK_SIZE, BLOCK_SIZE, ITEMS_PER_THREAD);
 
   size_t new_size = 0;
   size_t final_size = 0;
@@ -501,7 +512,7 @@ int lexer_stream(PRINT print, bool timeit = false) {
 
     const uint32_t num_blocks = numBlocks(bytes, BLOCK_SIZE, ITEMS_PER_THREAD);
     cudaEventRecord(start, 0);
-    lexer<uint32_t, size_t, BLOCK_SIZE, ITEMS_PER_THREAD><<<num_blocks, BLOCK_SIZE>>>(ctx, d_string, d_terminals, d_starts, d_ends, bytes, !is_not_done);
+    lexer<uint32_t, index_t, BLOCK_SIZE, ITEMS_PER_THREAD><<<num_blocks, BLOCK_SIZE>>>(ctx, d_string, d_terminals, d_starts, d_ends, bytes, !is_not_done);
     gpuAssert(cudaDeviceSynchronize());
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
@@ -513,8 +524,8 @@ int lexer_stream(PRINT print, bool timeit = false) {
     new_size = ctx.terminalsSize();
 
     cudaMemcpy(h_terminals, d_terminals, new_size * sizeof(terminal_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_starts, d_starts, new_size * sizeof(size_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ends, d_ends, new_size * sizeof(size_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_starts, d_starts, new_size * sizeof(index_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_ends, d_ends, new_size * sizeof(index_t), cudaMemcpyDeviceToHost);
 
     for (size_t i = 0; i < new_size; i++) {
       print(h_starts[i], h_ends[i], h_terminals[i]);
@@ -544,11 +555,11 @@ int lexer_stream(PRINT print, bool timeit = false) {
 
 template<uint32_t CHUNK_SIZE, uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
 bool lexer_full(
-  LexerCtx<uint32_t, size_t> ctx, 
+  LexerCtx<uint32_t, index_t> ctx,
   uint8_t* d_string,
   terminal_t* d_terminals,
-  size_t* d_starts,
-  size_t* d_ends,
+  index_t* d_starts,
+  index_t* d_ends,
   size_t size,
   size_t* new_size) {
   assert(size != 0);
@@ -571,8 +582,8 @@ bool lexer_full(
           "Kernel requires more shared memory than available on device!");
 
   cudaMalloc((void**)&d_terminals, CHUNK_SIZE * sizeof(terminal_t));
-  cudaMalloc((void**)&d_starts, CHUNK_SIZE * sizeof(size_t));
-  cudaMalloc((void**)&d_ends, CHUNK_SIZE * sizeof(size_t));
+  cudaMalloc((void**)&d_starts, CHUNK_SIZE * sizeof(index_t));
+  cudaMalloc((void**)&d_ends, CHUNK_SIZE * sizeof(index_t));
 
   size_t prev_index = 0;
   size_t temp_new_size = 0;
@@ -587,7 +598,7 @@ bool lexer_full(
 
     const uint32_t NUM_BLOCKS = numBlocks(bytes, BLOCK_SIZE, ITEMS_PER_THREAD);
     cudaEventRecord(start, 0);
-    lexer<uint32_t, size_t, BLOCK_SIZE, ITEMS_PER_THREAD><<<NUM_BLOCKS, BLOCK_SIZE>>>(ctx, d_string, d_terminals, d_starts, d_ends, bytes, offset < size - CHUNK_SIZE);
+    lexer<uint32_t, index_t, BLOCK_SIZE, ITEMS_PER_THREAD><<<NUM_BLOCKS, BLOCK_SIZE>>>(ctx, d_string, d_terminals, d_starts, d_ends, bytes, offset < size - CHUNK_SIZE);
     gpuAssert(cudaDeviceSynchronize());
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
@@ -603,8 +614,8 @@ bool lexer_full(
         alloc_size *= 2;
       }
       cudaMalloc((void**)&d_terminals, alloc_size * sizeof(terminal_t));
-      cudaMalloc((void**)&d_starts, alloc_size * sizeof(size_t));
-      cudaMalloc((void**)&d_ends, alloc_size * sizeof(size_t));
+      cudaMalloc((void**)&d_starts, alloc_size * sizeof(index_t));
+      cudaMalloc((void**)&d_ends, alloc_size * sizeof(index_t));
     }
 
     ctx.update();
@@ -613,8 +624,8 @@ bool lexer_full(
   *new_size = temp_new_size;
   
   cudaMalloc((void**)&d_terminals, temp_new_size * sizeof(terminal_t));
-  cudaMalloc((void**)&d_starts, temp_new_size * sizeof(size_t));
-  cudaMalloc((void**)&d_ends, temp_new_size * sizeof(size_t));
+  cudaMalloc((void**)&d_starts, temp_new_size * sizeof(index_t));
+  cudaMalloc((void**)&d_ends, temp_new_size * sizeof(index_t));
 
   return ctx.isAccept();
 }

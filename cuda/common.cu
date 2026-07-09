@@ -38,34 +38,147 @@ void compute_descriptors(float* measurements, size_t size, size_t bytes) {
 const uint8_t LG_WARP = 5;
 const uint8_t WARP = 1 << LG_WARP;
 
-template<typename T, typename I, I ITEMS_PER_THREAD>
-__device__ inline void
-glbToShmemCpy(const I glb_offs,
-              const I size,
-              const T ne,
-              T* d_read,
-              volatile T* shmem_write) {
-#pragma unroll
-  for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-    I lid = i * blockDim.x + threadIdx.x;
-    I gid = glb_offs + lid;
-    shmem_write[lid] = gid < size ? d_read[gid] : ne;
-  }
-  __syncthreads();
+// ---------------------------------------------------------------------------
+// Blocked I/O helpers: vectorized global↔register↔shared transfers.
+//
+// The key optimisation for sub-64-bit element types (e.g. uint8_t): each
+// thread issues one uint64_t load per VEC_PER_THREAD register slot instead
+// of ITEMS_PER_THREAD single-byte loads, reducing instruction count and
+// making coalescing explicit.
+//
+// Naming convention:
+//   glbToReg      – global → registers (packed as VEC = uint64_t)
+//   regToShmem    – registers (packed) → shared memory (unpacked as T)
+//   glbToShmem    – global → shared (vectorized, combined; adds __syncthreads)
+//   shmemToGlb    – shared → global (element-wise; adds __syncthreads)
+//   glbToShmemCpy – naive scalar fallback (kept for types where sizeof(T)==sizeof(VEC))
+//
+// Template parameters:
+//   T              – element type (e.g. uint8_t, uint32_t)
+//   VEC            – vector load type (e.g. uint64_t); must be >= sizeof(T)
+//   BLOCK_SIZE     – threads per block (compile-time)
+//   ITEMS_PER_THREAD – logical elements per thread
+//   I              – index type (e.g. uint32_t)
+//
+// VEC_PER_THREAD = ceil(ITEMS_PER_THREAD * sizeof(T) / sizeof(VEC)):
+//   number of VEC-sized register slots per thread.
+// ---------------------------------------------------------------------------
+
+// Number of VEC slots needed per thread to hold ITEMS_PER_THREAD elements of T.
+template<typename T, typename VEC, uint32_t ITEMS_PER_THREAD>
+__host__ __device__ constexpr uint32_t vecPerThread() {
+    return (ITEMS_PER_THREAD * (uint32_t)sizeof(T) + (uint32_t)sizeof(VEC) - 1)
+           / (uint32_t)sizeof(VEC);
 }
 
-template<typename T, typename I, I ITEMS_PER_THREAD>
-__device__ inline void
-shmemToGlbCpy(const I glb_offs,
-              const I size,
-              T* d_write,
-              volatile T* shmem_read) {
+// Load ITEMS_PER_THREAD elements of T per thread from global memory into
+// VEC-sized register slots (reg[VEC_PER_THREAD]).  Out-of-bounds positions
+// leave the corresponding bytes in `reg` uninitialised (callers guard with
+// `gid < size` before use, or use the shmem variant which fills `ne`).
+template<typename T, typename VEC, uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, typename I>
+__device__ __forceinline__ void
+glbToReg(I glb_offs, I size, const T* __restrict__ d_src,
+          VEC reg[vecPerThread<T, VEC, ITEMS_PER_THREAD>()])
+{
+    constexpr uint32_t VPT    = vecPerThread<T, VEC, ITEMS_PER_THREAD>();
+    constexpr uint32_t EPV    = (uint32_t)sizeof(VEC) / (uint32_t)sizeof(T); // elements per VEC
+    const T* __restrict__ src = d_src + glb_offs;
+    const I n_remaining       = size - glb_offs;    // elements left from our start
 #pragma unroll
-  for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-    I lid = blockDim.x * i + threadIdx.x;
-    I gid = glb_offs + lid;
-    if (gid < size)
-      d_write[gid] = shmem_read[lid];
-  }
-  __syncthreads();
+    for (uint32_t v = 0; v < VPT; v++) {
+        // Global index of the first element in this VEC slot for this thread.
+        I elem0 = (I)(v * BLOCK_SIZE + threadIdx.x) * EPV;
+        if (elem0 + EPV <= n_remaining) {
+            // Full vector load: all EPV elements are in bounds.
+            reg[v] = *reinterpret_cast<const VEC*>(src + elem0);
+        } else {
+            // Partial: byte-by-byte, guarded.
+            uint8_t* bytes = reinterpret_cast<uint8_t*>(&reg[v]);
+#pragma unroll
+            for (uint32_t b = 0; b < sizeof(VEC); b++) {
+                I gid = elem0 + b / (uint32_t)sizeof(T);
+                bytes[b] = (gid < n_remaining)
+                    ? reinterpret_cast<const uint8_t*>(src + elem0)[b]
+                    : 0;
+            }
+        }
+    }
+}
+
+// Unpack VEC register slots into shared memory as T elements.
+// Writes ITEMS_PER_THREAD entries at logical positions [threadIdx.x*IPT ..
+// threadIdx.x*IPT + IPT) in a striped layout compatible with glbToReg above.
+// No __syncthreads: caller must synchronise before reading shmem.
+template<typename T, typename VEC, uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+__device__ __forceinline__ void
+regToShmem(const VEC reg[vecPerThread<T, VEC, ITEMS_PER_THREAD>()],
+            volatile T shmem[BLOCK_SIZE * ITEMS_PER_THREAD])
+{
+    constexpr uint32_t VPT = vecPerThread<T, VEC, ITEMS_PER_THREAD>();
+    constexpr uint32_t EPV = (uint32_t)sizeof(VEC) / (uint32_t)sizeof(T);
+#pragma unroll
+    for (uint32_t v = 0; v < VPT; v++) {
+        const T* elems = reinterpret_cast<const T*>(&reg[v]);
+#pragma unroll
+        for (uint32_t e = 0; e < EPV; e++) {
+            uint32_t lid = (v * BLOCK_SIZE + threadIdx.x) * EPV + e;
+            if (lid < BLOCK_SIZE * ITEMS_PER_THREAD)
+                shmem[lid] = elems[e];
+        }
+    }
+}
+
+// Vectorized global → shared: combines glbToReg + regToShmem, fills
+// out-of-bounds positions with `ne`, then __syncthreads.
+template<typename T, typename VEC, uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, typename I>
+__device__ __forceinline__ void
+glbToShmem(I glb_offs, I size, T ne,
+            const T* __restrict__ d_src,
+            volatile T shmem[BLOCK_SIZE * ITEMS_PER_THREAD])
+{
+    constexpr uint32_t VPT = vecPerThread<T, VEC, ITEMS_PER_THREAD>();
+    VEC reg[VPT];
+    glbToReg<T, VEC, BLOCK_SIZE, ITEMS_PER_THREAD>(glb_offs, size, d_src, reg);
+    regToShmem<T, VEC, BLOCK_SIZE, ITEMS_PER_THREAD>(reg, shmem);
+    // Fill out-of-bounds with ne (only the partial tail thread needs this).
+#pragma unroll
+    for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
+        uint32_t lid = i * BLOCK_SIZE + threadIdx.x;
+        I gid = glb_offs + lid;
+        if (gid >= size) shmem[lid] = ne;
+    }
+    __syncthreads();
+}
+
+// Scalar global → shared (naive, for types where sizeof(T) == sizeof(VEC)
+// or when vectorization is not beneficial).  Adds __syncthreads.
+template<typename T, typename I, uint32_t ITEMS_PER_THREAD>
+__device__ __forceinline__ void
+glbToShmemCpy(I glb_offs, I size, T ne,
+               const T* __restrict__ d_src,
+               volatile T* shmem)
+{
+#pragma unroll
+    for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
+        uint32_t lid = i * blockDim.x + threadIdx.x;
+        I gid = glb_offs + lid;
+        shmem[lid] = (gid < size) ? d_src[gid] : ne;
+    }
+    __syncthreads();
+}
+
+// Shared → global (element-wise, no packing needed).  Adds __syncthreads.
+template<typename T, typename I, uint32_t ITEMS_PER_THREAD>
+__device__ __forceinline__ void
+shmemToGlbCpy(I glb_offs, I size,
+               T* d_dst,
+               const volatile T* shmem)
+{
+#pragma unroll
+    for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
+        uint32_t lid = i * blockDim.x + threadIdx.x;
+        I gid = glb_offs + lid;
+        if (gid < size) d_dst[gid] = shmem[lid];
+    }
+    __syncthreads();
 }
