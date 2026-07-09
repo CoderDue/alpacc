@@ -1,5 +1,10 @@
-ignore = (\s|\n|\t|\r)+;
-atom = [a-zA-Z0-9]+;
+params {
+  lookback = 0.
+  lookahead = 1.
+}
 
-E = atom | "(" E0 ")";
-E0 = | E E0;
+ignore = /\s|\n|\t|\r/.
+atom = /[a-zA-Z0-9]+/.
+
+E -> atom | "(" E0 ")".
+E0 -> | E E0.

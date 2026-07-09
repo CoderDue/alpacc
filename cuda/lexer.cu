@@ -535,7 +535,7 @@ int lexer_stream(PRINT print, bool timeit = false) {
   }
 
   if (timeit) {
-    printf("Time: %.2fms\n", time);
+    fprintf(stderr, "Time: %.2fms\n", time);
   }
 
   fflush(stdout);
