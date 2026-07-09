@@ -1,3 +1,5 @@
+#include <cuda/atomic>
+
 template<typename T, typename I, typename OP, I ITEMS_PER_THREAD>
 __device__ inline void
 scanThread(volatile T* shmem,
@@ -24,9 +26,11 @@ scanWarp(volatile T* shmem,
   uint8_t h;
 
 #pragma unroll
-  for (uint8_t d = 0; d < LG_WARP; d++)
+  for (uint8_t d = 0; d < LG_WARP; d++) {
     if ((h = 1 << d) <= lane)
       shmem[threadIdx.x] = op(shmem[threadIdx.x - h], shmem[threadIdx.x]);
+    __syncwarp();
+  }
 
   return shmem[threadIdx.x];
 }
@@ -102,18 +106,21 @@ enum Status: uint8_t {
   Prefix = 2,
 };
 
+// Alias for device-scope atomic status (acquire/release semantics).
+using AtomicStatus = cuda::atomic<Status, cuda::thread_scope_device>;
+
 template<typename I, typename T>
 struct States {
-  volatile T*      aggregates = nullptr;
-  volatile T*      prefixes   = nullptr;
-  volatile Status* statuses   = nullptr;
+  volatile T*   aggregates = nullptr;
+  volatile T*   prefixes   = nullptr;
+  AtomicStatus* statuses   = nullptr;
   I num_blocks = 0;
 
   States(I num_blocks) : num_blocks(num_blocks) {
     cudaMalloc((void**)&aggregates, num_blocks * sizeof(T));
     cudaMalloc((void**)&prefixes, num_blocks * sizeof(T));
-    cudaMalloc((void**)&statuses, num_blocks * sizeof(Status));
-    cudaMemset((void*) statuses, Invalid, num_blocks * sizeof(Status));
+    cudaMalloc((void**)&statuses, num_blocks * sizeof(AtomicStatus));
+    cudaMemset((void*) statuses, Invalid, num_blocks * sizeof(AtomicStatus));
   }
 
   States() {
@@ -129,6 +136,8 @@ struct States {
 
 __device__ inline Status
 combine(Status a, Status b) {
+  if (a == Invalid || b == Invalid)
+    return Invalid;
   if (b == Aggregate)
     return a;
   return b;
@@ -150,12 +159,13 @@ scanWarp(volatile T* values,
       values[tid] = is_not_aggregate ? values[tid] : op(values[tid - h], values[tid]);
       statuses[tid] = combine(statuses[tid - h], statuses[tid]);
     }
+    __syncwarp();
   }
 }
 
 template<typename T, typename I, typename OP, I ITEMS_PER_THREAD>
 __device__ inline T
-decoupledLookbackScan(volatile States<I, T> states,
+decoupledLookbackScan(States<I, T> states,
                       volatile T* shmem,
                       OP op,
                       T ne,
@@ -168,7 +178,9 @@ decoupledLookbackScan(volatile States<I, T> states,
   const bool is_first = threadIdx.x == 0;
 
   if (is_first) {
-    states.statuses[dyn_idx] = Invalid;
+    // relaxed store is fine: the __syncthreads() below acts as a barrier
+    // ensuring all threads in this block see Invalid before we proceed.
+    states.statuses[dyn_idx].store(Invalid, cuda::memory_order_relaxed);
   }
   __syncthreads();
 
@@ -180,11 +192,12 @@ decoupledLookbackScan(volatile States<I, T> states,
   if (dyn_idx == 0 && is_first) {
     states.prefixes[dyn_idx] = aggregate;
   }
-  __threadfence();
+  // Release store: memory_order_release makes aggregate/prefix writes visible
+  // to all threads that subsequently load this status with memory_order_acquire.
   if (dyn_idx == 0 && is_first) {
-    states.statuses[dyn_idx] = Prefix;
+    states.statuses[dyn_idx].store(Prefix, cuda::memory_order_release);
   } else if (is_first) {
-    states.statuses[dyn_idx] = Aggregate;
+    states.statuses[dyn_idx].store(Aggregate, cuda::memory_order_release);
   }
 
   T prefix = ne;
@@ -195,9 +208,11 @@ decoupledLookbackScan(volatile States<I, T> states,
     do {
       if (lookback_warp <= lookback_idx) {
         I idx = lookback_idx - lookback_warp;
-        status = states.statuses[idx];
-        statuses[threadIdx.x] = status;
-        values[threadIdx.x] = status == Prefix ? states.prefixes[idx] : states.aggregates[idx];
+        // Acquire load: pairs with the writer's memory_order_release store,
+        // ensuring aggregate/prefix writes are visible before we read them.
+        Status s = states.statuses[idx].load(cuda::memory_order_acquire);
+        statuses[threadIdx.x] = s;
+        values[threadIdx.x] = s == Prefix ? states.prefixes[idx] : states.aggregates[idx];
       } else {
         statuses[threadIdx.x] = Aggregate;
         values[threadIdx.x] = ne;
@@ -227,8 +242,7 @@ decoupledLookbackScan(volatile States<I, T> states,
 
   if (is_first) {
     states.prefixes[dyn_idx] = op(prefix, aggregate);
-    __threadfence();
-    states.statuses[dyn_idx] = Prefix;
+    states.statuses[dyn_idx].store(Prefix, cuda::memory_order_release);
   }
 
   prefix = shmem_prefix;
@@ -248,7 +262,7 @@ template<typename T, typename I, typename OP, I ITEMS_PER_THREAD>
 __device__ inline T
 scan(volatile T* block,
      volatile T* block_aux,
-     volatile States<I, T> states,
+     States<I, T> states,
      OP op,
      T ne,
      uint32_t dyn_idx,
