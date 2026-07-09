@@ -44,6 +44,7 @@ data Command
   = Generate !GeneratorParameters
   | Test !TestCommand
   | Random !RandomParameters
+  | GenBytes !GenBytesParameters
   deriving (Show)
 
 data TestCommand
@@ -63,6 +64,12 @@ data GeneratorParameters = GeneratorParameters
     generatorOutput :: !(Maybe String),
     generatorGenerator :: !Gen,
     generatorBackend :: !Backend
+  }
+  deriving (Show)
+
+data GenBytesParameters = GenBytesParameters
+  { genBytesInput :: !Input,
+    genBytesLength :: !Int
   }
   deriving (Show)
 
@@ -258,6 +265,22 @@ randomParameters =
             <*> numProductionsParameter
         )
 
+genBytesParameters :: Parser Command
+genBytesParameters =
+  GenBytes
+    <$> ( GenBytesParameters
+            <$> inputParameter
+            <*> option
+              auto
+              ( long "length"
+                  <> short 'l'
+                  <> help "Number of bytes to generate."
+                  <> showDefault
+                  <> value 104857600
+                  <> metavar "INT"
+              )
+        )
+
 testGenerateParameters :: Parser Command
 testGenerateParameters =
   Test . TestGenerate
@@ -295,6 +318,7 @@ commands =
         <> command "c" (info (generatorParameters C) (progDesc "Generate parsers written in C."))
         <> command "random" (info randomParameters (progDesc "Generate random parser that can be used for testing."))
         <> command "test" (info testCommands (progDesc "Test related commands."))
+        <> command "generate-bytes" (info genBytesParameters (progDesc "Generate raw input bytes for a lexer grammar, written to stdout."))
     )
 
 options :: ParserInfo Command
@@ -457,12 +481,22 @@ mainTestCompare params = do
     expected = testCompareExpected params
     result = testCompareResult params
 
+mainGenBytes :: GenBytesParameters -> IO ()
+mainGenBytes params = do
+  cfg <- readCfg input
+  bytes <- eitherToIO $ lexerBytes cfg len
+  ByteString.hPut stdout bytes
+  where
+    input = genBytesInput params
+    len = genBytesLength params
+
 main :: IO ()
 main = do
   opts <- execParser options
   case opts of
     Generate params -> mainGenerator params
     Random params -> mainRandom params
+    GenBytes params -> mainGenBytes params
     Test test -> case test of
       TestGenerate params -> mainTestGenerate params
       TestCompare params -> mainTestCompare params

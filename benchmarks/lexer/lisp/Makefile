@@ -6,9 +6,6 @@ FUTHARK_BACKEND?=cuda
 INPUT_SIZE?=104857600
 .PHONY: clean bench build bench-rust bench-c bench-futhark bench-cuda
 
-tokens: tokens.c
-	$(CC) -o $@ $^ $(CFLAGS)
-
 lexer-c: lexer.c
 	$(CC) -o $@ $^ $(CFLAGS)
 
@@ -18,10 +15,8 @@ lexer.cu: sexp.alp
 lexer-cuda: lexer.cu
 	nvcc -O3 -std=c++17 -arch=native -o $@ $^
 
-data.in: tokens
-	@printf "Creating input dataset...\n"
-	@./$^ $(INPUT_SIZE) > data.in
-	@printf "Done creating input dataset.\n"
+data.in: sexp.alp
+	alpacc generate-bytes sexp.alp --length $(INPUT_SIZE) > $@
 
 lexer-rust: lexer.rs Cargo.toml Cargo.lock
 	cargo build --release
@@ -73,4 +68,4 @@ bench: lexer-rust lexer-c lexer-cuda sexp.fut data.in
 	futhark bench --backend $(FUTHARK_BACKEND) sexp.fut
 
 clean:
-	rm -rf tokens data.in target lexer-rust lexer-c data.out sexp sexp.c sexp.fut lexer-cuda lexer.cu
+	rm -rf data.in target lexer-rust lexer-c data.out sexp sexp.c sexp.fut lexer-cuda lexer.cu

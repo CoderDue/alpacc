@@ -13,17 +13,9 @@ lexer.cu: json.alp
 lexer-cuda: lexer.cu
 	nvcc -O3 -std=c++17 -arch=native -o $@ $^
 
-data.json:
-	@{ \
-	if ! command -v mkjson &> /dev/null; \
-	then \
-		git clone https://github.com/mfussenegger/mkjson; \
-		cd mkjson; \
-		cabal install --overwrite-policy=always; \
-	fi; \
-	}
+data.json: json.alp
+	alpacc generate-bytes json.alp --length $(INPUT_SIZE) > $@
 
-	mkjson >$@ 'data=replicate(10,object(when,randomDateTime(),what,randomDouble(0,10),status,randomInt(0,1)))'
 lexer-rust: lexer.rs Cargo.toml Cargo.lock
 	cargo build --release
 	@cp target/release/lexer-rust .
@@ -65,4 +57,4 @@ bench: lexer-rust lexer-cuda json.fut data.json
 	futhark bench --backend $(FUTHARK_BACKEND) json.fut
 
 clean:
-	rm -rf tokens data.json target lexer-rust data.out json json.c json.fut lexer-cuda lexer.cu
+	rm -rf data.json target lexer-rust data.out json json.c json.fut lexer-cuda lexer.cu

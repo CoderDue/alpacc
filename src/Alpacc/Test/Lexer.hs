@@ -1,6 +1,7 @@
 module Alpacc.Test.Lexer
   ( lexerTests,
     lexerTestsCompare,
+    lexerBytes,
     TestMode (..),
     randomSeed,
   )
@@ -177,6 +178,15 @@ lexerTests mode cfg k = do
   where
     toOutputs dfa ignore = Outputs . fmap (Output . tokenize dfa ignore)
     toInputs = Inputs . fmap (Input . ByteString.pack)
+
+-- | Generate raw bytes for a single long lexer input, suitable for piping
+-- directly into a lexer benchmark (no binary framing).
+lexerBytes :: CFG -> Int -> Either Text ByteString
+lexerBytes cfg k = do
+  spec <- cfgToDFALexerSpec cfg
+  let alpha = alphabet $ fsa $ lexerDFA (0 :: Integer) $ mapSymbols unBytes spec
+  pure $ ByteString.pack $ generateSingleLongInputFromDFA k alpha
+         (fsa $ lexerDFA (0 :: Integer) $ mapSymbols unBytes spec)
 
 lexerTestsCompare :: CFG -> ByteString -> ByteString -> ByteString -> Either Text ()
 lexerTestsCompare cfg input expected result = do
