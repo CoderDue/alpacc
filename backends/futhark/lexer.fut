@@ -3,7 +3,7 @@
 -- The generic parallel lexer, expressed as a parameterised
 -- module.
 
-import "lib/github.com/diku-dk/containers/opt"
+import "lib/github.com/diku-dk/containers/core/opt"
 
 module type lexer_context = {
   type terminal
@@ -175,19 +175,18 @@ module mk_lexer (L: lexer_context)
               (chunk_size: i32)
               (str: [n]u8) : opt ([](terminal_int, (i64, i64))) =
     let (is_valid, result) = lex_int_flag chunk_size str
-    in if is_valid then some result else #none
+    in if is_valid then #some result else #none
 
   def lex [n]
           (chunk_size: i32)
           (str: [n]u8) : opt ([](terminal, (i64, i64))) =
     let (is_valid, result) = lex_int_flag chunk_size str
     in if is_valid
-       then some
-            <| map (\(t, s) ->
-                      ( copy L.terminal_int_to_name[L.terminal_int_module.to_i64 t]
-                      , s
-                      ))
-                   result
+       then #some (map (\(t, s) ->
+                          ( copy L.terminal_int_to_name[L.terminal_int_module.to_i64 t]
+                          , s
+                          ))
+                       result)
        else #none
 }
 

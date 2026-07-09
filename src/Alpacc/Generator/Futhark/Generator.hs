@@ -28,7 +28,7 @@ entry parse s =
     case #some t -> t
     case #none -> []
   let cst = parser.parse tokens
-  in if is_some tokens'
+  in if opt.is_some tokens'
      then cst
      else #none
 
@@ -39,7 +39,7 @@ entry parse_int s =
     case #some t -> t
     case #none -> []
   let cst = parser.parse_int tokens
-  in if is_some tokens'
+  in if opt.is_some tokens'
      then cst
      else #none
 

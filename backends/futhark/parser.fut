@@ -3,7 +3,7 @@
 -- The generic LLP parsing machine, expressed as a parameterised
 -- module.
 
-import "lib/github.com/diku-dk/containers/opt"
+import "lib/github.com/diku-dk/containers/core/opt"
 import "lib/github.com/diku-dk/segmented/segmented"
 
 module type parser_context = {
@@ -232,11 +232,11 @@ module mk_parser (P: parser_context)
   def construct_productions =
     segmented_copy P.productions
 
-  def to_keys arr =
+  def to_keys arr : opt ([]((i32, i32), (i32, i32))) =
     let arr' = [P.start_terminal] ++ arr ++ [P.end_terminal]
     let idxs = keys arr'
     in if valid_keys idxs
-       then some idxs
+       then #some idxs
        else #none
 
   def widen_span (s: i32, e: i32) : (i64, i64) = (i64.i32 s, i64.i32 e)
@@ -255,13 +255,13 @@ module mk_parser (P: parser_context)
 
   def pre_productions_int_flag [n] (arr: [n]terminal_int) : (bool, []production_int) =
     let ks' = to_keys arr
-    let is_valid = is_some ks'
+    let is_valid = opt.is_some ks'
     let ks =
       match ks'
       case #some k -> k
       case #none -> []
     let prods = to_productions ks
-    let is_valid = is_valid && is_some prods
+    let is_valid = is_valid && opt.is_some prods
     let result =
       match prods
       case #some ps -> ps
@@ -270,13 +270,12 @@ module mk_parser (P: parser_context)
 
   def pre_productions_int [n] (arr: [n]terminal_int) : opt ([]production_int) =
     let (is_valid, prods) = pre_productions_int_flag arr
-    in if is_valid then some prods else #none
+    in if is_valid then #some prods else #none
 
   def pre_productions [n] (arr: [n]terminal_int) : opt ([]production) =
     let (is_valid, prods) = pre_productions_int_flag arr
     in if is_valid
-       then some
-            <| map (\p -> copy P.production_int_to_name[production_int_module.to_i64 p]) prods
+       then #some (map (\p -> copy P.production_int_to_name[production_int_module.to_i64 p]) prods)
        else #none
 
   def production_to_terminal (p: production_int) : opt terminal_int =
@@ -307,12 +306,12 @@ module mk_parser (P: parser_context)
   def terminal_offsets [n] [m]
                        (spans: [m](i64, i64))
                        (ts: [n](opt terminal_int)) : [](i64, node terminal_int production_int) =
-    map (is_some) ts
+    map (opt.is_some) ts
     |> zip3 (iota n) (ts)
     |> filter (\(_, _, b) -> b)
     |> safe_zip spans
     |> map (\(s, (i, t, _)) ->
-              from_opt empty_terminal t
+              opt.from empty_terminal t
               |> (\t' -> (i, #terminal t' s)))
 
   def parse_int_flag [n] (arr: [n](terminal_int, (i64, i64))) : (bool, [](i64, node terminal_int production_int)) =
@@ -331,7 +330,7 @@ module mk_parser (P: parser_context)
         in scatter prods offsets tprods
            |> zip parent_vector
       case _ -> []
-    in if is_some prods' then (true, result) else (false, [])
+    in if opt.is_some prods' then (true, result) else (false, [])
 
   def parse_int [n] (arr: [n](terminal_int, (i64, i64))) : opt ([](i64, node terminal_int production_int)) =
     let (is_valid, prods) = parse_int_flag arr
@@ -348,7 +347,7 @@ module mk_parser (P: parser_context)
                ((i, #production (copy P.production_int_to_name[production_int_module.to_i64 p])) :> (i64, node terminal production)))
           prods
     in if is_valid
-       then some result
+       then #some result
        else #none
 }
 

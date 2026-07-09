@@ -3,7 +3,7 @@
 -- The generic parallel lexer tester, expressed as a parameterised
 -- module.
 
-import "lib/github.com/diku-dk/containers/opt"
+import "lib/github.com/diku-dk/containers/core/opt"
 
 #[inline]
 def encode_u64 (a: u64) : [8]u8 =
