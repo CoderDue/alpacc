@@ -5,7 +5,7 @@ params {
   lookahead = 3.
 }
 
-string = /"([\x00-\x21\x23-\xFF]|\\")*"/.
+string = /"([\x00-\x21\x23-\x5B\x5D-\xFF]|\\")*"/.
 number = /-?[0-9]+(.[0-9]+)?/.
 ignore = /\s|\n|\t|\r/.
 

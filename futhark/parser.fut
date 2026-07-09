@@ -17,14 +17,14 @@ module type parser_context = {
   val k : i64
   val number_of_productions : i64
   val production_to_terminal : [number_of_productions](opt terminal_int_module.t)
-  val production_to_arity : [number_of_productions]i64
+  val production_to_arity : [number_of_productions]u8
   val start_terminal : terminal_int_module.t
   val end_terminal : terminal_int_module.t
   val hash_table_size : i64
   val max_iters : i64
   val productions_size : i64
   val stacks_size : i64
-  val hash_table : [hash_table_size](bool, [q + k]terminal_int_module.t, ((i64, i64), (i64, i64)))
+  val hash_table : [hash_table_size](bool, [q + k]terminal_int_module.t, ((i32, i32), (i32, i32)))
   val stacks : [stacks_size]bracket_module.t
   val productions : [productions_size]production_int_module.t
   val production_int_to_name : [number_of_productions]production
@@ -127,10 +127,10 @@ module mk_parser (P: parser_context)
     map2 eq as bs
     |> and
 
-  def lookup (k: [P.q + P.k]terminal_int) : ((i64, i64), (i64, i64)) =
+  def lookup (k: [P.q + P.k]terminal_int) : ((i32, i32), (i32, i32)) =
     let h = (hash k) %% u64.i64 P.hash_table_size
     let (_, _, _, v) =
-      loop (is_found, i, h, v) = (false, 0, h, ((-1, -1), (-1, -1)))
+      loop (is_found, i, h, v) = (false, 0, h, ((-1i32, -1i32), (-1i32, -1i32)))
       while is_found || i < P.max_iters do
         let (t, k', v') = P.hash_table[i64.u64 h]
         let is_valid = t && (array_equal (terminal_int_module.==) k' k)
@@ -141,13 +141,13 @@ module mk_parser (P: parser_context)
            )
     in v
 
-  def keys [n] (arr: [n]terminal_int) : [n]((i64, i64), (i64, i64)) =
+  def keys [n] (arr: [n]terminal_int) : [n]((i32, i32), (i32, i32)) =
     tabulate n
              (\i ->
                 let key = get_key arr i
                 in lookup key)
 
-  def valid_keys [n] : [n]((i64, i64), (i64, i64)) -> bool =
+  def valid_keys [n] : [n]((i32, i32), (i32, i32)) -> bool =
     all (\((a, b), (c, d)) -> a != -1 && b != -1 && c != -1 && d != -1)
 
   def depths [n] (input: [n]bracket) : opt ([n]i64) =
@@ -239,13 +239,15 @@ module mk_parser (P: parser_context)
        then some idxs
        else #none
 
-  def to_productions [n] (ks: [n]((i64, i64), (i64, i64))) : opt ([]production_int) =
+  def widen_span (s: i32, e: i32) : (i64, i64) = (i64.i32 s, i64.i32 e)
+
+  def to_productions [n] (ks: [n]((i32, i32), (i32, i32))) : opt ([]production_int) =
     let (stack_spans, productions_spans) = unzip ks
-    let stacks = construct_stacks stack_spans
+    let stacks = construct_stacks (map widen_span stack_spans)
     let is_valid = brackets_matches stacks
     let prods =
       if is_valid
-      then construct_productions productions_spans
+      then construct_productions (map widen_span productions_spans)
       else []
     in if is_valid
        then #some prods
@@ -281,7 +283,7 @@ module mk_parser (P: parser_context)
     copy P.production_to_terminal[production_int_module.to_i64 p]
 
   def production_to_arity (p: production_int) : i64 =
-    copy P.production_to_arity[production_int_module.to_i64 p]
+    i64.u8 (copy P.production_to_arity[production_int_module.to_i64 p])
 
   def parents [n] (ps: [n]production_int) : [n]i64 =
     let tree =
