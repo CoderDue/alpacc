@@ -25,6 +25,12 @@
 #include <cstdint>
 #include <cinttypes>
 
+static inline uint64_t decode_be64(const uint8_t* p) {
+    return ((uint64_t)p[0]<<56)|((uint64_t)p[1]<<48)|((uint64_t)p[2]<<40)|
+           ((uint64_t)p[3]<<32)|((uint64_t)p[4]<<24)|((uint64_t)p[5]<<16)|
+           ((uint64_t)p[6]<< 8)|((uint64_t)p[7]);
+}
+
 // ---------------------------------------------------------------------------
 // Argument parsing helpers
 // ---------------------------------------------------------------------------
@@ -316,14 +322,6 @@ static void run_one_parser_test(const uint64_t* tokens, uint64_t n,
     } else {
         fputc(0, out);
     }
-}
-
-// Batch mode: read num_tests-prefixed stream
-// Decode a big-endian u64 from a byte pointer (no alignment requirement).
-static inline uint64_t decode_be64(const uint8_t* p) {
-    return ((uint64_t)p[0]<<56)|((uint64_t)p[1]<<48)|((uint64_t)p[2]<<40)|
-           ((uint64_t)p[3]<<32)|((uint64_t)p[4]<<24)|((uint64_t)p[5]<<16)|
-           ((uint64_t)p[6]<< 8)|((uint64_t)p[7]);
 }
 
 // Bulk-read the entire input into memory, then decode, to avoid per-token fread overhead.
