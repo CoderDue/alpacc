@@ -19,7 +19,7 @@ $(DATA): json.alp
 	alpacc test generate json.alp --lexer --single-long --no-outputs --length $(INPUT_SIZE) -o $(basename $(DATA))
 
 $(DATA_RAW): $(DATA)
-	dd if=$(DATA) of=$(DATA_RAW) bs=1 skip=16
+	dd if=$(DATA) of=$(DATA_RAW) bs=16 skip=1
 
 lexer-rust: lexer.rs Cargo.toml Cargo.lock
 	cargo build --release

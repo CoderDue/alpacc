@@ -16,7 +16,7 @@ $(DATA): json.alp
 	alpacc test generate json.alp --single-long --no-outputs --length $(INPUT_SIZE) -o $(basename $(DATA))
 
 $(DATA_RAW): $(DATA)
-	dd if=$(DATA) of=$(DATA_RAW) bs=1 skip=16
+	dd if=$(DATA) of=$(DATA_RAW) bs=16 skip=1
 
 json.fut: json.alp $(DATA_RAW)
 	alpacc futhark json.alp -o $@

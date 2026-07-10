@@ -25,7 +25,7 @@ lexer-rust: lexer.rs Cargo.toml Cargo.lock
 	@cp target/release/lexer-rust .
 
 $(DATA_RAW): $(DATA)
-	dd if=$(DATA) of=$(DATA_RAW) bs=1 skip=16
+	dd if=$(DATA) of=$(DATA_RAW) bs=16 skip=1
 
 sexp.fut: sexp.alp $(DATA_RAW)
 	alpacc futhark sexp.alp --lexer
