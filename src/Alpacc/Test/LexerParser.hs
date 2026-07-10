@@ -8,7 +8,7 @@ where
 import Alpacc.CFG
 import Alpacc.Encode
 import Alpacc.Grammar
-import Alpacc.LL (generateRandomDerivation, generateRandomDerivationFold, generateRandomDerivationLazy)
+import Alpacc.LL (generateRandomDerivationFold)
 import Alpacc.LLP
 import Alpacc.Lexer.DFA
 import Alpacc.Lexer.FSA

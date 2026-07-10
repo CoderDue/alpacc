@@ -4,7 +4,7 @@ H=\x1B[32m\033[1m
 E=\033[0m\x1B[0m
 FUTHARK_BACKEND?=cuda
 INPUT_SIZE?=104857600
-DATA=data-$(INPUT_SIZE).in
+DATA=data-$(INPUT_SIZE).inputs
 DATA_RAW=data-raw-$(INPUT_SIZE).in
 .PHONY: clean bench build bench-rust bench-c bench-futhark bench-cuda
 
@@ -18,7 +18,7 @@ lexer-cuda: lexer.cu
 	nvcc -O3 -std=c++17 -arch=native -o $@ $^
 
 $(DATA): sexp.alp
-	alpacc test generate sexp.alp --lexer --single-long --no-outputs --length $(INPUT_SIZE) -o $(basename $(DATA))
+	alpacc test generate sexp.alp --lexer --single-long --no-outputs --length $(INPUT_SIZE) -o data-$(INPUT_SIZE)
 
 lexer-rust: lexer.rs Cargo.toml Cargo.lock
 	cargo build --release
@@ -66,4 +66,4 @@ bench: lexer-c lexer-cuda sexp.fut $(DATA)
 	futhark bench --backend $(FUTHARK_BACKEND) sexp.fut
 
 clean:
-	rm -rf data-*.in data-raw-*.in target lexer-rust lexer-c sexp sexp.c sexp.fut lexer-cuda lexer.cu
+	rm -rf data-*.inputs data-raw-*.in target lexer-rust lexer-c sexp sexp.c sexp.fut lexer-cuda lexer.cu

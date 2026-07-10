@@ -2,7 +2,7 @@ H=\x1B[32m\033[1m
 E=\033[0m\x1B[0m
 FUTHARK_BACKEND?=cuda
 INPUT_SIZE?=10485760
-DATA=data-$(INPUT_SIZE).in
+DATA=data-$(INPUT_SIZE).inputs
 DATA_RAW=data-raw-$(INPUT_SIZE).in
 .PHONY: clean bench build bench-futhark bench-cuda
 
@@ -13,7 +13,7 @@ parser-cuda: parser.cu
 	nvcc -O3 -std=c++17 -arch=native -o $@ $^
 
 $(DATA): sexp.alp
-	alpacc test generate sexp.alp --single-long --no-outputs --length $(INPUT_SIZE) -o $(basename $(DATA))
+	alpacc test generate sexp.alp --single-long --no-outputs --length $(INPUT_SIZE) -o data-$(INPUT_SIZE)
 
 $(DATA_RAW): $(DATA)
 	dd if=$(DATA) of=$(DATA_RAW) bs=16 skip=1
@@ -44,4 +44,4 @@ bench: parser-cuda sexp.fut $(DATA)
 	futhark bench --backend $(FUTHARK_BACKEND) sexp.fut
 
 clean:
-	rm -rf data-*.in data-raw-*.in parser-cuda parser.cu sexp sexp.c sexp.fut
+	rm -rf data-*.inputs data-raw-*.in parser-cuda parser.cu sexp sexp.c sexp.fut
