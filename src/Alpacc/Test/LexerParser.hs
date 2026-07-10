@@ -8,7 +8,7 @@ where
 import Alpacc.CFG
 import Alpacc.Encode
 import Alpacc.Grammar
-import Alpacc.LL (generateRandomDerivationFold)
+import Alpacc.LL (generateRandomDerivationLazy)
 import Alpacc.LLP
 import Alpacc.Lexer.DFA
 import Alpacc.Lexer.FSA
@@ -321,22 +321,20 @@ minTokenBytes min_map tok = Map.findWithDefault [] tok min_map
 -- if the bytes already generated plus the minimum bytes still needed for the
 -- remaining tokens would exceed @len@, the rest of the tokens are given their
 -- minimum byte representation so the total stays within budget.
+-- Returns (payloadByteCount, lazyPayload) so callers avoid forcing LBS.length.
 generateSingleLongLexerParserInput ::
   (Ord s, Ord nt, Show nt) =>
   Int ->
   Set Word8 ->
   DFALexer Word8 s T ->
   Grammar (AugmentedNonterminal (Symbol nt T)) (AugmentedTerminal (Unused T)) ->
-  LBS.ByteString
+  (Int, LBS.ByteString)
 generateSingleLongLexerParserInput len _alpha dfa_lexer grammar =
   let gen = mkStdGen randomSeed
       min_map = computeMinTokenBytesMap dfa_lexer
       env = mkWalkEnv dfa_lexer
       maxPathBytes = 16
       poolSize = 256 :: Int
-      -- Build pools for ALL tokens known from the DFA (not just those that
-      -- appear in the derivation), so we never need to scan the derivation
-      -- list for unique tokens.  This keeps memory O(grammar size).
       allToks = Map.keys min_map
       buildPool g tok =
         let minPath = minTokenBytes min_map tok
@@ -353,37 +351,40 @@ generateSingleLongLexerParserInput len _alpha dfa_lexer grammar =
           (gen, Map.empty)
           allToks
       minCostOf tok = length (minTokenBytes min_map tok)
-      -- Pass 1: collect totalMin from one derivation traversal.
-      (_, totalMin) =
-        generateRandomDerivationFold gen len grammar
-          (\c raw -> case unaug raw of
-            Nothing  -> c
-            Just tok -> c + minCostOf tok)
-          (0 :: Int)
+      minBytesOf tok = ByteString.pack (minTokenBytes min_map tok)
+      -- Compute average pool variant length per token type, then use the
+      -- weighted average across all token types to scale the byte target to
+      -- an approximate token count for the derivation.
+      avgPoolLen tok =
+        let arr = pools Map.! tok
+            total = sum [ByteString.length (arr ! ix) | ix <- [0 .. poolSize - 1]]
+        in fromIntegral total / fromIntegral poolSize :: Double
+      allAvg = if null allToks then 1.0
+               else sum (map avgPoolLen allToks) / fromIntegral (length allToks)
+      -- Token count target: scale len by average bytes per token.
+      tokenTarget = max 1 (round (fromIntegral len / allAvg) :: Int)
+      -- Two lazy derivation passes with the scaled token target.
+      (_, rawToks) = generateRandomDerivationLazy gen tokenTarget grammar
+      toks = [t | raw <- rawToks, Just t <- [unaug raw]]
+      !totalMin = foldl' (\acc tok -> acc + minCostOf tok) 0 toks
       needsBudget = totalMin < len
-      -- Pass 2 (emit): track remMin (sum of min costs of not-yet-emitted tokens)
-      -- starting at totalMin and subtracting as each token is emitted.
-      -- If used + remMin > len, fall back to the minimum-path bytes so the
-      -- output never overshoots len while still emitting every token.
-      (_, (_, _, _, chunksRev)) =
-        generateRandomDerivationFold gen len grammar
-          (\(g, used, remMin, cs) raw ->
-            case unaug raw of
-              Nothing -> (g, used, remMin, cs)
-              Just tok ->
-                let mc = minCostOf tok
-                    remMin' = remMin - mc
-                 in if needsBudget && used + remMin > len
-                      then
-                        let bs = ByteString.pack (minTokenBytes min_map tok)
-                         in (g, used + mc, remMin', bs : cs)
-                      else
-                        let arr = pools Map.! tok
-                            (idx, g') = randomR (0, poolSize - 1 :: Int) g
-                            bs = arr ! idx
-                         in (g', used + ByteString.length bs, remMin', bs : cs))
-          (gen2, 0, totalMin, [])
-   in LBS.fromChunks (reverse chunksRev)
+      (_, rawToks2) = generateRandomDerivationLazy gen tokenTarget grammar
+      toks2 = [t | raw <- rawToks2, Just t <- [unaug raw]]
+      -- remMin tracks remaining minimum bytes for not-yet-emitted tokens.
+      (_, !totalBytes, _, chunksRev) =
+        foldl'
+          (\(g, !used, !remMin, cs) tok ->
+            let mc        = minCostOf tok
+                remMin'   = remMin - mc
+                arr       = pools Map.! tok
+                (idx, g') = randomR (0, poolSize - 1 :: Int) g
+                bs = if needsBudget && used + remMin > len
+                       then minBytesOf tok
+                       else arr ! idx
+             in (g', used + ByteString.length bs, remMin', bs : cs))
+          (gen2, 0 :: Int, totalMin, [])
+          toks2
+   in (totalBytes, LBS.fromChunks (reverse chunksRev))
   where
     unaug (AugmentedTerminal (Used t)) = Just t
     unaug _ = Nothing
@@ -408,8 +409,7 @@ lexerParserTests mode cfg n noOutputs = do
           out  = if noOutputs then Outputs [] else toOutputs q k encoder dfa maybe_ignore (getGrammar grammar) table comb
       pure (encode inp, encode out)
     SingleLong -> do
-      let singleInput = generateSingleLongLexerParserInput n alpha dfa (getGrammar grammar)
-          payloadLen  = LBS.length singleInput
+      let (payloadLen, singleInput) = generateSingleLongLexerParserInput n alpha dfa (getGrammar grammar)
           inp         = encode (1 :: Word64) <> encode (fromIntegral payloadLen :: Word64) <> singleInput
           combWords   = [LBS.unpack singleInput]
           out         = toOutputs q k encoder dfa maybe_ignore (getGrammar grammar) table combWords
