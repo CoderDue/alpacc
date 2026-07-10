@@ -159,7 +159,7 @@ static uint32_t auto_ipt(uint32_t shmem_budget, uint32_t bs) {
 // I/O helpers (reused across modes)
 // ---------------------------------------------------------------------------
 
-static uint64_t read_u64_be(FILE* f) {
+static __attribute__((unused)) uint64_t read_u64_be(FILE* f) {
     uint8_t p[8];
     if (fread(p, 1, 8, f) != 8) return (uint64_t)-1;
     return ((uint64_t)p[0]<<56)|((uint64_t)p[1]<<48)|((uint64_t)p[2]<<40)|
@@ -167,7 +167,7 @@ static uint64_t read_u64_be(FILE* f) {
            ((uint64_t)p[6]<< 8)|((uint64_t)p[7]);
 }
 
-static void write_u64_be(FILE* f, uint64_t v) {
+static __attribute__((unused)) void write_u64_be(FILE* f, uint64_t v) {
     uint8_t p[8];
     p[0]=(uint8_t)(v>>56); p[1]=(uint8_t)(v>>48);
     p[2]=(uint8_t)(v>>40); p[3]=(uint8_t)(v>>32);
@@ -253,9 +253,6 @@ static int run_lexer_batch_impl(FILE* in, bool timeit) {
         uint64_t n = decode_be64(p); p += 8;
         if (n > (uint64_t)(end - p)) { ret = 1; break; }
 
-        constexpr uint32_t CHUNK_SIZE = 100u * (1u << 20);
-        // Re-use lexer_stream by feeding bytes through a memory buffer via tmpfile approach
-        // is complex; instead directly invoke the lexer kernel on the chunk.
         if (n > 0) {
             uint8_t*    d_str  = nullptr;
             terminal_t* d_tok  = nullptr;
