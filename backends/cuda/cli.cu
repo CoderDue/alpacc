@@ -321,6 +321,7 @@ static void run_one_parser_test(const uint64_t* tokens, uint64_t n,
     }
 }
 
+#if defined(HAS_PARSER) && !defined(HAS_LEXER)
 // Bulk-read the entire input into memory, then decode, to avoid per-token fread overhead.
 static int parser_batch(FILE* in, FILE* out) {
     size_t buf_len = 0;
@@ -349,6 +350,7 @@ static int parser_batch(FILE* in, FILE* out) {
     fflush(out);
     return 0;
 }
+#endif /* HAS_PARSER && !HAS_LEXER */
 
 // Server mode: loop on length-prefixed frames.
 // Each frame: u64 BE frame_byte_length, then frame_byte_length bytes
