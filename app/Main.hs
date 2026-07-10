@@ -420,15 +420,15 @@ mainTestGenerate params = do
 
   case testGenerateGenerator params of
     GenLexer -> do
-      (inputs, ouputs) <- eitherToIO $ lexerTests mode cfg len
+      (inputs, ouputs) <- eitherToIO $ lexerTests mode cfg len noOutputs
       ByteString.writeFile (name <> ".inputs") inputs
       unless noOutputs $ ByteString.writeFile (name <> ".outputs") ouputs
     GenParser -> do
-      (inputs, ouputs) <- eitherToIO $ parserTests mode cfg len
+      (inputs, ouputs) <- eitherToIO $ parserTests mode cfg len noOutputs
       ByteString.writeFile (name <> ".inputs") inputs
       unless noOutputs $ ByteString.writeFile (name <> ".outputs") ouputs
     GenBoth -> do
-      (inputs, ouputs) <- eitherToIO $ lexerParserTests mode cfg len
+      (inputs, ouputs) <- eitherToIO $ lexerParserTests mode cfg len noOutputs
       ByteString.writeFile (name <> ".inputs") inputs
       unless noOutputs $ ByteString.writeFile (name <> ".outputs") ouputs
   where

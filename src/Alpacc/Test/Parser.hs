@@ -100,8 +100,8 @@ generateSingleLongTokenSequence len grammar =
     unaug (AugmentedTerminal t) = Just t
     unaug _ = Nothing
 
-parserTests :: TestMode -> CFG -> Int -> Either Text (ByteString, ByteString)
-parserTests mode cfg n = do
+parserTests :: TestMode -> CFG -> Int -> Bool -> Either Text (ByteString, ByteString)
+parserTests mode cfg n noOutputs = do
   let q = paramsLookback $ cfgParams cfg
       k = paramsLookahead $ cfgParams cfg
   grammar <- cfgToGrammar cfg
@@ -121,13 +121,13 @@ parserTests mode cfg n = do
         Exhaustive ->
           let comb = listProducts n validTerminals
            in ( Inputs $ Input . fmap (fromIntegral . encode' . AugmentedTerminal) <$> comb,
-                Outputs $ Output . fmap (fmap fromIntegral) . parse <$> comb
+                if noOutputs then Outputs [] else Outputs $ Output . fmap (fmap fromIntegral) . parse <$> comb
               )
         SingleLong ->
           let singleSeq = generateSingleLongTokenSequence n (getGrammar grammar)
               comb = [singleSeq]
            in ( Inputs $ Input . fmap (fromIntegral . encode' . AugmentedTerminal) <$> comb,
-                Outputs $ Output . fmap (fmap fromIntegral) . parse <$> comb
+                if noOutputs then Outputs [] else Outputs $ Output . fmap (fmap fromIntegral) . parse <$> comb
               )
       parse = llpParse q k table
   pure

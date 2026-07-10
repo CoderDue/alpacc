@@ -333,8 +333,8 @@ generateSingleLongLexerParserInput len _alpha dfa_lexer grammar =
     unaug (AugmentedTerminal (Used t)) = Just t
     unaug _ = Nothing
 
-lexerParserTests :: TestMode -> CFG -> Int -> Either Text (ByteString, ByteString)
-lexerParserTests mode cfg n = do
+lexerParserTests :: TestMode -> CFG -> Int -> Bool -> Either Text (ByteString, ByteString)
+lexerParserTests mode cfg n noOutputs = do
   let q = paramsLookback $ cfgParams cfg
       k = paramsLookahead $ cfgParams cfg
   spec <- cfgToDFALexerSpec cfg
@@ -349,11 +349,11 @@ lexerParserTests mode cfg n = do
       (inputs, outputs) = case mode of
         Exhaustive ->
           let comb = listProducts n $ Set.toList alpha
-           in (toInputs comb, toOutputs q k encoder dfa maybe_ignore (getGrammar grammar) table comb)
+           in (toInputs comb, if noOutputs then Outputs [] else toOutputs q k encoder dfa maybe_ignore (getGrammar grammar) table comb)
         SingleLong ->
           let singleInput = generateSingleLongLexerParserInput n alpha dfa (getGrammar grammar)
               comb = [singleInput]
-           in (toInputs comb, toOutputs q k encoder dfa maybe_ignore (getGrammar grammar) table comb)
+           in (toInputs comb, if noOutputs then Outputs [] else toOutputs q k encoder dfa maybe_ignore (getGrammar grammar) table comb)
   pure
     ( ByteString.toStrict $ encode inputs,
       ByteString.toStrict $ encode outputs

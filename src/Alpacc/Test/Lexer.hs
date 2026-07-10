@@ -20,6 +20,7 @@ import Data.Binary
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Internal
 import Data.Either.Extra
+import Data.Array (bounds, listArray, (!))
 import Data.List (zip4)
 import Data.Map qualified as Map
 import Data.Set qualified as Set
@@ -127,33 +128,43 @@ generateSingleLongInputFromDFA len alpha dfa =
       trans = transitions' dfa
       accept = accepting dfa
       alphaList = Set.toList alpha
+      alphaArr = listArray (0, length alphaList - 1) alphaList
 
-      -- First, try to generate a string that ends at an accepting state
+      -- Precompute per-state valid-symbol arrays so we do O(1) work per step.
+      validSymsFor s =
+        let vs = [sym | sym <- alphaList, Map.member (s, sym) trans]
+        in listArray (0, length vs - 1) vs
+      validSymsMap = Map.fromList [(s, validSymsFor s) | s <- Map.keys trans']
+        where trans' = Map.mapKeys fst trans
+
+      -- Walk the DFA randomly, accumulating symbols in reverse.
       simulateDFA _ 0 state acc
         | state `Set.member` accept = Just (reverse acc)
         | otherwise = Nothing
       simulateDFA g n state acc =
-        let validSymbols = [sym | sym <- alphaList, Map.member (state, sym) trans]
-         in if null validSymbols
-              then Nothing -- Stuck, can't continue
-              else
-                let (idx, g') = randomR (0, length validSymbols - 1) g
-                    nextSymbol = validSymbols !! idx
-                    nextState = trans Map.! (state, nextSymbol)
-                 in simulateDFA g' (n - 1) nextState (nextSymbol : acc)
+        case Map.lookup state validSymsMap of
+          Nothing -> Nothing
+          Just arr ->
+            let nValid = snd (bounds arr) + 1
+            in if nValid == 0
+                 then Nothing
+                 else
+                   let (idx, g') = randomR (0, nValid - 1) g
+                       nextSymbol = arr ! idx
+                       nextState = trans Map.! (state, nextSymbol)
+                   in simulateDFA g' (n - 1) nextState (nextSymbol : acc)
 
       result = simulateDFA gen len initial_state []
       fallback =
         let numChoices = length alphaList
             randomIndices = take len $ randomRs (0, numChoices - 1) gen
-         in map (alphaList !!) randomIndices
+         in map (alphaArr !) randomIndices
    in case result of
         Just xs -> xs
-        -- Fallback to random generation if we can't find a valid path
         Nothing -> fallback
 
-lexerTests :: TestMode -> CFG -> Int -> Either Text (ByteString, ByteString)
-lexerTests mode cfg k = do
+lexerTests :: TestMode -> CFG -> Int -> Bool -> Either Text (ByteString, ByteString)
+lexerTests mode cfg k noOutputs = do
   spec <- cfgToDFALexerSpec cfg
   let ts = Map.keys $ regexMap spec
       encoder = encodeTerminals (T "ignore") $ parsingTerminals ts
@@ -167,10 +178,10 @@ lexerTests mode cfg k = do
       (inputs, outputs) = case mode of
         Exhaustive ->
           let comb = listProducts k $ Set.toList alpha
-           in (toInputs comb, toOutputs dfa ignore comb)
+           in (toInputs comb, if noOutputs then emptyOutputs else toOutputs dfa ignore comb)
         SingleLong ->
           let singleInput = generateSingleLongInputFromDFA k alpha (fsa dfa)
-           in (toInputs [singleInput], toOutputs dfa ignore [singleInput])
+           in (toInputs [singleInput], if noOutputs then emptyOutputs else toOutputs dfa ignore [singleInput])
   pure
     ( ByteString.toStrict $ encode inputs,
       ByteString.toStrict $ encode outputs
@@ -178,6 +189,7 @@ lexerTests mode cfg k = do
   where
     toOutputs dfa ignore = Outputs . fmap (Output . tokenize dfa ignore)
     toInputs = Inputs . fmap (Input . ByteString.pack)
+    emptyOutputs = Outputs []
 
 -- | Generate raw bytes for a single long lexer input, suitable for piping
 -- directly into a lexer benchmark (no binary framing).
