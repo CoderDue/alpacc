@@ -9,7 +9,6 @@
 #   make test           test-unit + test-futhark + test-c  (no GPU required)
 
 SHELL := bash
-INSTALLDIR := $(HOME)/bin
 
 # Arguments forwarded to the random-grammar test scripts (mirror CI values).
 RANDOM_TARGET := 50
@@ -32,7 +31,6 @@ FUTHARK_BACKEND ?= multicore
 
 build:
 	cabal build all
-	cabal install --installdir=$(INSTALLDIR) --overwrite-policy=always
 
 # ---------------------------------------------------------------------------
 # Unit tests
