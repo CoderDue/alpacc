@@ -1,5 +1,6 @@
 module Alpacc.Test.LexerParser
   ( lexerParserTests,
+    lexerParserTestsSingleLong,
     parse,
     lexerParserTestsCompare,
   )
@@ -18,12 +19,14 @@ import Alpacc.Util
 import Codec.Binary.UTF8.String (encodeChar)
 import Control.Monad
 import Data.Bifunctor
+import Data.IORef
 import Data.Binary
 import Data.Binary.Get (getByteString)
 import Data.Binary.Put (putByteString)
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Internal
 import Data.ByteString.Lazy qualified as LBS
+import System.IO (Handle, SeekMode (..), hSeek)
 import Data.Either.Extra
 import Data.Foldable
 import Data.List (zip4)
@@ -314,22 +317,16 @@ randomWalkToToken env tok min_path maxSteps g0 =
 minTokenBytes :: Map T [Word8] -> T -> [Word8]
 minTokenBytes min_map tok = Map.findWithDefault [] tok min_map
 
--- | DFS based approach to generating input. Derives a random token sequence
--- from the grammar, then assigns byte sequences to each token.
---
--- Before assigning bytes to each token a budget check is performed:
--- if the bytes already generated plus the minimum bytes still needed for the
--- remaining tokens would exceed @len@, the rest of the tokens are given their
--- minimum byte representation so the total stays within budget.
--- Returns (payloadByteCount, lazyPayload) so callers avoid forcing LBS.length.
-generateSingleLongLexerParserInput ::
+-- Pure variant used for validation (--outputs mode).  Returns (byteCount, lbs).
+-- Only called for small sizes; for large runs use generateSingleLongLexerParserInput.
+generateSingleLongLexerParserInputPure ::
   (Ord s, Ord nt, Show nt) =>
   Int ->
   Set Word8 ->
   DFALexer Word8 s T ->
   Grammar (AugmentedNonterminal (Symbol nt T)) (AugmentedTerminal (Unused T)) ->
   (Int, LBS.ByteString)
-generateSingleLongLexerParserInput len _alpha dfa_lexer grammar =
+generateSingleLongLexerParserInputPure len _alpha dfa_lexer grammar =
   let gen = mkStdGen randomSeed
       min_map = computeMinTokenBytesMap dfa_lexer
       env = mkWalkEnv dfa_lexer
@@ -352,39 +349,79 @@ generateSingleLongLexerParserInput len _alpha dfa_lexer grammar =
           allToks
       minCostOf tok = length (minTokenBytes min_map tok)
       minBytesOf tok = ByteString.pack (minTokenBytes min_map tok)
-      -- Compute average pool variant length per token type, then use the
-      -- weighted average across all token types to scale the byte target to
-      -- an approximate token count for the derivation.
-      avgPoolLen tok =
-        let arr = pools Map.! tok
-            total = sum [ByteString.length (arr ! ix) | ix <- [0 .. poolSize - 1]]
-        in fromIntegral total / fromIntegral poolSize :: Double
-      allAvg = if null allToks then 1.0
-               else sum (map avgPoolLen allToks) / fromIntegral (length allToks)
-      -- Token count target: scale len by average bytes per token.
-      tokenTarget = max 1 (round (fromIntegral len / allAvg) :: Int)
-      -- Two lazy derivation passes with the scaled token target.
-      (_, rawToks) = generateRandomDerivationLazy gen tokenTarget grammar
-      toks = [t | raw <- rawToks, Just t <- [unaug raw]]
-      !totalMin = foldl' (\acc tok -> acc + minCostOf tok) 0 toks
-      needsBudget = totalMin < len
-      (_, rawToks2) = generateRandomDerivationLazy gen tokenTarget grammar
-      toks2 = [t | raw <- rawToks2, Just t <- [unaug raw]]
-      -- remMin tracks remaining minimum bytes for not-yet-emitted tokens.
-      (_, !totalBytes, _, chunksRev) =
-        foldl'
-          (\(g, !used, !remMin, cs) tok ->
-            let mc        = minCostOf tok
-                remMin'   = remMin - mc
-                arr       = pools Map.! tok
-                (idx, g') = randomR (0, poolSize - 1 :: Int) g
-                bs = if needsBudget && used + remMin > len
-                       then minBytesOf tok
-                       else arr ! idx
-             in (g', used + ByteString.length bs, remMin', bs : cs))
-          (gen2, 0 :: Int, totalMin, [])
-          toks2
+      (_, rawToks) = generateRandomDerivationLazy gen len grammar
+      (_, !totalBytes, chunksRev) = go gen2 0 len [] [t | raw <- rawToks, Just t <- [unaug raw]]
+      go g !used !_minBudget cs [] = (g, used, cs)
+      go g !used !minBudget cs (tok : ts) =
+        let mc         = minCostOf tok
+            minBudget' = minBudget - mc
+            arr        = pools Map.! tok
+            (idx, g')  = randomR (0, poolSize - 1 :: Int) g
+            bs         = if minBudget <= 0 || used + minBudget > len
+                           then minBytesOf tok
+                           else arr ! idx
+         in go g' (used + ByteString.length bs) minBudget' (bs : cs) ts
    in (totalBytes, LBS.fromChunks (reverse chunksRev))
+  where
+    unaug (AugmentedTerminal (Used t)) = Just t
+    unaug _ = Nothing
+
+-- | DFS based approach to generating input. Derives a random token sequence
+-- from the grammar, then assigns byte sequences to each token.
+--
+-- Writes the payload directly to @h@ and returns the byte count.
+-- Uses a single streaming pass with no intermediate list accumulation.
+generateSingleLongLexerParserInput ::
+  (Ord s, Ord nt, Show nt) =>
+  Int ->
+  Set Word8 ->
+  DFALexer Word8 s T ->
+  Grammar (AugmentedNonterminal (Symbol nt T)) (AugmentedTerminal (Unused T)) ->
+  Handle ->
+  IO Int
+generateSingleLongLexerParserInput len _alpha dfa_lexer grammar h = do
+  let gen = mkStdGen randomSeed
+      min_map = computeMinTokenBytesMap dfa_lexer
+      env = mkWalkEnv dfa_lexer
+      maxPathBytes = 16
+      poolSize = 256 :: Int
+      allToks = Map.keys min_map
+      buildPool g tok =
+        let minPath = minTokenBytes min_map tok
+            maxSteps = max (length minPath) maxPathBytes
+            step (g', variants) _ =
+              let (mpath, g'') = randomWalkToToken env tok minPath maxSteps g'
+                  bs = fromMaybe minPath mpath
+               in (g'', ByteString.pack bs : variants)
+            (gFinal, variants') = foldl' step (g, []) [1 .. poolSize]
+         in (gFinal, listArray (0, poolSize - 1) variants')
+      (gen2, pools) =
+        foldl'
+          (\(g, m) tok -> let (g', arr) = buildPool g tok in (g', Map.insert tok arr m))
+          (gen, Map.empty)
+          allToks
+      minCostOf tok = length (minTokenBytes min_map tok)
+      minBytesOf tok = ByteString.pack (minTokenBytes min_map tok)
+      (_, rawToks) = generateRandomDerivationLazy gen len grammar
+      toks = [t | raw <- rawToks, Just t <- [unaug raw]]
+  -- Stream chunks directly to h; no list accumulation.
+  totalRef <- newIORef (0 :: Int)
+  let go _ !_minBudget [] = pure ()
+      go g !minBudget (tok : ts) = do
+        nb <- readIORef totalRef
+        let mc         = minCostOf tok
+            minBudget' = minBudget - mc
+            arr        = pools Map.! tok
+            (idx, g')  = randomR (0, poolSize - 1 :: Int) g
+            bs         = if minBudget <= 0 || nb + minBudget > len
+                           then minBytesOf tok
+                           else arr ! idx
+            !bsLen     = ByteString.length bs
+        ByteString.hPut h bs
+        modifyIORef' totalRef (+ bsLen)
+        go g' minBudget' ts
+  go gen2 len toks
+  readIORef totalRef
   where
     unaug (AugmentedTerminal (Used t)) = Just t
     unaug _ = Nothing
@@ -402,28 +439,73 @@ lexerParserTests mode cfg n noOutputs = do
       dfa = lexerDFA (0 :: Integer) $ mapSymbols unBytes spec
       alpha = alphabet $ fsa dfa
       maybe_ignore = if ignore `Map.member` regex_map then Just ignore else Nothing
-  (inputsLbs, outputsLbs) <- case mode of
+  case mode of
     Exhaustive -> do
       let comb = listProducts n $ Set.toList alpha
           inp  = toInputs comb
           out  = if noOutputs then Outputs [] else toOutputs q k encoder dfa maybe_ignore (getGrammar grammar) table comb
       pure (encode inp, encode out)
-    SingleLong -> do
-      let (payloadLen, singleInput) = generateSingleLongLexerParserInput n alpha dfa (getGrammar grammar)
-          inp         = encode (1 :: Word64) <> encode (fromIntegral payloadLen :: Word64) <> singleInput
-          combWords   = [LBS.unpack singleInput]
-          out         = toOutputs q k encoder dfa maybe_ignore (getGrammar grammar) table combWords
-      unless noOutputs $
-        case results out of
-          [Output (Just _)] -> pure ()
-          [Output Nothing]  -> Left "Error: generated combined input failed to lex or parse."
-          _                 -> Left "Error: unexpected number of outputs for SingleLong."
-      pure (inp, encode (if noOutputs then Outputs [] else out))
-  pure (inputsLbs, outputsLbs)
+    SingleLong ->
+      Left "SingleLong mode must be handled via lexerParserTestsSingleLong"
   where
     toOutputs q k encoder dfa ignore grammar table =
       Outputs . fmap (toOutput q k encoder dfa ignore grammar table)
     toInputs = Inputs . fmap (Input . ByteString.pack)
+    toOutput q k encoder dfa ignore grammar table str = Output $ do
+      ts <- fmap toTuple <$> tokenize dfa ignore str
+      tree <- llpParseFlatTree grammar q k table (first Used <$> ts)
+      pure $ fmap (fromIntegral . fromJust . (`terminalLookup` encoder)) <$> tree
+      where
+        toTuple (Lexeme t m) = (t, m)
+
+-- | SingleLong variant that streams the payload directly to the .inputs file
+-- handle, avoiding any large in-memory accumulation.  Returns the .outputs
+-- bytes (or empty if noOutputs).  The caller is responsible for writing them.
+lexerParserTestsSingleLong ::
+  CFG ->
+  Int ->
+  Bool ->
+  Handle ->       -- ^ handle to write framed .inputs payload into
+  IO (Either Text LBS.ByteString)
+lexerParserTestsSingleLong cfg n noOutputs h = do
+  let q = paramsLookback $ cfgParams cfg
+      k = paramsLookahead $ cfgParams cfg
+  case cfgToDFALexerSpec cfg of
+    Left e -> pure (Left e)
+    Right spec -> case cfgToGrammar cfg of
+      Left e -> pure (Left e)
+      Right grammar -> case llpParserTableWithStarts q k $ getGrammar grammar of
+        Left e -> pure (Left e)
+        Right table -> do
+          let regex_map = regexMap spec
+              ignore = T "ignore"
+              encoder = fromSymbolToTerminalEncoder $ encodeSymbols ignore grammar
+              dfa = lexerDFA (0 :: Integer) $ mapSymbols unBytes spec
+              alpha = alphabet $ fsa dfa
+              maybe_ignore = if ignore `Map.member` regex_map then Just ignore else Nothing
+          if noOutputs
+            then do
+              -- Streaming path: write directly to handle, never accumulate payload.
+              let headerCount = encode (1 :: Word64)
+                  headerLen   = encode (0 :: Word64)  -- placeholder, patched below
+              LBS.hPut h (headerCount <> headerLen)
+              payloadLen <- generateSingleLongLexerParserInput n alpha dfa (getGrammar grammar) h
+              hSeek h AbsoluteSeek 8
+              LBS.hPut h (encode (fromIntegral payloadLen :: Word64))
+              pure (Right (encode (Outputs [])))
+            else do
+              -- Validation path: accumulate payload in memory to run the parser.
+              -- Only used for small test sizes (--no-outputs is used for large runs).
+              let (payloadLen, singleInput) = generateSingleLongLexerParserInputPure n alpha dfa (getGrammar grammar)
+                  inp = encode (1 :: Word64) <> encode (fromIntegral payloadLen :: Word64) <> singleInput
+              LBS.hPut h inp
+              let combWords = [LBS.unpack singleInput]
+                  out = Outputs $ fmap (toOutput q k encoder dfa maybe_ignore (getGrammar grammar) table) combWords
+              case results out of
+                [Output (Just _)] -> pure (Right (encode out))
+                [Output Nothing]  -> pure (Left "Error: generated combined input failed to lex or parse.")
+                _                 -> pure (Left "Error: unexpected number of outputs for SingleLong.")
+  where
     toOutput q k encoder dfa ignore grammar table str = Output $ do
       ts <- fmap toTuple <$> tokenize dfa ignore str
       tree <- llpParseFlatTree grammar q k table (first Used <$> ts)

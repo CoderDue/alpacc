@@ -12,6 +12,7 @@ import Alpacc.Generator.Cuda.Generator qualified as Cuda
 import Alpacc.Generator.Futhark.Generator qualified as Futhark
 import Alpacc.Random qualified as Random
 import Alpacc.Test
+import Alpacc.Test.LexerParser (lexerParserTestsSingleLong)
 import Control.Monad (unless)
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Lazy qualified as LBS
@@ -428,10 +429,19 @@ mainTestGenerate params = do
       (inputs, ouputs) <- eitherToIO $ parserTests mode cfg len noOutputs
       LBS.writeFile (name <> ".inputs") inputs
       unless noOutputs $ LBS.writeFile (name <> ".outputs") ouputs
-    GenBoth -> do
-      (inputs, ouputs) <- eitherToIO $ lexerParserTests mode cfg len noOutputs
-      LBS.writeFile (name <> ".inputs") inputs
-      unless noOutputs $ LBS.writeFile (name <> ".outputs") ouputs
+    GenBoth -> case mode of
+      Exhaustive -> do
+        (inputs, ouputs) <- eitherToIO $ lexerParserTests mode cfg len noOutputs
+        LBS.writeFile (name <> ".inputs") inputs
+        unless noOutputs $ LBS.writeFile (name <> ".outputs") ouputs
+      SingleLong -> do
+        let inputsFile = name <> ".inputs"
+        -- Open for ReadWrite so we can seek back to patch the length field.
+        h <- openBinaryFile inputsFile ReadWriteMode
+        result <- lexerParserTestsSingleLong cfg len noOutputs h
+        hClose h
+        outs <- eitherToIO result
+        unless noOutputs $ LBS.writeFile (name <> ".outputs") outs
   where
     out = testGenerateOutput params
     input = testGenerateInput params
