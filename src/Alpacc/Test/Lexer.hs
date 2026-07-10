@@ -17,8 +17,11 @@ import Alpacc.Util
 import Control.Monad
 import Data.Bifunctor
 import Data.Binary
+import Data.Binary.Get (getByteString)
+import Data.Binary.Put (putByteString)
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Internal
+import Data.ByteString.Lazy qualified as LBS
 import Data.Either.Extra
 import Data.Array (bounds, listArray, (!))
 import Data.List (zip4)
@@ -89,11 +92,11 @@ instance Binary Output where
 instance Binary Input where
   put (Input str) = do
     put (fromIntegral $ ByteString.length str :: Word64)
-    mapM_ put $ ByteString.unpack str
+    putByteString str
 
   get = do
     i <- get :: Get Word64
-    str <- ByteString.pack <$> mapM (const get) [1 .. i]
+    str <- getByteString $ fromIntegral i
     pure $ Input str
 
 instance Binary Inputs where
@@ -163,7 +166,7 @@ generateSingleLongInputFromDFA len alpha dfa =
         Just xs -> xs
         Nothing -> fallback
 
-lexerTests :: TestMode -> CFG -> Int -> Bool -> Either Text (ByteString, ByteString)
+lexerTests :: TestMode -> CFG -> Int -> Bool -> Either Text (LBS.ByteString, LBS.ByteString)
 lexerTests mode cfg k noOutputs = do
   spec <- cfgToDFALexerSpec cfg
   let ts = Map.keys $ regexMap spec
@@ -183,8 +186,8 @@ lexerTests mode cfg k noOutputs = do
           let singleInput = generateSingleLongInputFromDFA k alpha (fsa dfa)
            in (toInputs [singleInput], if noOutputs then emptyOutputs else toOutputs dfa ignore [singleInput])
   pure
-    ( ByteString.toStrict $ encode inputs,
-      ByteString.toStrict $ encode outputs
+    ( encode inputs,
+      encode outputs
     )
   where
     toOutputs dfa ignore = Outputs . fmap (Output . tokenize dfa ignore)

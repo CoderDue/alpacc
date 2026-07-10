@@ -14,6 +14,7 @@ import Alpacc.Random qualified as Random
 import Alpacc.Test
 import Control.Monad (unless)
 import Data.ByteString qualified as ByteString
+import Data.ByteString.Lazy qualified as LBS
 import Data.Maybe
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -421,16 +422,16 @@ mainTestGenerate params = do
   case testGenerateGenerator params of
     GenLexer -> do
       (inputs, ouputs) <- eitherToIO $ lexerTests mode cfg len noOutputs
-      ByteString.writeFile (name <> ".inputs") inputs
-      unless noOutputs $ ByteString.writeFile (name <> ".outputs") ouputs
+      LBS.writeFile (name <> ".inputs") inputs
+      unless noOutputs $ LBS.writeFile (name <> ".outputs") ouputs
     GenParser -> do
       (inputs, ouputs) <- eitherToIO $ parserTests mode cfg len noOutputs
-      ByteString.writeFile (name <> ".inputs") inputs
-      unless noOutputs $ ByteString.writeFile (name <> ".outputs") ouputs
+      LBS.writeFile (name <> ".inputs") inputs
+      unless noOutputs $ LBS.writeFile (name <> ".outputs") ouputs
     GenBoth -> do
       (inputs, ouputs) <- eitherToIO $ lexerParserTests mode cfg len noOutputs
-      ByteString.writeFile (name <> ".inputs") inputs
-      unless noOutputs $ ByteString.writeFile (name <> ".outputs") ouputs
+      LBS.writeFile (name <> ".inputs") inputs
+      unless noOutputs $ LBS.writeFile (name <> ".outputs") ouputs
   where
     out = testGenerateOutput params
     input = testGenerateInput params

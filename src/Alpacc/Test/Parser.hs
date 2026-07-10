@@ -16,6 +16,7 @@ import Data.Bifunctor
 import Data.Binary
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Internal
+import Data.ByteString.Lazy qualified as LBS
 import Data.List (zip4)
 import Data.Maybe
 import Data.Text (Text)
@@ -100,7 +101,7 @@ generateSingleLongTokenSequence len grammar =
     unaug (AugmentedTerminal t) = Just t
     unaug _ = Nothing
 
-parserTests :: TestMode -> CFG -> Int -> Bool -> Either Text (ByteString, ByteString)
+parserTests :: TestMode -> CFG -> Int -> Bool -> Either Text (LBS.ByteString, LBS.ByteString)
 parserTests mode cfg n noOutputs = do
   let q = paramsLookback $ cfgParams cfg
       k = paramsLookahead $ cfgParams cfg
@@ -131,8 +132,8 @@ parserTests mode cfg n noOutputs = do
               )
       parse = llpParse q k table
   pure
-    ( ByteString.toStrict $ encode inputs,
-      ByteString.toStrict $ encode outputs
+    ( encode inputs,
+      encode outputs
     )
   where
     unaug (AugmentedTerminal t) = Just t

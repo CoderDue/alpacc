@@ -26,6 +26,8 @@ module Alpacc.LL
     minTerminalCounts,
     canDeriveRecursively,
     generateRandomDerivation,
+    generateRandomDerivationFold,
+    generateRandomDerivationLazy,
   )
 where
 
@@ -34,6 +36,7 @@ import Alpacc.Util
 import Control.DeepSeq
 import Control.Monad (foldM, zipWithM)
 import Control.Monad.State hiding (state)
+import Data.Array (bounds, listArray, (!))
 import Data.Bifunctor qualified as Bifunctor
 import Data.Foldable
 import Data.List qualified as List
@@ -705,6 +708,92 @@ canDeriveRecursively grammar = fixedPointIterate (==) update Set.empty
 -- and contracting (choosing productions that minimize terminal count) based on
 -- the current length vs. target length.
 -- Returns the generated terminal sequence.
+-- | Like 'generateRandomDerivation' but folds over terminals as they are
+-- produced, never building a list.  This keeps memory O(grammar size) rather
+-- than O(output length).
+generateRandomDerivationFold ::
+  (RandomGen g, Ord nt, Ord t, Show nt, Show t) =>
+  g ->
+  Int ->
+  Grammar nt t ->
+  (b -> t -> b) ->
+  b ->
+  (g, b)
+generateRandomDerivationFold gen targetLen grammar step z =
+  let prod_map  = toProductionsMap $ productions grammar
+      recursive = canDeriveRecursively grammar
+      minCounts = minTerminalCounts grammar
+      allNts = Set.toList $ Set.fromList $
+        nonterminals grammar
+          <> Map.keys prod_map
+          <> [nt | rhss <- Map.elems prod_map, rhs <- rhss, Nonterminal nt <- rhs]
+      ntIdx = Map.fromList $ zip allNts [0 :: Int ..]
+      numNts = Map.size ntIdx
+      toIntSym (Terminal t) = Terminal t
+      toIntSym (Nonterminal nt) = Nonterminal (ntIdx Map.! nt)
+      annotatedByIdx = Map.fromList
+        [ (ntIdx Map.! nt, map annotate rhss)
+        | (nt, rhss) <- Map.toList prod_map
+        ]
+        where
+          annotate rhs = (map toIntSym rhs, rhsCount minCounts rhs, hasRecursiveNT recursive rhs)
+      annotatedFor ix = Map.findWithDefault [] ix annotatedByIdx
+      expandArr xs =
+        let all_ = [rhs | (rhs,_,_) <- xs]
+            rec_ = [rhs | (rhs,_,True) <- xs]
+        in (listArray (0, length all_ - 1) all_,
+            listArray (0, length rec_ - 1) rec_)
+      expandTable = listArray (0, numNts - 1)
+        [expandArr (annotatedFor ix) | ix <- [0 .. numNts - 1]]
+      contractTable = listArray (0, numNts - 1)
+        [[(c, rhs) | (rhs, Just c, _) <- annotatedFor ix] | ix <- [0 .. numNts - 1]]
+      initialSymbols = Seq.singleton (Nonterminal $ ntIdx Map.! start grammar)
+   in deriveFold expandTable contractTable gen 0 initialSymbols z
+  where
+    deriveFold _ _ g _ Empty acc = (g, acc)
+    deriveFold expandTable contractTable g termCount (Terminal t :<| syms) acc =
+      let !acc' = step acc t
+       in deriveFold expandTable contractTable g (termCount + 1) syms acc'
+    deriveFold expandTable contractTable g termCount (Nonterminal nt :<| syms) acc =
+      let !(allArr, recArr) = expandTable ! nt
+       in if snd (bounds allArr) < 0
+            then deriveFold expandTable contractTable g termCount syms acc
+            else
+              let remaining    = targetLen - termCount
+                  shouldExpand = remaining > 5 && snd (bounds recArr) >= 0
+                  !(g', rhs) =
+                    if shouldExpand
+                      then chooseExpanding g allArr recArr
+                      else chooseContracting g remaining (contractTable ! nt) allArr
+                  !newSymbols = Seq.fromList rhs >< syms
+               in deriveFold expandTable contractTable g' termCount newSymbols acc
+    chooseExpanding g allArr recArr =
+      let (r, g') = randomR (0 :: Int, 1) g
+          arr = if r == 1 && snd (bounds recArr) >= 0 then recArr else allArr
+          n = snd (bounds arr) + 1
+          (idx, g'') = randomR (0, n - 1) g'
+      in (g'', arr ! idx)
+    chooseContracting g remaining valid allArr =
+      let fitting = [rhs | (c, rhs) <- valid, c <= remaining]
+          candidates =
+            if not (null fitting)
+              then fitting
+              else if not (null valid)
+                then let minC = minimum (map fst valid)
+                     in [rhs | (c, rhs) <- valid, c == minC]
+              else Data.Foldable.toList allArr
+          n = length candidates
+          candArr = listArray (0, n - 1) candidates
+          (idx, g') = randomR (0, n - 1) g
+      in (g', candArr ! idx)
+    hasRecursiveNT rec = any (\sym -> case sym of Nonterminal nt' -> nt' `Set.member` rec; _ -> False)
+    rhsCount _ [] = Just (0 :: Int)
+    rhsCount counts (Terminal _ : syms) = (1 +) <$> rhsCount counts syms
+    rhsCount counts (Nonterminal nt' : syms) = do
+      ntCount <- Map.lookup nt' counts
+      restCount <- rhsCount counts syms
+      return (ntCount + restCount)
+
 generateRandomDerivation ::
   (RandomGen g, Ord nt, Ord t, Show nt, Show t) =>
   g ->
@@ -712,68 +801,177 @@ generateRandomDerivation ::
   Grammar nt t ->
   (g, [t])
 generateRandomDerivation gen targetLen grammar =
-  let initialSymbols = [Nonterminal $ start grammar]
-      prod_map = toProductionsMap $ productions grammar
+  let (g', ts) = generateRandomDerivationFold gen targetLen grammar (flip (:)) []
+   in (g', reverse ts)
+
+-- | Like 'generateRandomDerivationFold' but produces a lazy list of terminals
+-- so callers can process them one at a time without holding the whole list.
+generateRandomDerivationLazy ::
+  (RandomGen g, Ord nt, Ord t, Show nt, Show t) =>
+  g ->
+  Int ->
+  Grammar nt t ->
+  (g, [t])
+generateRandomDerivationLazy gen targetLen grammar =
+  let prod_map  = toProductionsMap $ productions grammar
       recursive = canDeriveRecursively grammar
       minCounts = minTerminalCounts grammar
-   in derive prod_map recursive minCounts gen 0 initialSymbols
+      allNts = Set.toList $ Set.fromList $
+        nonterminals grammar
+          <> Map.keys prod_map
+          <> [nt | rhss <- Map.elems prod_map, rhs <- rhss, Nonterminal nt <- rhs]
+      ntIdx = Map.fromList $ zip allNts [0 :: Int ..]
+      numNts = Map.size ntIdx
+      toIntSym (Terminal t) = Terminal t
+      toIntSym (Nonterminal nt) = Nonterminal (ntIdx Map.! nt)
+      annotatedByIdx = Map.fromList
+        [ (ntIdx Map.! nt, map annotate rhss)
+        | (nt, rhss) <- Map.toList prod_map
+        ]
+        where
+          annotate rhs = (map toIntSym rhs, rhsCount minCounts rhs, hasRecursiveNT recursive rhs)
+      annotatedFor ix = Map.findWithDefault [] ix annotatedByIdx
+      expandArr xs =
+        let all_ = [rhs | (rhs,_,_) <- xs]
+            rec_ = [rhs | (rhs,_,True) <- xs]
+        in (listArray (0, length all_ - 1) all_,
+            listArray (0, length rec_ - 1) rec_)
+      expandTable = listArray (0, numNts - 1)
+        [expandArr (annotatedFor ix) | ix <- [0 .. numNts - 1]]
+      contractTable = listArray (0, numNts - 1)
+        [[(c, rhs) | (rhs, Just c, _) <- annotatedFor ix] | ix <- [0 .. numNts - 1]]
+      initialSymbols = Seq.singleton (Nonterminal $ ntIdx Map.! start grammar)
+      (gFinal, lazyTs) = deriveLazy expandTable contractTable gen 0 initialSymbols
+   in (gFinal, lazyTs)
   where
-    derive _ _ _ g _ [] = (g, [])
-    derive prod_map recursive minCounts g termCount (Terminal t : syms) =
-      let (g', rest) = derive prod_map recursive minCounts g (termCount + 1) syms
-       in (g', t : rest)
-    derive prod_map recursive minCounts g termCount (Nonterminal nt : syms) =
-      let rhss = Map.findWithDefault [] nt prod_map
-       in if null rhss
-            then derive prod_map recursive minCounts g termCount syms
-            else
-              let remaining = targetLen - termCount
-                  shouldExpand = remaining > 5 && nt `Set.member` recursive
-                  chosen =
-                    if shouldExpand
-                      then chooseExpanding recursive g rhss
-                      else chooseContracting minCounts g remaining rhss
-                  (g', rhs) = chosen
-                  newSymbols = rhs ++ syms
-               in derive prod_map recursive minCounts g' termCount newSymbols
-
-    -- Choose a production, preferring recursive ones only half the time so
-    -- that leaf productions (e.g. string/number/null) are selected regularly.
-    -- This prevents unbounded nesting from consuming the entire budget before
-    -- sibling nonterminals (e.g. FS1/EL1) have a chance to expand.
-    chooseExpanding recursive g rhss =
-      let expandable = filter (hasRecursiveNT recursive) rhss
-          (r, g') = randomR (0 :: Int, 1) g
-          useExpand = r == 1
-          candidates = if null expandable || not useExpand then rhss else expandable
-          (idx, g'') = randomR (0, length candidates - 1) g'
-       in (g'', candidates !! idx)
-
-    -- Choose a production that fits within the remaining budget, picking
-    -- randomly among all fitting candidates rather than always the minimum.
-    -- This allows multi-element arrays/objects to be generated when budget
-    -- permits, instead of always collapsing to epsilon.
-    chooseContracting minCounts g remaining rhss =
-      let countsWithRhs = [(rhsCount minCounts rhs, rhs) | rhs <- rhss]
-          validCounts = [(c, rhs) | (Just c, rhs) <- countsWithRhs]
-          -- Prefer productions that fit within the remaining budget; fall back
-          -- to the minimum-count production(s) if nothing fits.
-          fittingCounts = filter (\(c, _) -> c <= remaining) validCounts
+    deriveLazy _ _ g _ Empty = (g, [])
+    deriveLazy expandTable contractTable g termCount (Terminal t :<| syms) =
+      let (gFinal, rest) = deriveLazy expandTable contractTable g (termCount + 1) syms
+       in (gFinal, t : rest)
+    deriveLazy expandTable contractTable g termCount (Nonterminal nt :<| syms)
+      | snd (bounds allArr) < 0 =
+          deriveLazy expandTable contractTable g termCount syms
+      | otherwise =
+          let remaining   = targetLen - termCount
+              shouldExpand = remaining > 5 && snd (bounds recArr) >= 0
+              (g', rhs) =
+                if shouldExpand
+                  then chooseExpandingL g allArr recArr
+                  else chooseContractingL g remaining (contractTable ! nt) allArr
+              newSymbols = Seq.fromList rhs >< syms
+          in deriveLazy expandTable contractTable g' termCount newSymbols
+      where
+        (allArr, recArr) = expandTable ! nt
+    chooseExpandingL g allArr recArr =
+      let (r, g') = randomR (0 :: Int, 1) g
+          arr = if r == 1 && snd (bounds recArr) >= 0 then recArr else allArr
+          n = snd (bounds arr) + 1
+          (idx, g'') = randomR (0, n - 1) g'
+      in (g'', arr ! idx)
+    chooseContractingL g remaining valid allArr =
+      let fitting = [rhs | (c, rhs) <- valid, c <= remaining]
           candidates =
-            if not (null fittingCounts)
-              then map snd fittingCounts
-              else if not (null validCounts)
-                then
-                  let minC = minimum [c | (c, _) <- validCounts]
-                   in [rhs | (c, rhs) <- validCounts, c == minC]
-              else rhss
-          (idx, g') = randomR (0, length candidates - 1) g
-       in (g', candidates !! idx)
+            if not (null fitting)
+              then fitting
+              else if not (null valid)
+                then let minC = minimum (map fst valid)
+                     in [rhs | (c, rhs) <- valid, c == minC]
+              else Data.Foldable.toList allArr
+          n = length candidates
+          candArr = listArray (0, n - 1) candidates
+          (idx, g') = randomR (0, n - 1) g
+      in (g', candArr ! idx)
+    hasRecursiveNT rec = any (\sym -> case sym of Nonterminal nt' -> nt' `Set.member` rec; _ -> False)
+    rhsCount _ [] = Just (0 :: Int)
+    rhsCount counts (Terminal _ : syms) = (1 +) <$> rhsCount counts syms
+    rhsCount counts (Nonterminal nt' : syms) = do
+      ntCount <- Map.lookup nt' counts
+      restCount <- rhsCount counts syms
+      return (ntCount + restCount)
 
-    -- Check if a RHS contains a recursive nonterminal
+generateRandomDerivation' ::
+  (RandomGen g, Ord nt, Ord t, Show nt, Show t) =>
+  g ->
+  Int ->
+  Grammar nt t ->
+  (g, [t])
+generateRandomDerivation' gen targetLen grammar =
+  let prod_map  = toProductionsMap $ productions grammar
+      recursive = canDeriveRecursively grammar
+      minCounts = minTerminalCounts grammar
+      -- Renumber nonterminals to dense Ints so the derive loop uses O(1)
+      -- array indexing instead of Map lookups on expensive Ord instances.
+      allNts = Set.toList $ Set.fromList $
+        nonterminals grammar
+          <> Map.keys prod_map
+          <> [nt | rhss <- Map.elems prod_map, rhs <- rhss, Nonterminal nt <- rhs]
+      ntIdx = Map.fromList $ zip allNts [0 :: Int ..]
+      numNts = Map.size ntIdx
+      toIntSym (Terminal t) = Terminal t
+      toIntSym (Nonterminal nt) = Nonterminal (ntIdx Map.! nt)
+      -- Per-nonterminal candidate entries: (rhs, minTermCount, isExpandable)
+      annotatedByIdx = Map.fromList
+        [ (ntIdx Map.! nt, map annotate rhss)
+        | (nt, rhss) <- Map.toList prod_map
+        ]
+        where
+          annotate rhs = (map toIntSym rhs, rhsCount minCounts rhs, hasRecursiveNT recursive rhs)
+      annotatedFor ix = Map.findWithDefault [] ix annotatedByIdx
+      -- For expanding mode: array of all rhss, plus array of only recursive ones
+      expandArr xs =
+        let all_ = [rhs | (rhs,_,_) <- xs]
+            rec_ = [rhs | (rhs,_,True) <- xs]
+        in (listArray (0, length all_ - 1) all_,
+            listArray (0, length rec_ - 1) rec_)
+      expandTable = listArray (0, numNts - 1)
+        [expandArr (annotatedFor ix) | ix <- [0 .. numNts - 1]]
+      -- For contracting mode: list of (minCount, rhs) for valid rhss
+      contractTable = listArray (0, numNts - 1)
+        [[(c, rhs) | (rhs, Just c, _) <- annotatedFor ix] | ix <- [0 .. numNts - 1]]
+      initialSymbols = Seq.singleton (Nonterminal $ ntIdx Map.! start grammar)
+   in derive expandTable contractTable gen 0 initialSymbols []
+  where
+    derive _ _ g _ Empty acc = (g, reverse acc)
+    derive expandTable contractTable g termCount (Terminal t :<| syms) acc =
+      derive expandTable contractTable g (termCount + 1) syms (t : acc)
+    derive expandTable contractTable g termCount (Nonterminal nt :<| syms) acc
+      | snd (bounds allArr) < 0 =
+          derive expandTable contractTable g termCount syms acc
+      | otherwise =
+          let remaining   = targetLen - termCount
+              shouldExpand = remaining > 5 && snd (bounds recArr) >= 0
+              (g', rhs) =
+                if shouldExpand
+                  then chooseExpanding g allArr recArr
+                  else chooseContracting g remaining (contractTable ! nt) allArr
+              newSymbols = Seq.fromList rhs >< syms
+          in derive expandTable contractTable g' termCount newSymbols acc
+      where
+        (allArr, recArr) = expandTable ! nt
+
+    chooseExpanding g allArr recArr =
+      let (r, g') = randomR (0 :: Int, 1) g
+          arr = if r == 1 && snd (bounds recArr) >= 0 then recArr else allArr
+          n = snd (bounds arr) + 1
+          (idx, g'') = randomR (0, n - 1) g'
+      in (g'', arr ! idx)
+
+    chooseContracting g remaining valid allArr =
+      let fitting = [rhs | (c, rhs) <- valid, c <= remaining]
+          candidates =
+            if not (null fitting)
+              then fitting
+              else if not (null valid)
+                then let minC = minimum (map fst valid)
+                     in [rhs | (c, rhs) <- valid, c == minC]
+              else Data.Foldable.toList allArr
+          n = length candidates
+          candArr = listArray (0, n - 1) candidates
+          (idx, g') = randomR (0, n - 1) g
+      in (g', candArr ! idx)
+
     hasRecursiveNT rec = any (\sym -> case sym of Nonterminal nt -> nt `Set.member` rec; _ -> False)
 
-    -- Compute terminal count for a RHS
     rhsCount _ [] = Just 0
     rhsCount counts (Terminal _ : syms) = (1 +) <$> rhsCount counts syms
     rhsCount counts (Nonterminal nt : syms) = do

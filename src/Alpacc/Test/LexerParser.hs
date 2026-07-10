@@ -8,7 +8,7 @@ where
 import Alpacc.CFG
 import Alpacc.Encode
 import Alpacc.Grammar
-import Alpacc.LL (generateRandomDerivation)
+import Alpacc.LL (generateRandomDerivation, generateRandomDerivationFold, generateRandomDerivationLazy)
 import Alpacc.LLP
 import Alpacc.Lexer.DFA
 import Alpacc.Lexer.FSA
@@ -19,8 +19,11 @@ import Codec.Binary.UTF8.String (encodeChar)
 import Control.Monad
 import Data.Bifunctor
 import Data.Binary
+import Data.Binary.Get (getByteString)
+import Data.Binary.Put (putByteString)
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Internal
+import Data.ByteString.Lazy qualified as LBS
 import Data.Either.Extra
 import Data.Foldable
 import Data.List (zip4)
@@ -102,11 +105,11 @@ instance Binary Output where
 instance Binary Input where
   put (Input str) = do
     put (fromIntegral $ ByteString.length str :: Word64)
-    mapM_ put $ ByteString.unpack str
+    putByteString str
 
   get = do
     i <- get :: Get Word64
-    str <- ByteString.pack <$> mapM (const get) [1 .. i]
+    str <- getByteString $ fromIntegral i
     pure $ Input str
 
 instance Binary Inputs where
@@ -193,34 +196,57 @@ computeMinTokenBytesMap dfa_lexer =
        in go (queue <> neighbors) visited' result'
 
 -- | Precomputed DFA structures shared across all per-token random walks.
--- Stores per-state valid transitions as arrays for O(1) random access,
--- and per-token accepting state sets for O(log n) membership tests.
-data WalkEnv s = WalkEnv
-  { weInitial :: s
-  , weTrans :: Map (s, Word8) s
-  , weTokenAccepting :: Map T (Set s)
-  , weValidTrans :: Map s (Array Int (Word8, s))
+-- States are renumbered to dense Ints so the hot walk loop uses O(1) array
+-- indexing instead of Map/Set operations on expensive Ord instances.
+data WalkEnv = WalkEnv
+  { weInitial :: Int
+  , weTrans :: Map (Int, Word8) Int
+  , weTokenAccepting :: Map T (Array Int Bool)
+  , weValidTrans :: Array Int (Array Int (Word8, Int))
+  , weNonAcceptTrans :: Array Int (Array Int (Word8, Int))  -- transitions to non-accepting states
   }
 
-mkWalkEnv :: (Ord s) => DFALexer Word8 s T -> WalkEnv s
+mkWalkEnv :: (Ord s) => DFALexer Word8 s T -> WalkEnv
 mkWalkEnv dfa_lexer = WalkEnv
-  { weInitial = initial dfa
-  , weTrans = tr
-  , weTokenAccepting = Map.fromListWith Set.union
-      [(tok, Set.singleton s) | (s, tok) <- Map.toList (tokenMap dfa_lexer)
-                               , Set.member s (accepting dfa)]
-  , weValidTrans = Map.fromList
-      [ (s, listArray (0, length xs - 1) xs)
-      | (s, xs) <- Map.toList validByState ]
+  { weInitial = ix (initial dfa)
+  , weTrans = trI
+  , weTokenAccepting = Map.map toBoolArray tokAccSets
+  , weValidTrans = toStateArray validByState
+  , weNonAcceptTrans = toStateArray nonAcceptByState
   }
   where
     dfa = fsa dfa_lexer
     tr  = transitions' dfa
     prod = producesToken dfa_lexer
+    acc = accepting dfa
+    stIdx = Map.fromList $ zip (Set.toList (states dfa)) [0 ..]
+    numStates = Map.size stIdx
+    ix s = stIdx Map.! s
+    trI = Map.fromList
+      [ ((ix s, sym), ix s') | ((s, sym), s') <- Map.toList tr ]
+    tokAccSets = Map.fromListWith Set.union
+      [ (tok, Set.singleton (ix s))
+      | (s, tok) <- Map.toList (tokenMap dfa_lexer)
+      , Set.member s acc
+      ]
+    toBoolArray ss =
+      listArray (0, numStates - 1) [Set.member i ss | i <- [0 .. numStates - 1]]
+    toStateArray m =
+      listArray (0, numStates - 1)
+        [ let xs = Map.findWithDefault [] i m
+           in listArray (0, length xs - 1) xs
+        | i <- [0 .. numStates - 1]
+        ]
     validByState = Map.fromListWith (++)
-      [ (s, [(sym, s')])
+      [ (ix s, [(sym, ix s')])
       | ((s, sym), s') <- Map.toList tr
       , not ((s, sym) `Set.member` prod)
+      ]
+    nonAcceptByState = Map.fromListWith (++)
+      [ (ix s, [(sym, ix s')])
+      | ((s, sym), s') <- Map.toList tr
+      , not ((s, sym) `Set.member` prod)
+      , not (Set.member s' acc)
       ]
 
 -- | Attempt a single random walk that produces a byte sequence lexing to
@@ -229,8 +255,8 @@ mkWalkEnv dfa_lexer = WalkEnv
 -- that interior state.  Stop probability increases linearly with steps so path
 -- lengths are roughly uniformly distributed up to @maxSteps@.
 randomWalkToToken ::
-  (Ord s, RandomGen g) =>
-  WalkEnv s ->
+  (RandomGen g) =>
+  WalkEnv ->
   T ->
   [Word8] ->
   Int ->
@@ -242,10 +268,11 @@ randomWalkToToken env tok min_path maxSteps g0 =
    in walk g0 start_state 0 (reverse prefix)
   where
     stepDFA s sym = Map.findWithDefault s (s, sym) (weTrans env)
-    tokAccepting = Map.findWithDefault Set.empty tok (weTokenAccepting env)
-    isOk s = Set.member s tokAccepting
-    emptyArr = listArray (0, -1) []
-    validArr s = Map.findWithDefault emptyArr s (weValidTrans env)
+    isOk = case Map.lookup tok (weTokenAccepting env) of
+      Just a -> (a !)
+      Nothing -> const False
+    validArr s = weValidTrans env ! s
+    nonAcceptArr s = weNonAcceptTrans env ! s
 
     walk g state steps acc
       | steps >= maxSteps =
@@ -264,12 +291,13 @@ randomWalkToToken env tok min_path maxSteps g0 =
                               (sym, ns)  = arr ! i
                            in if isOk ns
                                 then
-                                  let nonAcceptIdxs = [j | j <- [0..n-1], not (isOk (snd (arr!j)))]
-                                   in if null nonAcceptIdxs
+                                  let naArr = nonAcceptArr state
+                                      nna   = snd (bounds naArr) + 1
+                                   in if nna == 0
                                         then walk g'' ns (steps + 1) (sym : acc)
-                                        else let (j, g''') = randomR (0, length nonAcceptIdxs - 1) g''
-                                                 (sym', ns') = arr ! (nonAcceptIdxs !! j)
-                                              in walk g''' ns' (steps + 1) (sym' : acc)
+                                        else let (j, g''') = randomR (0, nna - 1) g''
+                                                 (sym', ns') = naArr ! j
+                                             in walk g''' ns' (steps + 1) (sym' : acc)
                                 else walk g'' ns (steps + 1) (sym : acc)
       | otherwise =
           let arr = validArr state
@@ -299,41 +327,68 @@ generateSingleLongLexerParserInput ::
   Set Word8 ->
   DFALexer Word8 s T ->
   Grammar (AugmentedNonterminal (Symbol nt T)) (AugmentedTerminal (Unused T)) ->
-  [Word8]
+  LBS.ByteString
 generateSingleLongLexerParserInput len _alpha dfa_lexer grammar =
   let gen = mkStdGen randomSeed
       min_map = computeMinTokenBytesMap dfa_lexer
       env = mkWalkEnv dfa_lexer
       maxPathBytes = 16
-      (gen2, derivedTerminals) = generateRandomDerivation gen len grammar
-      tokens = mapMaybe unaug derivedTerminals
-      minCosts = map (length . minTokenBytes min_map) tokens
-      totalMin = sum minCosts
-      needsBudget = totalMin < len
-      byteTarget = len
-      suffixMins = drop 1 $ scanr (+) 0 minCosts
-      (_, _, bytesRev) =
+      poolSize = 256 :: Int
+      -- Build pools for ALL tokens known from the DFA (not just those that
+      -- appear in the derivation), so we never need to scan the derivation
+      -- list for unique tokens.  This keeps memory O(grammar size).
+      allToks = Map.keys min_map
+      buildPool g tok =
+        let minPath = minTokenBytes min_map tok
+            maxSteps = max (length minPath) maxPathBytes
+            step (g', variants) _ =
+              let (mpath, g'') = randomWalkToToken env tok minPath maxSteps g'
+                  bs = fromMaybe minPath mpath
+               in (g'', ByteString.pack bs : variants)
+            (gFinal, variants') = foldl' step (g, []) [1 .. poolSize]
+         in (gFinal, listArray (0, poolSize - 1) variants')
+      (gen2, pools) =
         foldl'
-          ( \(g, used, acc) (tok, remainingMin) ->
-              if needsBudget && used + remainingMin > byteTarget
-                then
-                  let bs = minTokenBytes min_map tok
-                   in (g, used + length bs, bs : acc)
-                else
-                  let minPath = minTokenBytes min_map tok
-                      maxSteps = max (length minPath) maxPathBytes
-                      (mpath, g') = randomWalkToToken env tok minPath maxSteps g
-                      bs = case mpath of Just p -> p; Nothing -> minPath
-                   in (g', used + length bs, bs : acc)
-          )
-          (gen2, 0, [])
-          (zip tokens suffixMins)
-   in concat (reverse bytesRev)
+          (\(g, m) tok -> let (g', arr) = buildPool g tok in (g', Map.insert tok arr m))
+          (gen, Map.empty)
+          allToks
+      minCostOf tok = length (minTokenBytes min_map tok)
+      -- Pass 1: collect totalMin from one derivation traversal.
+      (_, totalMin) =
+        generateRandomDerivationFold gen len grammar
+          (\c raw -> case unaug raw of
+            Nothing  -> c
+            Just tok -> c + minCostOf tok)
+          (0 :: Int)
+      needsBudget = totalMin < len
+      -- Pass 2 (emit): track remMin (sum of min costs of not-yet-emitted tokens)
+      -- starting at totalMin and subtracting as each token is emitted.
+      -- If used + remMin > len, fall back to the minimum-path bytes so the
+      -- output never overshoots len while still emitting every token.
+      (_, (_, _, _, chunksRev)) =
+        generateRandomDerivationFold gen len grammar
+          (\(g, used, remMin, cs) raw ->
+            case unaug raw of
+              Nothing -> (g, used, remMin, cs)
+              Just tok ->
+                let mc = minCostOf tok
+                    remMin' = remMin - mc
+                 in if needsBudget && used + remMin > len
+                      then
+                        let bs = ByteString.pack (minTokenBytes min_map tok)
+                         in (g, used + mc, remMin', bs : cs)
+                      else
+                        let arr = pools Map.! tok
+                            (idx, g') = randomR (0, poolSize - 1 :: Int) g
+                            bs = arr ! idx
+                         in (g', used + ByteString.length bs, remMin', bs : cs))
+          (gen2, 0, totalMin, [])
+   in LBS.fromChunks (reverse chunksRev)
   where
     unaug (AugmentedTerminal (Used t)) = Just t
     unaug _ = Nothing
 
-lexerParserTests :: TestMode -> CFG -> Int -> Bool -> Either Text (ByteString, ByteString)
+lexerParserTests :: TestMode -> CFG -> Int -> Bool -> Either Text (LBS.ByteString, LBS.ByteString)
 lexerParserTests mode cfg n noOutputs = do
   let q = paramsLookback $ cfgParams cfg
       k = paramsLookahead $ cfgParams cfg
@@ -346,18 +401,25 @@ lexerParserTests mode cfg n noOutputs = do
       dfa = lexerDFA (0 :: Integer) $ mapSymbols unBytes spec
       alpha = alphabet $ fsa dfa
       maybe_ignore = if ignore `Map.member` regex_map then Just ignore else Nothing
-      (inputs, outputs) = case mode of
-        Exhaustive ->
-          let comb = listProducts n $ Set.toList alpha
-           in (toInputs comb, if noOutputs then Outputs [] else toOutputs q k encoder dfa maybe_ignore (getGrammar grammar) table comb)
-        SingleLong ->
-          let singleInput = generateSingleLongLexerParserInput n alpha dfa (getGrammar grammar)
-              comb = [singleInput]
-           in (toInputs comb, if noOutputs then Outputs [] else toOutputs q k encoder dfa maybe_ignore (getGrammar grammar) table comb)
-  pure
-    ( ByteString.toStrict $ encode inputs,
-      ByteString.toStrict $ encode outputs
-    )
+  (inputsLbs, outputsLbs) <- case mode of
+    Exhaustive -> do
+      let comb = listProducts n $ Set.toList alpha
+          inp  = toInputs comb
+          out  = if noOutputs then Outputs [] else toOutputs q k encoder dfa maybe_ignore (getGrammar grammar) table comb
+      pure (encode inp, encode out)
+    SingleLong -> do
+      let singleInput = generateSingleLongLexerParserInput n alpha dfa (getGrammar grammar)
+          payloadLen  = LBS.length singleInput
+          inp         = encode (1 :: Word64) <> encode (fromIntegral payloadLen :: Word64) <> singleInput
+          combWords   = [LBS.unpack singleInput]
+          out         = toOutputs q k encoder dfa maybe_ignore (getGrammar grammar) table combWords
+      unless noOutputs $
+        case results out of
+          [Output (Just _)] -> pure ()
+          [Output Nothing]  -> Left "Error: generated combined input failed to lex or parse."
+          _                 -> Left "Error: unexpected number of outputs for SingleLong."
+      pure (inp, encode (if noOutputs then Outputs [] else out))
+  pure (inputsLbs, outputsLbs)
   where
     toOutputs q k encoder dfa ignore grammar table =
       Outputs . fmap (toOutput q k encoder dfa ignore grammar table)
