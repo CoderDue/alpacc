@@ -18,15 +18,15 @@ import Alpacc.Test.Lexer (TestMode (..), randomSeed)
 import Alpacc.Util
 import Codec.Binary.UTF8.String (encodeChar)
 import Control.Monad
-import Data.Bifunctor
 import Data.IORef
+import Data.Bifunctor
 import Data.Binary
 import Data.Binary.Get (getByteString)
-import Data.Binary.Put (putByteString)
+import Data.Binary.Put (putByteString, runPut)
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Internal
 import Data.ByteString.Lazy qualified as LBS
-import System.IO (Handle, SeekMode (..), hSeek)
+import System.IO (Handle, SeekMode (..), hSeek, hTell)
 import Data.Either.Extra
 import Data.Foldable
 import Data.List (zip4)
@@ -204,6 +204,7 @@ computeMinTokenBytesMap dfa_lexer =
 data WalkEnv = WalkEnv
   { weInitial :: Int
   , weTrans :: Map (Int, Word8) Int
+  , weProducesToken :: Set (Int, Word8)
   , weTokenAccepting :: Map T (Array Int Bool)
   , weValidTrans :: Array Int (Array Int (Word8, Int))
   , weNonAcceptTrans :: Array Int (Array Int (Word8, Int))  -- transitions to non-accepting states
@@ -213,6 +214,7 @@ mkWalkEnv :: (Ord s) => DFALexer Word8 s T -> WalkEnv
 mkWalkEnv dfa_lexer = WalkEnv
   { weInitial = ix (initial dfa)
   , weTrans = trI
+  , weProducesToken = prodI
   , weTokenAccepting = Map.map toBoolArray tokAccSets
   , weValidTrans = toStateArray validByState
   , weNonAcceptTrans = toStateArray nonAcceptByState
@@ -227,6 +229,7 @@ mkWalkEnv dfa_lexer = WalkEnv
     ix s = stIdx Map.! s
     trI = Map.fromList
       [ ((ix s, sym), ix s') | ((s, sym), s') <- Map.toList tr ]
+    prodI = Set.map (\(s, sym) -> (ix s, sym)) prod
     tokAccSets = Map.fromListWith Set.union
       [ (tok, Set.singleton (ix s))
       | (s, tok) <- Map.toList (tokenMap dfa_lexer)
@@ -251,6 +254,14 @@ mkWalkEnv dfa_lexer = WalkEnv
       , not ((s, sym) `Set.member` prod)
       , not (Set.member s' acc)
       ]
+
+-- | Compute the DFA state reached after reading @bs@ starting from @s0@.
+-- Returns Nothing if the DFA has no transition for some byte.
+dfaStateAfter :: Map (Int, Word8) Int -> Int -> [Word8] -> Maybe Int
+dfaStateAfter trans s0 = foldl' step (Just s0)
+  where
+    step Nothing _ = Nothing
+    step (Just s) b = Map.lookup (s, b) trans
 
 -- | Attempt a single random walk that produces a byte sequence lexing to
 -- @tok@.  To stay within the right DFA subgraph, the walk replays the minimum
@@ -317,55 +328,6 @@ randomWalkToToken env tok min_path maxSteps g0 =
 minTokenBytes :: Map T [Word8] -> T -> [Word8]
 minTokenBytes min_map tok = Map.findWithDefault [] tok min_map
 
--- Pure variant used for validation (--outputs mode).  Returns (byteCount, lbs).
--- Only called for small sizes; for large runs use generateSingleLongLexerParserInput.
-generateSingleLongLexerParserInputPure ::
-  (Ord s, Ord nt, Show nt) =>
-  Int ->
-  Set Word8 ->
-  DFALexer Word8 s T ->
-  Grammar (AugmentedNonterminal (Symbol nt T)) (AugmentedTerminal (Unused T)) ->
-  (Int, LBS.ByteString)
-generateSingleLongLexerParserInputPure len _alpha dfa_lexer grammar =
-  let gen = mkStdGen randomSeed
-      min_map = computeMinTokenBytesMap dfa_lexer
-      env = mkWalkEnv dfa_lexer
-      maxPathBytes = 16
-      poolSize = 256 :: Int
-      allToks = Map.keys min_map
-      buildPool g tok =
-        let minPath = minTokenBytes min_map tok
-            maxSteps = max (length minPath) maxPathBytes
-            step (g', variants) _ =
-              let (mpath, g'') = randomWalkToToken env tok minPath maxSteps g'
-                  bs = fromMaybe minPath mpath
-               in (g'', ByteString.pack bs : variants)
-            (gFinal, variants') = foldl' step (g, []) [1 .. poolSize]
-         in (gFinal, listArray (0, poolSize - 1) variants')
-      (gen2, pools) =
-        foldl'
-          (\(g, m) tok -> let (g', arr) = buildPool g tok in (g', Map.insert tok arr m))
-          (gen, Map.empty)
-          allToks
-      minCostOf tok = length (minTokenBytes min_map tok)
-      minBytesOf tok = ByteString.pack (minTokenBytes min_map tok)
-      (_, rawToks) = generateRandomDerivationLazy gen len grammar
-      (_, !totalBytes, chunksRev) = go gen2 0 len [] [t | raw <- rawToks, Just t <- [unaug raw]]
-      go g !used !_minBudget cs [] = (g, used, cs)
-      go g !used !minBudget cs (tok : ts) =
-        let mc         = minCostOf tok
-            minBudget' = minBudget - mc
-            arr        = pools Map.! tok
-            (idx, g')  = randomR (0, poolSize - 1 :: Int) g
-            bs         = if minBudget <= 0 || used + minBudget > len
-                           then minBytesOf tok
-                           else arr ! idx
-         in go g' (used + ByteString.length bs) minBudget' (bs : cs) ts
-   in (totalBytes, LBS.fromChunks (reverse chunksRev))
-  where
-    unaug (AugmentedTerminal (Used t)) = Just t
-    unaug _ = Nothing
-
 -- | DFS based approach to generating input. Derives a random token sequence
 -- from the grammar, then assigns byte sequences to each token.
 --
@@ -404,10 +366,45 @@ generateSingleLongLexerParserInput len _alpha dfa_lexer grammar h = do
       minBytesOf tok = ByteString.pack (minTokenBytes min_map tok)
       (_, rawToks) = generateRandomDerivationLazy gen len grammar
       toks = [t | raw <- rawToks, Just t <- [unaug raw]]
-  -- Stream chunks directly to h; no list accumulation.
+      -- A separator byte (e.g. space) that is accepted by the ignore terminal,
+      -- used to force a token boundary when adjacent byte sequences would merge.
+      -- We find it by looking for a single-byte ignore-token sequence.
+      separatorByte :: Maybe Word8
+      separatorByte = case Map.lookup (T "ignore") min_map of
+        Just (b : _) -> Just b
+        _            -> Nothing
   totalRef <- newIORef (0 :: Int)
-  let go _ !_minBudget [] = pure ()
-      go g !minBudget (tok : ts) = do
+  let tr    = weTrans env
+      prod  = weProducesToken env
+      s0    = weInitial env
+      -- Write bs and, if needed, a separator byte so the next token's first
+      -- byte does not merge with the last state of the current token.
+      writeSafe bs nextTok = do
+        ByteString.hPut h bs
+        modifyIORef' totalRef (+ ByteString.length bs)
+        case separatorByte of
+          Nothing -> pure ()
+          Just sep ->
+            let bsList = ByteString.unpack bs
+                needsSep = case (dfaStateAfter tr s0 bsList, minTokenBytes min_map nextTok) of
+                  (Just sEnd, firstNext : _) -> not (Set.member (sEnd, firstNext) prod)
+                  _                          -> False
+            in when needsSep $ do
+                 ByteString.hPut h (ByteString.singleton sep)
+                 modifyIORef' totalRef (+ 1)
+      go _ !_minBudget [] = pure ()
+      go g !minBudget [tok] = do
+        nb <- readIORef totalRef
+        let mc         = minCostOf tok
+            arr        = pools Map.! tok
+            (idx, g')  = randomR (0, poolSize - 1 :: Int) g
+            bs         = if minBudget <= 0 || nb + minBudget > len
+                           then minBytesOf tok
+                           else arr ! idx
+        ByteString.hPut h bs
+        modifyIORef' totalRef (+ ByteString.length bs)
+        go g' (minBudget - mc) []
+      go g !minBudget (tok : ts@(nextTok : _)) = do
         nb <- readIORef totalRef
         let mc         = minCostOf tok
             minBudget' = minBudget - mc
@@ -416,9 +413,7 @@ generateSingleLongLexerParserInput len _alpha dfa_lexer grammar h = do
             bs         = if minBudget <= 0 || nb + minBudget > len
                            then minBytesOf tok
                            else arr ! idx
-            !bsLen     = ByteString.length bs
-        ByteString.hPut h bs
-        modifyIORef' totalRef (+ bsLen)
+        writeSafe bs nextTok
         go g' minBudget' ts
   go gen2 len toks
   readIORef totalRef
@@ -459,59 +454,66 @@ lexerParserTests mode cfg n noOutputs = do
         toTuple (Lexeme t m) = (t, m)
 
 -- | SingleLong variant that streams the payload directly to the .inputs file
--- handle, avoiding any large in-memory accumulation.  Returns the .outputs
--- bytes (or empty if noOutputs).  The caller is responsible for writing them.
+-- handle and, when outputs are requested, streams the parse tree directly to
+-- the .outputs handle — neither the payload nor the encoded tree is ever fully
+-- accumulated in memory.
 lexerParserTestsSingleLong ::
   CFG ->
   Int ->
-  Bool ->
-  Handle ->       -- ^ handle to write framed .inputs payload into
-  IO (Either Text LBS.ByteString)
-lexerParserTestsSingleLong cfg n noOutputs h = do
+  Handle ->         -- ^ handle to write framed .inputs payload into
+  Maybe Handle ->   -- ^ Just outH to stream .outputs; Nothing when noOutputs
+  IO (Either Text ())
+lexerParserTestsSingleLong cfg n h mOutH = do
   let q = paramsLookback $ cfgParams cfg
       k = paramsLookahead $ cfgParams cfg
   case cfgToDFALexerSpec cfg of
     Left e -> pure (Left e)
     Right spec -> case cfgToGrammar cfg of
       Left e -> pure (Left e)
-      Right grammar -> case llpParserTableWithStarts q k $ getGrammar grammar of
+      Right grammar -> case llpParserTableWithStartsHomomorphisms q k $ getGrammar grammar of
         Left e -> pure (Left e)
-        Right table -> do
+        Right homoTable -> do
           let regex_map = regexMap spec
               ignore = T "ignore"
               encoder = fromSymbolToTerminalEncoder $ encodeSymbols ignore grammar
               dfa = lexerDFA (0 :: Integer) $ mapSymbols unBytes spec
               alpha = alphabet $ fsa dfa
               maybe_ignore = if ignore `Map.member` regex_map then Just ignore else Nothing
-          if noOutputs
-            then do
-              -- Streaming path: write directly to handle, never accumulate payload.
-              let headerCount = encode (1 :: Word64)
-                  headerLen   = encode (0 :: Word64)  -- placeholder, patched below
-              LBS.hPut h (headerCount <> headerLen)
-              payloadLen <- generateSingleLongLexerParserInput n alpha dfa (getGrammar grammar) h
-              hSeek h AbsoluteSeek 8
-              LBS.hPut h (encode (fromIntegral payloadLen :: Word64))
-              pure (Right (encode (Outputs [])))
-            else do
-              -- Validation path: accumulate payload in memory to run the parser.
-              -- Only used for small test sizes (--no-outputs is used for large runs).
-              let (payloadLen, singleInput) = generateSingleLongLexerParserInputPure n alpha dfa (getGrammar grammar)
-                  inp = encode (1 :: Word64) <> encode (fromIntegral payloadLen :: Word64) <> singleInput
-              LBS.hPut h inp
-              let combWords = [LBS.unpack singleInput]
-                  out = Outputs $ fmap (toOutput q k encoder dfa maybe_ignore (getGrammar grammar) table) combWords
-              case results out of
-                [Output (Just _)] -> pure (Right (encode out))
-                [Output Nothing]  -> pure (Left "Error: generated combined input failed to lex or parse.")
-                _                 -> pure (Left "Error: unexpected number of outputs for SingleLong.")
+          -- Write placeholder header, then payload; patch payloadLen afterward.
+          LBS.hPut h (encode (1 :: Word64) <> encode (0 :: Word64))
+          payloadLen <- generateSingleLongLexerParserInput n alpha dfa (getGrammar grammar) h
+          hSeek h AbsoluteSeek 8
+          LBS.hPut h (encode (fromIntegral payloadLen :: Word64))
+          case mOutH of
+            Nothing -> pure (Right ())
+            Just outH -> do
+              -- Read back the payload as a compact strict ByteString (no [Word8] list).
+              hSeek h AbsoluteSeek 16
+              payload <- ByteString.hGet h payloadLen
+              let encTok t = fromIntegral (fromJust (terminalLookup t encoder)) :: Word64
+              LBS.hPut outH (runPut $ put (1 :: Word64) >> put True)
+              nodeCountPos <- hTell outH
+              LBS.hPut outH (runPut $ put (0 :: Word64))
+              -- Tokenize and parse in one pass: tokenizeWithBS pushes each lexeme
+              -- into the push-mode parser step function; no intermediate token list.
+              let emitNode node = LBS.hPut outH (runPut (putFlatNode (fmap encTok node)))
+              (stepFn, finalize) <- llpParseDirectPush (getGrammar grammar) q k homoTable emitNode
+              let pushTok (Lexeme t m) = stepFn (AugmentedTerminal (Used t), m)
+              mLex <- tokenizeWithBS dfa maybe_ignore payload pushTok
+              mCount <- case mLex of
+                Nothing -> pure Nothing
+                Just () -> finalize
+              case mCount of
+                Nothing -> pure (Left "Error: generated combined input failed to lex or parse.")
+                Just nodeCount -> do
+                  hSeek outH AbsoluteSeek nodeCountPos
+                  LBS.hPut outH (runPut $ put nodeCount)
+                  pure (Right ())
   where
-    toOutput q k encoder dfa ignore grammar table str = Output $ do
-      ts <- fmap toTuple <$> tokenize dfa ignore str
-      tree <- llpParseFlatTree grammar q k table (first Used <$> ts)
-      pure $ fmap (fromIntegral . fromJust . (`terminalLookup` encoder)) <$> tree
-      where
-        toTuple (Lexeme t m) = (t, m)
+    putFlatNode (FlatProduction p t) =
+      put (0 :: Word8) >> put p >> put t >> put (0 :: Word64) >> put (0 :: Word64)
+    putFlatNode (FlatTerminal p (i, j) t) =
+      put (1 :: Word8) >> put p >> put t >> put i >> put j
 
 lexerParserTestsCompare :: CFG -> ByteString -> ByteString -> ByteString -> Either Text ()
 lexerParserTestsCompare cfg input expected result = do

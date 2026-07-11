@@ -12,7 +12,9 @@ import Alpacc.Generator.Cuda.Generator qualified as Cuda
 import Alpacc.Generator.Futhark.Generator qualified as Futhark
 import Alpacc.Random qualified as Random
 import Alpacc.Test
+import Alpacc.Test.Lexer (lexerTestsSingleLong)
 import Alpacc.Test.LexerParser (lexerParserTestsSingleLong)
+import Alpacc.Test.Parser (parserTestsSingleLong)
 import Control.Monad (unless)
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Lazy qualified as LBS
@@ -421,14 +423,36 @@ mainTestGenerate params = do
                   pathOfInput "test.alp" input
 
   case testGenerateGenerator params of
-    GenLexer -> do
-      (inputs, ouputs) <- eitherToIO $ lexerTests mode cfg len noOutputs
-      LBS.writeFile (name <> ".inputs") inputs
-      unless noOutputs $ LBS.writeFile (name <> ".outputs") ouputs
-    GenParser -> do
-      (inputs, ouputs) <- eitherToIO $ parserTests mode cfg len noOutputs
-      LBS.writeFile (name <> ".inputs") inputs
-      unless noOutputs $ LBS.writeFile (name <> ".outputs") ouputs
+    GenLexer -> case mode of
+      Exhaustive -> do
+        (inputs, ouputs) <- eitherToIO $ lexerTests mode cfg len noOutputs
+        LBS.writeFile (name <> ".inputs") inputs
+        unless noOutputs $ LBS.writeFile (name <> ".outputs") ouputs
+      SingleLong -> do
+        let inputsFile = name <> ".inputs"
+        h <- openBinaryFile inputsFile ReadWriteMode
+        mOutH <- if noOutputs
+                   then pure Nothing
+                   else Just <$> openBinaryFile (name <> ".outputs") WriteMode
+        result <- lexerTestsSingleLong cfg len h mOutH
+        hClose h
+        mapM_ hClose mOutH
+        eitherToIO result
+    GenParser -> case mode of
+      Exhaustive -> do
+        (inputs, ouputs) <- eitherToIO $ parserTests mode cfg len noOutputs
+        LBS.writeFile (name <> ".inputs") inputs
+        unless noOutputs $ LBS.writeFile (name <> ".outputs") ouputs
+      SingleLong -> do
+        let inputsFile = name <> ".inputs"
+        h <- openBinaryFile inputsFile WriteMode
+        mOutH <- if noOutputs
+                   then pure Nothing
+                   else Just <$> openBinaryFile (name <> ".outputs") WriteMode
+        result <- parserTestsSingleLong cfg len h mOutH
+        hClose h
+        mapM_ hClose mOutH
+        eitherToIO result
     GenBoth -> case mode of
       Exhaustive -> do
         (inputs, ouputs) <- eitherToIO $ lexerParserTests mode cfg len noOutputs
@@ -436,12 +460,14 @@ mainTestGenerate params = do
         unless noOutputs $ LBS.writeFile (name <> ".outputs") ouputs
       SingleLong -> do
         let inputsFile = name <> ".inputs"
-        -- Open for ReadWrite so we can seek back to patch the length field.
         h <- openBinaryFile inputsFile ReadWriteMode
-        result <- lexerParserTestsSingleLong cfg len noOutputs h
+        mOutH <- if noOutputs
+                   then pure Nothing
+                   else Just <$> openBinaryFile (name <> ".outputs") WriteMode
+        result <- lexerParserTestsSingleLong cfg len h mOutH
         hClose h
-        outs <- eitherToIO result
-        unless noOutputs $ LBS.writeFile (name <> ".outputs") outs
+        mapM_ hClose mOutH
+        eitherToIO result
   where
     out = testGenerateOutput params
     input = testGenerateInput params

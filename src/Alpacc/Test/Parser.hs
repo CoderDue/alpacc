@@ -1,5 +1,6 @@
 module Alpacc.Test.Parser
   ( parserTests,
+    parserTestsSingleLong,
     parserTestsCompare,
   )
 where
@@ -7,7 +8,7 @@ where
 import Alpacc.CFG
 import Alpacc.Encode
 import Alpacc.Grammar
-import Alpacc.LL (generateRandomDerivation)
+import Alpacc.LL (generateRandomDerivation, generateRandomDerivationLazy)
 import Alpacc.LLP
 import Alpacc.Test.Lexer (TestMode (..), randomSeed)
 import Alpacc.Util
@@ -21,6 +22,7 @@ import Data.List (zip4)
 import Data.Maybe
 import Data.Text (Text)
 import Data.Text qualified as Text
+import System.IO (Handle, SeekMode (..), hSeek, hTell)
 import System.Random
 
 newtype Output
@@ -136,6 +138,63 @@ parserTests mode cfg n noOutputs = do
       encode outputs
     )
   where
+    unaug (AugmentedTerminal t) = Just t
+    unaug _ = Nothing
+
+-- | SingleLong variant that streams the framed payload to the .inputs handle
+-- and, when outputs are requested, streams the production list to the .outputs
+-- handle.  Writing is done in a single streaming fold; parsing requires a
+-- second derivation pass (same seed ⇒ same sequence) so the token list and
+-- the write buffer never coexist in memory.
+parserTestsSingleLong ::
+  CFG ->
+  Int ->
+  Handle ->       -- ^ .inputs handle (WriteMode)
+  Maybe Handle -> -- ^ Just outH to stream .outputs; Nothing when noOutputs
+  IO (Either Text ())
+parserTestsSingleLong cfg n h mOutH = do
+  case cfgToGrammar cfg of
+    Left e -> pure (Left e)
+    Right grammar ->
+      case llpParserTableWithStarts q k $ getGrammar grammar of
+        Left e -> pure (Left e)
+        Right table -> do
+          let s_encoder = encodeSymbols (T "ignore") grammar
+              encode' x = fromJust $ Terminal x `symbolLookup` s_encoder
+              gen = mkStdGen randomSeed
+              -- Stream-write phase: consume the lazy derivation list one token at a
+              -- time, writing each to h.  GHC reclaims list cells as we go, so the
+              -- live set is O(1).
+              (_, rawLazy) = generateRandomDerivationLazy gen n (getGrammar grammar)
+              lazySeq = mapMaybe unaug rawLazy
+          LBS.hPut h (encode (1 :: Word64))
+          tokenCountPos <- hTell h
+          LBS.hPut h (encode (0 :: Word64))
+          totalToks <- foldM (\(!cnt) t -> do
+                let w = fromIntegral (encode' (AugmentedTerminal t)) :: Word64
+                LBS.hPut h (encode w)
+                pure (cnt + 1)) (0 :: Word64) lazySeq
+          hSeek h AbsoluteSeek tokenCountPos
+          LBS.hPut h (encode totalToks)
+          case mOutH of
+            Nothing -> pure (Right ())
+            Just outH -> do
+              -- Parse phase: re-derive with same seed (same sequence) for llpParse.
+              let (_, rawSeq) = generateRandomDerivation gen n (getGrammar grammar)
+                  singleSeq = mapMaybe unaug rawSeq
+                  mProds = fmap (fmap fromIntegral) $ llpParse q k table singleSeq
+              case mProds of
+                Nothing -> do
+                  LBS.hPut outH (encode (1 :: Word64) <> encode False)
+                  pure (Right ())
+                Just prods -> do
+                  LBS.hPut outH $ encode (1 :: Word64) <> encode True
+                              <> encode (fromIntegral (length prods) :: Word64)
+                  mapM_ (\p -> LBS.hPut outH (encode (p :: Word64))) prods
+                  pure (Right ())
+  where
+    q = paramsLookback $ cfgParams cfg
+    k = paramsLookahead $ cfgParams cfg
     unaug (AugmentedTerminal t) = Just t
     unaug _ = Nothing
 

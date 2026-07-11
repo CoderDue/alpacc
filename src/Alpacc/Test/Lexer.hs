@@ -1,5 +1,6 @@
 module Alpacc.Test.Lexer
   ( lexerTests,
+    lexerTestsSingleLong,
     lexerTestsCompare,
     lexerBytes,
     TestMode (..),
@@ -16,9 +17,10 @@ import Alpacc.Lexer.RegularExpression
 import Alpacc.Util
 import Control.Monad
 import Data.Bifunctor
+import Data.IORef
 import Data.Binary
 import Data.Binary.Get (getByteString)
-import Data.Binary.Put (putByteString)
+import Data.Binary.Put (putByteString, runPut)
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Internal
 import Data.ByteString.Lazy qualified as LBS
@@ -29,6 +31,7 @@ import Data.Map qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
+import System.IO (Handle, SeekMode (..), hSeek, hTell)
 import System.Random
 
 -- | Seed used for reproducible random generation in test cases
@@ -193,6 +196,59 @@ lexerTests mode cfg k noOutputs = do
     toOutputs dfa ignore = Outputs . fmap (Output . tokenize dfa ignore)
     toInputs = Inputs . fmap (Input . ByteString.pack)
     emptyOutputs = Outputs []
+
+-- | SingleLong variant that streams the framed payload to the .inputs handle
+-- and, when outputs are requested, streams the lexer output to the .outputs
+-- handle — the payload is never fully held in memory as a list.
+lexerTestsSingleLong ::
+  CFG ->
+  Int ->
+  Handle ->       -- ^ .inputs handle (ReadWriteMode for seek-back)
+  Maybe Handle -> -- ^ Just outH to stream .outputs; Nothing when noOutputs
+  IO (Either Text ())
+lexerTestsSingleLong cfg k h mOutH = do
+  case cfgToDFALexerSpec cfg of
+    Left e -> pure (Left e)
+    Right spec -> do
+      let ts = Map.keys $ regexMap spec
+          encoder = encodeTerminals (T "ignore") $ parsingTerminals ts
+      case mapTokens (fmap (fromIntegral :: Integer -> Word64) . (`terminalLookup` encoder)) $
+             lexerDFA (0 :: Integer) $ mapSymbols unBytes spec of
+        Nothing -> pure (Left "Error: Could not encode tokens.")
+        Just dfa -> do
+          let ignore = fromIntegral <$> terminalLookup (T "ignore") encoder
+              alpha  = alphabet $ fsa dfa
+              singleInput = generateSingleLongInputFromDFA k alpha (fsa dfa)
+          LBS.hPut h (encode (1 :: Word64) <> encode (0 :: Word64))
+          LBS.hPut h (LBS.pack singleInput)
+          let payloadLen = fromIntegral (length singleInput) :: Word64
+          hSeek h AbsoluteSeek 8
+          LBS.hPut h (encode payloadLen)
+          case mOutH of
+            Nothing -> pure (Right ())
+            Just outH -> do
+              -- Read back the payload as a compact strict ByteString and tokenize.
+              hSeek h AbsoluteSeek 16
+              payload <- ByteString.hGet h (fromIntegral payloadLen)
+              -- Outputs header: count=1, then Output valid-flag placeholder.
+              LBS.hPut outH (encode (1 :: Word64))
+              validPos <- hTell outH
+              LBS.hPut outH (encode False <> encode (0 :: Word64))
+              tokCountRef <- newIORef (0 :: Word64)
+              let putLexeme (Lexeme t (i, j)) = do
+                    LBS.hPut outH $ runPut $ do
+                      put (fromIntegral t :: Word64)
+                      put i
+                      put j
+                    modifyIORef' tokCountRef (+ 1)
+              mResult <- tokenizeWithBS dfa ignore payload putLexeme
+              case mResult of
+                Nothing -> pure (Right ())   -- leave valid=False as-is
+                Just () -> do
+                  tokCount <- readIORef tokCountRef
+                  hSeek outH AbsoluteSeek validPos
+                  LBS.hPut outH (encode True <> encode tokCount)
+                  pure (Right ())
 
 -- | Generate raw bytes for a single long lexer input, suitable for piping
 -- directly into a lexer benchmark (no binary framing).
