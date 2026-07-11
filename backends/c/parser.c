@@ -74,9 +74,9 @@ static bool parse_test(const uint64_t *tokens, uint64_t n,
     num_prods += (uint64_t) (spans[i].prod_end - spans[i].prod_start);
   }
 
-  // Bracket matching with a stack; equivalent to the depths validity +
-  // PSE(<=) + eq_no_bracket formulation in parser.fut `brackets_matches`.
+  // Bracket matching and production collection in one pass over spans.
   stack = (bracket_t *) malloc(num_brackets * sizeof(bracket_t));
+  prods = (uint64_t *) malloc(num_prods * sizeof(uint64_t));
   for (uint64_t i = 0; i < m; i++) {
     for (int64_t j = spans[i].stack_start; j < spans[i].stack_end; j++) {
       bracket_t b = STACKS[j];
@@ -88,14 +88,11 @@ static bool parse_test(const uint64_t *tokens, uint64_t n,
         top--;
       }
     }
+    for (int64_t j = spans[i].prod_start; j < spans[i].prod_end; j++)
+      prods[np++] = (uint64_t) PRODUCTIONS[j];
   }
   if (top != -1)
     goto done;
-
-  prods = (uint64_t *) malloc(num_prods * sizeof(uint64_t));
-  for (uint64_t i = 0; i < m; i++)
-    for (int64_t j = spans[i].prod_start; j < spans[i].prod_end; j++)
-      prods[np++] = (uint64_t) PRODUCTIONS[j];
   *prods_out = prods;
   *num_prods_out = np;
   prods = NULL;
