@@ -23,8 +23,18 @@ q_value="${1:-1}"
 k_value="${2:-1}"
 target="${3:-10}"
 parallel_jobs="${4:-$(nproc)}"
-type_flag="${5:-}"
-backend="${6:-multicore}"
+
+# arg5 is type_flag (--lexer or --parser) or omitted; arg6 is backend.
+# When called from the Makefile in combined mode the empty type_flag is dropped
+# by shell word-splitting, so backend lands in arg5. Detect this by checking
+# whether arg5 looks like a flag.
+if [[ "${5:-}" == --* ]]; then
+    type_flag="${5}"
+    backend="${6:-multicore}"
+else
+    type_flag=""
+    backend="${5:-multicore}"
+fi
 
 # Validate that arguments are numbers
 if ! [[ "$q_value" =~ ^[0-9]+$ ]] || ! [[ "$k_value" =~ ^[0-9]+$ ]] || ! [[ "$target" =~ ^[0-9]+$ ]]; then
@@ -72,12 +82,12 @@ run_test() {
     local job_id=$1
     local q_value=$2
     local k_value=$3
-    local type_flag=$4
-    local temp_dir=$5
-    local counter_file=$6
-    local target=$7
-    local done_file=$8
-    local backend=$9
+    local temp_dir=$4
+    local counter_file=$5
+    local target=$6
+    local done_file=$7
+    local backend=$8
+    local type_flag=$9
     
     # Create unique work directory for this job
     local work_dir="$temp_dir/job_$job_id"
@@ -166,7 +176,7 @@ export -f run_test
 # Run enough parallel jobs to reach the target
 # Each job will complete one successful test
 seq 1 $target | parallel --no-notice -j "$parallel_jobs" --halt soon,fail=1 --line-buffer \
-    "run_test {} $q_value $k_value '$type_flag' $temp_dir $counter_file $target $done_file '$backend'"
+    "run_test {} $q_value $k_value $temp_dir $counter_file $target $done_file '$backend' '$type_flag'"
 
 # Check final count
 final_count=$(cat "$counter_file")
