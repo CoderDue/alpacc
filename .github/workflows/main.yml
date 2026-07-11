@@ -102,7 +102,7 @@ jobs:
         run: make test-unit
 
       - name: Futhark tests
-        run: make test-futhark
+        run: make test-futhark-multicore
 
       - name: C tests
         run: |
