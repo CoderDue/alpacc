@@ -13,13 +13,14 @@
 # Requires nvcc and an NVIDIA GPU; not run in hosted CI (GPU-less).
 
 show_usage() {
-    echo "Usage: $0 [q_value] [k_value] [target_runs] [parallel_jobs] [arch]"
+    echo "Usage: $0 [q_value] [k_value] [target_runs] [parallel_jobs] [type_flag] [arch]"
     echo "  q_value:       -q parameter for alpacc (default: 1)"
     echo "  k_value:       -k parameter for alpacc (default: 1)"
     echo "  target_runs:   number of successful grammars (default: 10)"
     echo "  parallel_jobs: number of parallel jobs (default: 1)"
+    echo "  type_flag:     --lexer, --parser, or empty — ignored (CUDA always tests parser)"
     echo "  arch:          nvcc -arch value (default: native)"
-    echo "Example: $0 1 1 20 1 native"
+    echo "Example: $0 1 1 20 1 '' native"
 }
 
 if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
@@ -32,7 +33,9 @@ q_value="${1:-1}"
 k_value="${2:-1}"
 target="${3:-10}"
 parallel_jobs="${4:-1}"
-arch="${5:-native}"
+# arg5 is type_flag (--lexer/--parser/empty) passed by the Makefile run_random_c
+# macro — ignored here since CUDA always tests the full parser.
+arch="${6:-native}"
 
 if ! [[ "$q_value" =~ ^[0-9]+$ ]] || ! [[ "$k_value" =~ ^[0-9]+$ ]] || ! [[ "$target" =~ ^[0-9]+$ ]]; then
     echo "Error: q_value, k_value, and target must be positive integers"
