@@ -33,6 +33,8 @@ typedef #{cudafy bracket_type} bracket_t;
 #define MAX_ITERS #{cudafy $ oaMaxIters oa}
 #define STACKS_SIZE #{cudafy stacks_size}
 #define PRODUCTIONS_SIZE #{cudafy productions_size}
+#define MAX_BRACKETS_PER_POSITION #{cudafy max_brackets_per_pos}
+#define MAX_PRODS_PER_POSITION #{cudafy max_prods_per_pos}
 static const bracket_t STACKS[STACKS_SIZE] =
   #{cudafy stacks};
 static const production_t PRODUCTIONS[PRODUCTIONS_SIZE] =
@@ -67,6 +69,10 @@ static const int64_t HASH_TABLE_PRODUCTIONS_SPAN[HASH_TABLE_SIZE][2] =
     ( hash_table_stacks_span,
       hash_table_productions_span
       ) = unzip hash_table_spans
+    max_brackets_per_pos =
+      maximum $ 0 : [se - ss | ((ss, se), _) <- hash_table_spans, ss >= 0]
+    max_prods_per_pos =
+      maximum $ 0 : [pe - ps | (_, (ps, pe)) <- hash_table_spans, ps >= 0]
 
 -- | Like 'generateParser' but also emits the arity and production-to-terminal
 -- constants needed to build the CST parent vector in combined (both) mode.

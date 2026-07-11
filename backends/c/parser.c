@@ -50,12 +50,11 @@ static bool parse_test(const uint64_t *tokens, uint64_t n,
                        uint64_t **prods_out, uint64_t *num_prods_out) {
   bool ok = false;
   uint64_t m = n + 2;
-  terminal_t *arr = (terminal_t *) malloc(m * sizeof(terminal_t));
-  key_spans_t *spans = (key_spans_t *) malloc(m * sizeof(key_spans_t));
-  bracket_t *stack = NULL;
-  uint64_t *prods = NULL;
+  terminal_t *arr    = (terminal_t *) malloc(m * sizeof(terminal_t));
+  bracket_t  *stack  = (bracket_t *)  malloc(m * MAX_BRACKETS_PER_POSITION * sizeof(bracket_t));
+  uint64_t   *prods  = (uint64_t *)   malloc(m * MAX_PRODS_PER_POSITION    * sizeof(uint64_t));
   terminal_t key[Q + K];
-  uint64_t num_brackets = 0, num_prods = 0, np = 0;
+  uint64_t np = 0;
   int64_t top = -1;
 
   arr[0] = START_TERMINAL;
@@ -68,17 +67,10 @@ static bool parse_test(const uint64_t *tokens, uint64_t n,
       uint64_t idx = i + j;
       key[j] = (idx < Q || idx >= m + Q) ? EMPTY_TERMINAL : arr[idx - Q];
     }
-    if (!lookup_key(key, &spans[i]))
+    key_spans_t spans;
+    if (!lookup_key(key, &spans))
       goto done;
-    num_brackets += (uint64_t) (spans[i].stack_end - spans[i].stack_start);
-    num_prods += (uint64_t) (spans[i].prod_end - spans[i].prod_start);
-  }
-
-  // Bracket matching and production collection in one pass over spans.
-  stack = (bracket_t *) malloc(num_brackets * sizeof(bracket_t));
-  prods = (uint64_t *) malloc(num_prods * sizeof(uint64_t));
-  for (uint64_t i = 0; i < m; i++) {
-    for (int64_t j = spans[i].stack_start; j < spans[i].stack_end; j++) {
+    for (int64_t j = spans.stack_start; j < spans.stack_end; j++) {
       bracket_t b = STACKS[j];
       if (is_left(b)) {
         stack[++top] = b;
@@ -88,7 +80,7 @@ static bool parse_test(const uint64_t *tokens, uint64_t n,
         top--;
       }
     }
-    for (int64_t j = spans[i].prod_start; j < spans[i].prod_end; j++)
+    for (int64_t j = spans.prod_start; j < spans.prod_end; j++)
       prods[np++] = (uint64_t) PRODUCTIONS[j];
   }
   if (top != -1)
@@ -100,7 +92,6 @@ static bool parse_test(const uint64_t *tokens, uint64_t n,
 
 done:
   free(arr);
-  free(spans);
   free(stack);
   free(prods);
   return ok;
