@@ -17,8 +17,8 @@ RANDOM_JOBS   := 10
 # CUDA arch (override with: make test-cuda CUDA_ARCH=sm_75)
 export CUDA_ARCH ?= native
 
-# Futhark backend used for long-input tests (override with: make test-futhark FUTHARK_BACKEND=cuda)
-FUTHARK_BACKEND ?= multicore
+# Futhark execution target for long-input tests (override with: make test-futhark FUTHARK_TARGET=opencl)
+FUTHARK_TARGET ?= multicore
 
 # Grammars exercised by the long-input end-to-end tests.
 LONG_INPUT_GRAMMARS := grammars/json.alp grammars/arithmetic.alp grammars/sexp.alp
@@ -52,10 +52,10 @@ define run_random_c
 	bash $(1) $(2) $(3) $(RANDOM_TARGET) $(RANDOM_JOBS) $(4)
 endef
 
-# Run one (q, k) config for testfuthark.sh, forwarding the Futhark backend.
+# Run one (q, k) config for testfuthark.sh, forwarding the Futhark execution target.
 # Usage: $(call run_random_futhark, q, k, [--lexer|--parser|])
 define run_random_futhark
-	bash tests/testfuthark.sh $(1) $(2) $(RANDOM_TARGET) $(RANDOM_JOBS) $(3) $(FUTHARK_BACKEND)
+	bash tests/testfuthark.sh $(1) $(2) $(RANDOM_TARGET) $(RANDOM_JOBS) $(3) $(FUTHARK_TARGET)
 endef
 
 # Run test-long-input.sh for every grammar in LONG_INPUT_GRAMMARS.
@@ -74,7 +74,7 @@ test-futhark:
 	$(call run_random_futhark, 1, 1,)
 	$(call run_random_futhark, 2, 2,)
 	$(call run_random_futhark, 3, 3,)
-	$(call run_long_input, $(FUTHARK_BACKEND))
+	$(call run_long_input, futhark-$(FUTHARK_TARGET))
 
 test-c:
 	$(call run_random_c, tests/testc.sh, 0, 0, --lexer)

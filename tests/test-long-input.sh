@@ -6,9 +6,11 @@
 #   test-long-input.sh <grammar.alp> [backend] [length]
 #
 # backend (default: c):
-#   c          — alpacc c backend, compiled with cc
-#   cuda       — alpacc cuda backend, compiled with nvcc (requires GPU)
-#   multicore, opencl, ispc, <any>  — alpacc futhark backend
+#   c                    — alpacc c backend, compiled with cc
+#   cuda                 — alpacc cuda backend, compiled with nvcc (requires GPU)
+#   futhark-<target>     — alpacc futhark backend, run via futhark script
+#                          <target> is the Futhark execution target, e.g.:
+#                          futhark-multicore, futhark-opencl, futhark-ispc, futhark-cuda
 #
 # length (default: 100000)
 #
@@ -19,7 +21,7 @@
 #   2. Write a function  run_backend_<backend> <mode_flag> <stem>
 #      - generates <stem>.results from <stem>.inputs
 #      - returns 0 on success, non-zero on failure
-#   3. Add the backend name to the dispatch in run_test() below.
+#   3. Add a case for the backend name in the dispatch section below.
 
 set -euo pipefail
 
@@ -88,11 +90,12 @@ run_backend_cuda() {
 }
 
 # ---------------------------------------------------------------------------
-# Backend: futhark (multicore, opencl, ispc, ...)
+# Backend: futhark-<target>  (e.g. futhark-multicore, futhark-opencl, ...)
 # ---------------------------------------------------------------------------
 
 # futhark_pkg_dir: where the shared futhark.pkg + lib/ live (set by setup_futhark)
 futhark_pkg_dir=""
+futhark_target=""   # Futhark execution target, stripped from the backend name
 
 setup_futhark() {
     futhark_pkg_dir="$temp_dir/futhark-pkg"
@@ -115,7 +118,7 @@ run_backend_futhark() {
         echo "ERROR: alpacc futhark failed"; return 1
     fi
     # futhark script -b emits a 16-byte header before the binary payload; strip it.
-    futhark script --backend="$backend" -b "${stem}.fut" \
+    futhark script --backend="$futhark_target" -b "${stem}.fut" \
         "test (\$loadbytes \"${stem}.inputs\")" \
         | tail -c +16 > "${stem}.results"
 }
@@ -125,9 +128,24 @@ run_backend_futhark() {
 # ---------------------------------------------------------------------------
 
 case "$backend" in
-    c)    setup_fn=setup_c;       run_fn=run_backend_c    ;;
-    cuda) setup_fn=setup_cuda;    run_fn=run_backend_cuda ;;
-    *)    setup_fn=setup_futhark; run_fn=run_backend_futhark ;;
+    c)
+        setup_fn=setup_c
+        run_fn=run_backend_c
+        ;;
+    cuda)
+        setup_fn=setup_cuda
+        run_fn=run_backend_cuda
+        ;;
+    futhark-*)
+        futhark_target="${backend#futhark-}"
+        setup_fn=setup_futhark
+        run_fn=run_backend_futhark
+        ;;
+    *)
+        echo "error: unknown backend '$backend'" >&2
+        echo "       use c, cuda, or futhark-<target> (e.g. futhark-multicore)" >&2
+        exit 1
+        ;;
 esac
 
 # ---------------------------------------------------------------------------
