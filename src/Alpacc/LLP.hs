@@ -13,6 +13,10 @@ module Alpacc.LLP
     FlatNode (..),
     llpParseTree,
     llpParseFlatTree,
+    llpParseFlatTreeStream,
+    llpParseDirect,
+    llpParseDirectStream,
+    llpParseDirectPush,
   )
 where
 
@@ -20,7 +24,9 @@ import Alpacc.Grammar
 import Alpacc.LL hiding (before, follow, llParse)
 import Control.DeepSeq
 import Control.Monad (foldM, join)
+import Data.IORef
 import Control.Monad.State
+import Data.Array (listArray, (!))
 import Data.Bifunctor qualified as BI
 import Data.Foldable
 import Data.List qualified as List
@@ -590,20 +596,20 @@ llpParserTable = do
     (llp_table, _) <- either_tuple
     return llp_table
 
--- | Given a lsit create all the pairs with q lookback and k lookahead which
+-- | Given a list create all the pairs with q lookback and k lookahead which
 -- will be used as keys in the table.
+-- Uses a bounded deque (list of length <= q) for lookback, avoiding O(n) Seq.
 pairLookup :: (Ord t, Show t) => Map ([t], [t]) v -> Int -> Int -> [t] -> [Maybe v]
-pairLookup table' q k = toList . auxiliary Seq.empty Seq.empty . Seq.fromList
+pairLookup table' q k = go []
   where
-    auxiliary es _ Empty = es
-    auxiliary es ys (x :<| xs) = auxiliary (es :|> val) (ys :|> x) xs
+    go _ [] = []
+    go back (x : xs) =
+      val : go back' xs
       where
-        backwards = takeR q ys
-        forwards = Seq.take (k - 1) xs
-        val = (toList backwards, toList $ x <| forwards) `Map.lookup` table'
-        takeR i' seq' = Seq.drop (n - i') seq'
-          where
-            n = Seq.length seq'
+        back'   = keepQ (back ++ [x])
+        forward = take (k - 1) xs
+        val     = Map.lookup (back, x : forward) table'
+    keepQ xs = drop (length xs - q) xs
 
 -- | Checks if the first sequence is a prefix of the second.
 seqIsPrefixOf :: (Eq a) => Seq a -> Seq a -> Bool
@@ -743,3 +749,501 @@ llpParseFlatTree ::
   Maybe [FlatNode Word64 m t]
 llpParseFlatTree grammar q k table str_meta =
   flattenTree <$> llpParseTree grammar q k table str_meta
+
+-- | Fused parse + flatten that emits FlatNodes one at a time via a callback,
+-- never materialising the CST.  Returns the total node count, or Nothing if
+-- the input fails to parse.
+--
+-- The emitted FlatNodes are identical to those produced by llpParseFlatTree:
+-- each node carries its parent index p and the counter c advances in
+-- pre-order, matching the flattenTree / mkFlatTree numbering exactly.
+llpParseFlatTreeStream ::
+  (Ord nt, Show nt, Show t, Ord t, Show t', Ord t', NFData t', NFData t, NFData nt, Show m, Monad f) =>
+  Grammar
+    (AugmentedNonterminal (Symbol nt t))
+    (AugmentedTerminal t') ->
+  Int ->
+  Int ->
+  Map
+    ([AugmentedTerminal t'], [AugmentedTerminal t'])
+    ( [Symbol (AugmentedNonterminal (Symbol nt t)) (AugmentedTerminal t')],
+      [Symbol (AugmentedNonterminal (Symbol nt t)) (AugmentedTerminal t')],
+      [Int]
+    ) ->
+  [(t', m)] ->
+  (FlatNode Word64 m t -> f ()) ->
+  f (Maybe Word64)
+llpParseFlatTreeStream grammar q k table str_meta emit =
+  case llpParse q k table str of
+    Nothing -> pure Nothing
+    Just derivation -> do
+      (_, _, finalCount) <- go meta derivation 0 0
+      pure (Just finalCount)
+  where
+    (str, meta) = unzip str_meta
+    prod_map = Map.fromList $ zip [(0 :: Int) ..] $ productions grammar
+    toProd = flip Map.lookup prod_map
+
+    -- go ms ds p c
+    --   ms  = remaining token metadata
+    --   ds  = remaining derivation steps
+    --   p   = parent node index (for the FlatNode parent field)
+    --   c   = current node counter (this subtree's own index)
+    -- Returns (remaining_ms, remaining_ds, next_free_counter).
+    -- Mirrors mkTree + mkFlatTree: emit the node at index c with parent p,
+    -- then recurse into children passing c as their parent.
+    go [] [d] p !c
+      | Just (Production (AugmentedNonterminal (Nonterminal _)) []) <- toProd d = do
+          emit (FlatProduction p (fromIntegral d))
+          pure ([], [], c + 1)
+    go [m] [d] p !c
+      | Just (Production (AugmentedNonterminal (Terminal t)) [_]) <- toProd d = do
+          emit (FlatTerminal p m t)
+          pure ([], [], c + 1)
+    go ms@(m : tms) (d : ds) p !c
+      | Just (Production (AugmentedNonterminal (Terminal t)) _) <- toProd d = do
+          emit (FlatTerminal p m t)
+          pure (tms, ds, c + 1)
+      | Just (Production (AugmentedNonterminal (Nonterminal _)) syms) <- toProd d = do
+          emit (FlatProduction p (fromIntegral d))
+          goChildren ms ds (c + 1) c (length syms)
+    go [] (d : ds) p !c
+      | Just (Production (AugmentedNonterminal (Nonterminal _)) syms) <- toProd d = do
+          emit (FlatProduction p (fromIntegral d))
+          goChildren [] ds (c + 1) c (length syms)
+    go _ _ _ !c = pure ([], [], c)
+
+    -- goChildren ms ds c p n: emit n children, each with parent p, counter starting at c.
+    goChildren ms ds !c _ 0 = pure (ms, ds, c)
+    goChildren ms ds !c p n = do
+      (ms', ds', c') <- go ms ds p c
+      goChildren ms' ds' c' p (n - 1)
+
+-- | Direct parse using the homomorphism table: avoids building a CST entirely.
+-- Uses bracket-stack matching (O(max_depth) space) and arity-stack PSE for
+-- parent computation, mirroring compute_parents in backends/c/parser.c.
+-- Emits FlatNodes via a callback; returns Nothing if the input fails to parse.
+llpParseDirect ::
+  (Ord nt, Eq nt, Show nt, Ord t, Eq t, Show t, NFData t, NFData nt, Monad f) =>
+  Grammar
+    (AugmentedNonterminal (Symbol nt T))
+    (AugmentedTerminal (Unused t)) ->
+  Int ->
+  Int ->
+  Map
+    ([AugmentedTerminal (Unused t)], [AugmentedTerminal (Unused t)])
+    ( [Bracket (Symbol (AugmentedNonterminal (Symbol nt T)) (AugmentedTerminal (Unused t)))],
+      [Int]
+    ) ->
+  [(AugmentedTerminal (Unused t), m)] ->
+  (FlatNode Word64 m T -> f ()) ->
+  f (Maybe Word64)
+llpParseDirect grammar q k table str_meta emit = do
+  -- Single streaming pass over pairLookup results.
+  -- Fuses: table lookup validation + bracket matching + PSE parent computation + emit.
+  -- State: bstk = bracket stack, pstk = PSE stack, idx = production index, c = node count.
+  result <- go (pairLookup table q k paddedStr) metas (0 :: Word64) (0 :: Int) [] []
+  pure result
+  where
+    (str, metas) = unzip str_meta
+    paddedStr = [RightTurnstile] ++ str ++ [LeftTurnstile]
+    prod_map = Map.fromList $ zip [0..] $ productions grammar
+    prod_arr = listArray (0, Map.size prod_map - 1) $ productions grammar
+
+    isTerminalProd d = case Map.lookup d prod_map of
+      Just (Production (AugmentedNonterminal (Terminal t)) _) -> Just t
+      _ -> Nothing
+
+    arityOf d = length $ filter isNt $ symbols (prod_arr ! d)
+      where
+        isNt (Nonterminal _) = True
+        isNt _               = False
+
+    -- Main loop: process one token's (brackets, productions) at a time.
+    -- bstk = bracket validation stack, pstk = PSE stack.
+    go [] _ !c _ bstk _ =
+      if null bstk then pure (Just c) else pure Nothing
+    go (Nothing : _) _ _ _ _ _ = pure Nothing
+    go (Just (brackets, prods) : rest) ms !c !idx bstk pstk = do
+      case pushBrackets brackets bstk of
+        Nothing   -> pure Nothing
+        Just bstk' -> do
+          (c', idx', ms', pstk') <- emitProds prods ms c idx pstk
+          go rest ms' c' idx' bstk' pstk'
+
+    -- Validate and update bracket stack for one token's brackets.
+    pushBrackets [] bstk = Just bstk
+    pushBrackets (LBracket x : rest) bstk = pushBrackets rest (x : bstk)
+    pushBrackets (RBracket x : rest) (top : bstk)
+      | x == top  = pushBrackets rest bstk
+      | otherwise = Nothing
+    pushBrackets (RBracket _ : _) [] = Nothing
+
+    -- PSE + emit for one token's productions.
+    emitProds [] ms !c !idx pstk = pure (c, idx, ms, pstk)
+    emitProds (d : ds) ms !c !idx pstk = do
+      let arity  = arityOf d
+          parent = case pstk of { (p, _) : _ -> fromIntegral p; [] -> 0 }
+          pstk'  = case pstk of
+                     (_, 1) : t   -> t
+                     (p', n) : t  -> (p', n - 1) : t
+                     []           -> []
+          pstk2  = if arity > 0 then (idx, arity) : pstk' else pstk'
+      case isTerminalProd d of
+        Just t -> case ms of
+          (m : ms') -> do
+            emit (FlatTerminal parent m t)
+            emitProds ds ms' (c + 1) (idx + 1) pstk2
+          [] -> emitProds ds [] (c + 1) (idx + 1) pstk2
+        Nothing -> do
+          emit (FlatProduction parent (fromIntegral d))
+          emitProds ds ms (c + 1) (idx + 1) pstk2
+
+-- | Streaming variant of 'llpParseDirect'.  Tokens are pulled one at a time
+-- from the @nextToken@ IO action (returns Nothing at end-of-input) so that no
+-- intermediate token list is ever allocated.  A bounded lookback deque (size q)
+-- and lookahead queue (size k) are maintained internally.
+llpParseDirectStream ::
+  (Ord nt, Eq nt, Show nt, Ord t, Eq t, Show t, NFData t, NFData nt) =>
+  Grammar
+    (AugmentedNonterminal (Symbol nt T))
+    (AugmentedTerminal (Unused t)) ->
+  Int ->
+  Int ->
+  Map
+    ([AugmentedTerminal (Unused t)], [AugmentedTerminal (Unused t)])
+    ( [Bracket (Symbol (AugmentedNonterminal (Symbol nt T)) (AugmentedTerminal (Unused t)))],
+      [Int]
+    ) ->
+  IO (Maybe (AugmentedTerminal (Unused t), meta)) ->
+  (FlatNode Word64 meta T -> IO ()) ->
+  IO (Maybe Word64)
+llpParseDirectStream grammar q k table nextToken emit = do
+  -- Prime the lookahead buffer with the sentinel + first k tokens.
+  -- We pad with RightTurnstile at the start and LeftTurnstile at the end,
+  -- mirroring llpParseDirect's paddedStr.
+  --
+  -- Strategy: maintain
+  --   back :: [tok]          bounded lookback deque of length <= q
+  --   ahead :: [(tok, meta)] lookahead window of length <= k (current token = head ahead)
+  --   metaQ :: [meta]        parallel metadata for the lookahead window tokens
+  --
+  -- On each step we look up (back, current:forward_toks) in the table,
+  -- process the result, then advance by one token.
+
+  -- Fill the lookahead window initially.
+  let fillAhead n acc = if n <= 0
+        then pure (reverse acc)
+        else do
+          mt <- nextToken
+          case mt of
+            Nothing -> pure (reverse acc)
+            Just tok -> fillAhead (n - 1) (tok : acc)
+
+  -- We process one token position at a time.
+  -- current = the token we are looking up now
+  -- back    = lookback window (list of length <= q, most-recent last)
+  -- ahead   = tokens after current that form the lookahead (length <= k-1)
+  let loop back current ahead !c !idx !bstk !pstk = do
+        -- Build table key: (back_toks, [current_tok] ++ forward_toks)
+        let backToks    = map fst back
+            currentTok  = fst current
+            forwardToks = map fst (take (k - 1) ahead)
+            key         = (backToks, currentTok : forwardToks)
+        case Map.lookup key table of
+          Nothing -> pure Nothing
+          Just (brackets, prods) ->
+            case pushBrackets brackets bstk of
+              Nothing    -> pure Nothing
+              Just bstk' -> do
+                (c', idx', meta', pstk') <- emitProds prods [snd current] c idx pstk
+                _ <- pure meta'  -- consumed
+                -- Advance: pull next token into ahead, drop oldest from ahead into current.
+                nextTok <- nextToken
+                let back' = keepQ (back ++ [current])
+                case ahead of
+                  [] ->
+                    -- No more real tokens; process LeftTurnstile sentinel.
+                    processEnd back' bstk' pstk' c' idx'
+                  (nxt : ahead') -> do
+                    -- Extend ahead with newly pulled token (if any).
+                    let ahead'' = case nextTok of
+                                    Nothing  -> ahead'
+                                    Just t   -> ahead' ++ [t]
+                    loop back' nxt ahead'' c' idx' bstk' pstk'
+
+      -- After all real tokens, process the LeftTurnstile sentinel.
+      processEnd back bstk pstk !c !idx = do
+        let backToks = map fst back
+            key      = (backToks, [LeftTurnstile])
+        case Map.lookup key table of
+          Nothing -> pure Nothing
+          Just (brackets, prods) ->
+            case pushBrackets brackets bstk of
+              Nothing    -> pure Nothing
+              Just bstk' -> do
+                (c', _idx', _meta', _pstk') <- emitProds prods [] c idx pstk
+                if null bstk' then pure (Just c') else pure Nothing
+
+  -- Seed: fill k tokens for the initial lookahead.
+  initial <- fillAhead k []
+  case initial of
+    [] -> do
+      -- Empty input: just look up ([], [LeftTurnstile]) for the sentinel.
+      let key = ([] :: [AugmentedTerminal (Unused t)], [LeftTurnstile])
+      case Map.lookup key table of
+        Nothing -> pure Nothing
+        Just (brackets, prods) ->
+          case pushBrackets brackets [] of
+            Nothing    -> pure Nothing
+            Just bstk' -> do
+              (c', _, _, _) <- emitProds prods [] (0 :: Word64) (0 :: Int) []
+              if null bstk' then pure (Just c') else pure Nothing
+    (firstTok : rest) ->
+      loop [] firstTok rest (0 :: Word64) (0 :: Int) [] []
+  where
+    prod_map = Map.fromList $ zip [0..] $ productions grammar
+    prod_arr = listArray (0, Map.size prod_map - 1) $ productions grammar
+
+    isTerminalProd d = case Map.lookup d prod_map of
+      Just (Production (AugmentedNonterminal (Terminal t)) _) -> Just t
+      _ -> Nothing
+
+    arityOf d = length $ filter isNt $ symbols (prod_arr ! d)
+      where
+        isNt (Nonterminal _) = True
+        isNt _               = False
+
+    keepQ xs = drop (length xs - q) xs
+
+    pushBrackets [] bstk = Just bstk
+    pushBrackets (LBracket x : rest) bstk = pushBrackets rest (x : bstk)
+    pushBrackets (RBracket x : rest) (top : bstk)
+      | x == top  = pushBrackets rest bstk
+      | otherwise = Nothing
+    pushBrackets (RBracket _ : _) [] = Nothing
+
+    emitProds [] ms !c !idx pstk = pure (c, idx, ms, pstk)
+    emitProds (d : ds) ms !c !idx pstk = do
+      let arity  = arityOf d
+          parent = case pstk of { (p, _) : _ -> fromIntegral p; [] -> 0 }
+          pstk'  = case pstk of
+                     (_, 1) : t   -> t
+                     (p', n) : t  -> (p', n - 1) : t
+                     []           -> []
+          pstk2  = if arity > 0 then (idx, arity) : pstk' else pstk'
+      case isTerminalProd d of
+        Just t -> case ms of
+          (m : ms') -> do
+            emit (FlatTerminal parent m t)
+            emitProds ds ms' (c + 1) (idx + 1) pstk2
+          [] -> emitProds ds [] (c + 1) (idx + 1) pstk2
+        Nothing -> do
+          emit (FlatProduction parent (fromIntegral d))
+          emitProds ds ms (c + 1) (idx + 1) pstk2
+
+-- | Internal state for 'llpParseDirectPush'.
+data PushSt tok bsym meta = PushSt
+  { psStartup :: !Bool
+  , psBack    :: ![(tok, meta)]
+  , psAhead   :: ![(tok, meta)]
+  , psBstk    :: ![bsym]
+  , psPstk    :: ![(Int, Int)]
+  , psCount   :: !Word64
+  , psProdIdx :: !Int
+  }
+
+-- | Push-mode streaming parser.  Returns @(step, finalize)@:
+--   * @step (tok, meta)@ -- call once per token in order; after a parse error
+--     further calls are no-ops.
+--   * @finalize@ -- call once after all tokens to process the end sentinel and
+--     get the final node count (Nothing = parse error).
+--
+-- No intermediate token list is allocated; this is meant to be driven by
+-- 'tokenizeWithBS' in a single pass.
+llpParseDirectPush ::
+  (Ord nt, Eq nt, Show nt, Ord t, Eq t, Show t, NFData t, NFData nt) =>
+  Grammar
+    (AugmentedNonterminal (Symbol nt T))
+    (AugmentedTerminal (Unused t)) ->
+  Int ->
+  Int ->
+  Map
+    ([AugmentedTerminal (Unused t)], [AugmentedTerminal (Unused t)])
+    ( [Bracket (Symbol (AugmentedNonterminal (Symbol nt T)) (AugmentedTerminal (Unused t)))],
+      [Int]
+    ) ->
+  (FlatNode Word64 meta T -> IO ()) ->
+  IO
+    ( (AugmentedTerminal (Unused t), meta) -> IO ()
+    , IO (Maybe Word64)
+    )
+llpParseDirectPush grammar q k table emitNode = do
+  -- Parser state record.  'startup=True' while we accumulate the first k tokens
+  -- needed to look up the RightTurnstile position in the table.
+  let initSt = PushSt
+        { psStartup   = True
+        , psBack      = [] :: [(AugmentedTerminal (Unused t), meta)]
+        , psAhead     = [] :: [(AugmentedTerminal (Unused t), meta)]
+        , psBstk      = [] :: [Symbol (AugmentedNonterminal (Symbol nt T)) (AugmentedTerminal (Unused t))]
+        , psPstk      = [] :: [(Int, Int)]
+        , psCount     = 0  :: Word64
+        , psProdIdx   = 0  :: Int
+        }
+  stateRef <- newIORef (Right initSt)
+
+  let step tok = do
+        est <- readIORef stateRef
+        case est of
+          Left _   -> pure ()
+          Right st ->
+            if psStartup st
+              then do
+                let ahead' = psAhead st ++ [tok]
+                if length ahead' < k
+                  then writeIORef stateRef $ Right st { psAhead = ahead' }
+                  else do
+                    -- Have k tokens: process RightTurnstile position, then drain.
+                    let fwd = map fst (take (k - 1) ahead')
+                        startKey = ([] :: [AugmentedTerminal (Unused t)], RightTurnstile : fwd)
+                    r <- processStart (psBack st) ahead' (psBstk st) (psPstk st) (psCount st) (psProdIdx st) startKey
+                    case r of
+                      Nothing  -> writeIORef stateRef (Left ())
+                      Just st' -> writeIORef stateRef (Right st')
+              else do
+                let ahead' = psAhead st ++ [tok]
+                r <- drain st { psAhead = ahead' }
+                case r of
+                  Nothing  -> writeIORef stateRef (Left ())
+                  Just st' -> writeIORef stateRef (Right st')
+
+      -- Compute forward-lookahead tokens for drainAll, mirroring pairLookup on the
+      -- padded string: exactly one LeftTurnstile sentinel follows the last real token.
+      padFwd toks = take (k - 1) (map fst toks ++ [LeftTurnstile])
+
+      finalize = do
+        est <- readIORef stateRef
+        case est of
+          Left _   -> pure Nothing
+          Right st ->
+            if psStartup st
+              then do
+                -- Fewer than k tokens total: process RightTurnstile then drain all.
+                let fwd      = padFwd (psAhead st)
+                    startKey = ([] :: [AugmentedTerminal (Unused t)], RightTurnstile : fwd)
+                r <- processStart (psBack st) (psAhead st) (psBstk st) (psPstk st) (psCount st) (psProdIdx st) startKey
+                case r of
+                  Nothing  -> pure Nothing
+                  Just st' -> finishDrain st'
+              else finishDrain st
+
+      -- Process the RightTurnstile position, then run drain.
+      processStart back ahead bstk pstk !c !pidx startKey =
+        case Map.lookup startKey table of
+          Nothing -> pure Nothing
+          Just (brackets, prods) ->
+            case pshBrackets brackets bstk of
+              Nothing    -> pure Nothing
+              Just bstk1 -> do
+                (c1, pidx1, _, pstk1) <- emtProds prods [] c pidx pstk
+                let back1 = keepQ (back ++ [(RightTurnstile, error "no meta")])
+                    st1   = PushSt False back1 ahead bstk1 pstk1 c1 pidx1
+                drain st1
+
+      -- drain: consume tokens while ahead has more than k-1 entries.
+      drain st
+        | length (psAhead st) > k - 1 = case psAhead st of
+            [] -> pure (Just st)
+            (current : rest) -> do
+              let fwdToks = map fst (take (k - 1) rest)
+              r <- processOne (psBack st) current fwdToks (psBstk st) (psPstk st) (psCount st) (psProdIdx st)
+              case r of
+                Nothing                              -> pure Nothing
+                Just (back', bstk', pstk', c', pi') ->
+                  drain st { psBack = back', psAhead = rest, psBstk = bstk', psPstk = pstk', psCount = c', psProdIdx = pi' }
+        | otherwise = pure (Just st)
+
+      -- finishDrain: drainAll remaining tokens then process LeftTurnstile.
+      finishDrain st = do
+        r <- drainAll (psBack st) (psAhead st) (psBstk st) (psPstk st) (psCount st) (psProdIdx st)
+        case r of
+          Nothing                              -> pure Nothing
+          Just (back', bstk', pstk', c', pi') -> processEnd back' bstk' pstk' c' pi'
+
+      -- drainAll: process every remaining token, padding forward with LeftTurnstile.
+      drainAll back [] bstk pstk !c !pidx = pure $ Just (back, bstk, pstk, c, pidx)
+      drainAll back (current : rest) bstk pstk !c !pidx = do
+        let fwdToks = padFwd rest
+        r <- processOne back current fwdToks bstk pstk c pidx
+        case r of
+          Nothing                              -> pure Nothing
+          Just (back', bstk', pstk', c', pi') -> drainAll back' rest bstk' pstk' c' pi'
+
+      -- processOne: table lookup + bracket check + emit productions for one token.
+      processOne back current fwdToks bstk pstk !c !pidx = do
+        let backToks   = map fst back
+            currentTok = fst current
+            key        = (backToks, currentTok : fwdToks)
+        case Map.lookup key table of
+          Nothing -> pure Nothing
+          Just (brackets, prods) ->
+            case pshBrackets brackets bstk of
+              Nothing    -> pure Nothing
+              Just bstk' -> do
+                (c', pidx', _, pstk') <- emtProds prods [snd current] c pidx pstk
+                let back' = keepQ (back ++ [current])
+                pure (Just (back', bstk', pstk', c', pidx'))
+
+      processEnd back bstk pstk !c !pidx = do
+        let backToks = map fst back
+            key      = (backToks, [LeftTurnstile])
+        case Map.lookup key table of
+          Nothing -> pure Nothing
+          Just (brackets, prods) ->
+            case pshBrackets brackets bstk of
+              Nothing    -> pure Nothing
+              Just bstk' -> do
+                (c', _, _, _) <- emtProds prods [] c pidx pstk
+                if null bstk' then pure (Just c') else pure Nothing
+
+  pure (step, finalize)
+  where
+    prod_map = Map.fromList $ zip [0..] $ productions grammar
+    prod_arr = listArray (0, Map.size prod_map - 1) $ productions grammar
+
+    isTerminalProd d = case Map.lookup d prod_map of
+      Just (Production (AugmentedNonterminal (Terminal t)) _) -> Just t
+      _ -> Nothing
+
+    arityOf d = length $ filter isNt $ symbols (prod_arr ! d)
+      where
+        isNt (Nonterminal _) = True
+        isNt _               = False
+
+    keepQ xs = drop (length xs - q) xs
+
+    pshBrackets [] stk = Just stk
+    pshBrackets (LBracket x : rest) stk = pshBrackets rest (x : stk)
+    pshBrackets (RBracket x : rest) (top : stk)
+      | x == top  = pshBrackets rest stk
+      | otherwise = Nothing
+    pshBrackets (RBracket _ : _) [] = Nothing
+
+    emtProds [] ms !c !pidx pstk = pure (c, pidx, ms, pstk)
+    emtProds (d : ds) ms !c !pidx pstk = do
+      let arity  = arityOf d
+          parent = case pstk of { (p, _) : _ -> fromIntegral p; [] -> 0 }
+          pstk'  = case pstk of
+                     (_, 1) : t   -> t
+                     (p', n) : t  -> (p', n - 1) : t
+                     []           -> []
+          pstk2  = if arity > 0 then (pidx, arity) : pstk' else pstk'
+      case isTerminalProd d of
+        Just t -> case ms of
+          (m : ms') -> do
+            emitNode (FlatTerminal parent m t)
+            emtProds ds ms' (c + 1) (pidx + 1) pstk2
+          [] -> emtProds ds [] (c + 1) (pidx + 1) pstk2
+        Nothing -> do
+          emitNode (FlatProduction parent (fromIntegral d))
+          emtProds ds ms (c + 1) (pidx + 1) pstk2
