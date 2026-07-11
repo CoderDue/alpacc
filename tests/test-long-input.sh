@@ -1,0 +1,179 @@
+#!/bin/bash
+# test-long-input.sh — Run lexer, parser, and combined modes on a single
+# long input for an arbitrary grammar and backend.
+#
+# Usage:
+#   test-long-input.sh <grammar.alp> [backend] [length]
+#
+# backend (default: c):
+#   c          — alpacc c backend, compiled with cc
+#   cuda       — alpacc cuda backend, compiled with nvcc (requires GPU)
+#   multicore, opencl, ispc, <any>  — alpacc futhark backend
+#
+# length (default: 100000)
+#
+# Exit codes: 0 = all tests passed, 1 = at least one failed.
+#
+# Adding a new backend:
+#   1. Write a function  setup_<backend>   (optional; called once before tests)
+#   2. Write a function  run_backend_<backend> <mode_flag> <stem>
+#      - generates <stem>.results from <stem>.inputs
+#      - returns 0 on success, non-zero on failure
+#   3. Add the backend name to the dispatch in run_test() below.
+
+set -euo pipefail
+
+show_usage() {
+    echo "Usage: $0 <grammar.alp> [backend] [length]"
+    echo "  grammar.alp  path to the .alp grammar file"
+    echo "  backend      c (default), cuda, or any futhark backend"
+    echo "  length       input length (default: 100000)"
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    show_usage; exit 0
+fi
+if [ $# -lt 1 ]; then
+    echo "error: grammar file required" >&2; show_usage; exit 1
+fi
+
+export PATH="$HOME/bin:$PATH"
+
+GRAMMAR="$(realpath "$1")"
+backend="${2:-c}"
+length="${3:-100000}"
+grammar_name="$(basename "$GRAMMAR" .alp)"
+
+echo "Testing '$grammar_name' grammar with backend '$backend' (length=$length)..."
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+temp_dir=$(mktemp -d)
+trap 'rm -rf "$temp_dir"' EXIT
+
+# ---------------------------------------------------------------------------
+# Backend: c
+# ---------------------------------------------------------------------------
+
+setup_c() { :; }
+
+run_backend_c() {
+    local mode_flag="$1" stem="$2"
+    # shellcheck disable=SC2086
+    if ! alpacc c "$GRAMMAR" $mode_flag -o "${stem}.c"; then
+        echo "ERROR: alpacc c failed"; return 1
+    fi
+    if ! cc -std=c99 -O2 ${CFLAGS:-} -o "${stem}" "${stem}.c" &>/dev/null; then
+        echo "ERROR: cc compilation failed"; return 1
+    fi
+    "./${stem}" < "${stem}.inputs" > "${stem}.results"
+}
+
+# ---------------------------------------------------------------------------
+# Backend: cuda
+# ---------------------------------------------------------------------------
+
+setup_cuda() { :; }
+
+run_backend_cuda() {
+    local mode_flag="$1" stem="$2"
+    local arch="${CUDA_ARCH:-native}"
+    # shellcheck disable=SC2086
+    if ! alpacc cuda "$GRAMMAR" $mode_flag -o "${stem}.cu"; then
+        echo "ERROR: alpacc cuda failed"; return 1
+    fi
+    if ! nvcc -O3 -std=c++17 -arch="$arch" -o "${stem}" "${stem}.cu" &>/dev/null; then
+        echo "ERROR: nvcc compilation failed"; return 1
+    fi
+    "./${stem}" < "${stem}.inputs" > "${stem}.results"
+}
+
+# ---------------------------------------------------------------------------
+# Backend: futhark (multicore, opencl, ispc, ...)
+# ---------------------------------------------------------------------------
+
+# futhark_pkg_dir: where the shared futhark.pkg + lib/ live (set by setup_futhark)
+futhark_pkg_dir=""
+
+setup_futhark() {
+    futhark_pkg_dir="$temp_dir/futhark-pkg"
+    mkdir -p "$futhark_pkg_dir"
+    echo "Setting up Futhark packages..."
+    ( cd "$futhark_pkg_dir"
+      futhark pkg add github.com/diku-dk/containers
+      futhark pkg add github.com/diku-dk/sorts
+      futhark pkg sync
+    )
+    echo "Futhark packages ready"
+}
+
+run_backend_futhark() {
+    local mode_flag="$1" stem="$2"
+    cp -r "$futhark_pkg_dir/lib" .
+    cp "$futhark_pkg_dir/futhark.pkg" .
+    # shellcheck disable=SC2086
+    if ! alpacc futhark "$GRAMMAR" $mode_flag; then
+        echo "ERROR: alpacc futhark failed"; return 1
+    fi
+    # futhark script -b emits a 16-byte header before the binary payload; strip it.
+    futhark script --backend="$backend" -b "${stem}.fut" \
+        "test (\$loadbytes \"${stem}.inputs\")" \
+        | tail -c +16 > "${stem}.results"
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch: map backend name -> setup_* and run_backend_* functions
+# ---------------------------------------------------------------------------
+
+case "$backend" in
+    c)    setup_fn=setup_c;       run_fn=run_backend_c    ;;
+    cuda) setup_fn=setup_cuda;    run_fn=run_backend_cuda ;;
+    *)    setup_fn=setup_futhark; run_fn=run_backend_futhark ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Per-mode test runner
+# ---------------------------------------------------------------------------
+
+run_test() {
+    local mode_flag="$1"
+    local mode_name
+    if [ -z "$mode_flag" ]; then mode_name="combined"; else mode_name="${mode_flag#--}"; fi
+
+    echo "========================================="
+    echo "Testing $grammar_name $mode_name mode (backend=$backend)..."
+    echo "========================================="
+
+    local work_dir="$temp_dir/$mode_name"
+    mkdir -p "$work_dir"
+    cd "$work_dir"
+
+    # shellcheck disable=SC2086
+    if ! alpacc test generate "$GRAMMAR" --single-long --length "$length" $mode_flag; then
+        echo "ERROR: alpacc test generate failed for $mode_name mode"; return 1
+    fi
+
+    if ! "$run_fn" "$mode_flag" "$grammar_name"; then
+        return 1
+    fi
+
+    # shellcheck disable=SC2086
+    if ! alpacc test compare "$GRAMMAR" \
+            "${grammar_name}.inputs" "${grammar_name}.outputs" "${grammar_name}.results" \
+            $mode_flag; then
+        echo "ERROR: test FAILED for $grammar_name $mode_name mode"; return 1
+    fi
+
+    echo "$grammar_name $mode_name test PASSED"
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+"$setup_fn"
+
+run_test "--lexer"  || exit 1
+run_test "--parser" || exit 1
+run_test ""         || exit 1
+
+echo "All $grammar_name tests passed (backend=$backend)."

@@ -3,9 +3,9 @@
 # Targets:
 #   make build          build and install the alpacc binary to ~/bin
 #   make test-unit      cabal unit/property tests
-#   make test-futhark   Futhark random-grammar tests + JSON end-to-end (Futhark multicore)
-#   make test-c         C random-grammar tests + JSON end-to-end (C backend)
-#   make test-cuda      CUDA random-grammar tests + JSON end-to-end (CUDA backend)
+#   make test-futhark   Futhark random-grammar tests + long-input end-to-end (Futhark multicore)
+#   make test-c         C random-grammar tests + long-input end-to-end (C backend)
+#   make test-cuda      CUDA random-grammar tests + long-input end-to-end (CUDA backend)
 #   make test           test-unit + test-futhark + test-c  (no GPU required)
 
 SHELL := bash
@@ -17,8 +17,11 @@ RANDOM_JOBS   := 10
 # CUDA arch (override with: make test-cuda CUDA_ARCH=sm_75)
 export CUDA_ARCH ?= native
 
-# Futhark backend used for JSON test (override with: make test-json-futhark FUTHARK_BACKEND=cuda)
+# Futhark backend used for long-input tests (override with: make test-futhark FUTHARK_BACKEND=cuda)
 FUTHARK_BACKEND ?= multicore
+
+# Grammars exercised by the long-input end-to-end tests.
+LONG_INPUT_GRAMMARS := grammars/json.alp grammars/arithmetic.alp grammars/sexp.alp
 
 .PHONY: build \
         test-unit \
@@ -55,6 +58,12 @@ define run_random_futhark
 	bash tests/testfuthark.sh $(1) $(2) $(RANDOM_TARGET) $(RANDOM_JOBS) $(3) $(FUTHARK_BACKEND)
 endef
 
+# Run test-long-input.sh for every grammar in LONG_INPUT_GRAMMARS.
+# Usage: $(call run_long_input, backend)
+define run_long_input
+	$(foreach g,$(LONG_INPUT_GRAMMARS),bash tests/test-long-input.sh $(g) $(1) &&) true
+endef
+
 test-futhark:
 	$(call run_random_futhark, 0, 0, --lexer)
 	$(call run_random_futhark, 0, 1, --parser)
@@ -65,7 +74,7 @@ test-futhark:
 	$(call run_random_futhark, 1, 1,)
 	$(call run_random_futhark, 2, 2,)
 	$(call run_random_futhark, 3, 3,)
-	bash tests/testjson-futhark.sh $(FUTHARK_BACKEND)
+	$(call run_long_input, $(FUTHARK_BACKEND))
 
 test-c:
 	$(call run_random_c, tests/testc.sh, 0, 0, --lexer)
@@ -77,7 +86,7 @@ test-c:
 	$(call run_random_c, tests/testc.sh, 1, 1,)
 	$(call run_random_c, tests/testc.sh, 2, 2,)
 	$(call run_random_c, tests/testc.sh, 3, 3,)
-	bash tests/testjson-c.sh
+	$(call run_long_input, c)
 
 test-cuda:
 	$(call run_random_c, tests/testcuda.sh, 0, 0, --lexer)
@@ -89,7 +98,7 @@ test-cuda:
 	$(call run_random_c, tests/testcuda.sh, 1, 1,)
 	$(call run_random_c, tests/testcuda.sh, 2, 2,)
 	$(call run_random_c, tests/testcuda.sh, 3, 3,)
-	bash tests/testjson-cuda.sh $(CUDA_ARCH)
+	$(call run_long_input, cuda)
 
 # ---------------------------------------------------------------------------
 # Composite targets
