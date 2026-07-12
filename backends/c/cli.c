@@ -4,20 +4,30 @@
 // lexer.c (if HAS_LEXER), and parser.c (if HAS_PARSER).
 //
 // The generated code defines:
-//   void run_test_case(const uint8_t *in, uint64_t n, FILE *out);
-// which processes one test and writes its result to `out`.
+//   void run_test_case(uint64_t n, const uint8_t *in, FILE *out);
+//     — one batch test (u64-BE test protocol), result to `out`
+//   void run_server_case(uint64_t n, const uint8_t *in, FILE *out);
+//     — one server frame (native types, host byte order), result to `out`
+//   void print_layout(FILE *out);
+//     — native type sizes as key=value lines (for --layout)
+// plus the INPUT_BYTES(n) / SERVER_INPUT_BYTES(n) payload-size macros.
 //
-// Input format (batch mode):
+// Input format (batch mode, u64 BE regardless of native types):
 //   u64 BE  num_tests
 //   per test:
 //     u64 BE  n          (bytes for lexer/both; token count for parser)
 //     n bytes / n*8 bytes payload
+//
+// Server mode uses native types in host byte order (alpacc targets
+// little-endian hosts): u64 frame_len; content: u64 n + payload
+// (n raw bytes for lexer/both; n × sizeof(terminal_t) token ids for parser).
 //
 // Flags:
 //   -i FILE    input file  (default: stdin)
 //   -o FILE    output file (default: stdout)
 //   --timeit   print wall-clock time to stderr
 //   --server   length-prefixed frame loop (one test per frame, no num_tests header)
+//   --layout   print native type sizes and exit
 //   -h/--help  show usage
 
 // ---------------------------------------------------------------------------
@@ -50,6 +60,15 @@ static uint64_t decode_u64(const uint8_t *p) {
 
 static void write_u64(FILE *f, uint64_t v) { write_u64be(f, v); }
 
+// Host-byte-order (little-endian) helpers for the native server protocol.
+static uint64_t read_u64le(FILE *f) {
+    uint64_t v;
+    if (fread(&v, sizeof v, 1, f) != 1) return (uint64_t)-1;
+    return v;
+}
+
+static void write_u64le(FILE *f, uint64_t v) { fwrite(&v, sizeof v, 1, f); }
+
 // ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
@@ -60,7 +79,8 @@ static void usage(const char *prog) {
         "  -i FILE    input file  (default: stdin)\n"
         "  -o FILE    output file (default: stdout)\n"
         "  --timeit   print wall-clock elapsed time to stderr\n"
-        "  --server   length-prefixed frame mode (one test per frame)\n"
+        "  --server   length-prefixed frame mode (one test per frame, native types)\n"
+        "  --layout   print native type sizes and exit\n"
         "  -h/--help  show this message\n",
         prog);
 }
@@ -81,6 +101,8 @@ static CliArgs parse_args(int argc, char *argv[]) {
             a.timeit = true;
         } else if (strcmp(argv[i], "--server") == 0) {
             a.server = true;
+        } else if (strcmp(argv[i], "--layout") == 0) {
+            print_layout(stdout); exit(0);
         } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
             a.input_file = argv[++i];
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
@@ -127,17 +149,17 @@ static int batch_mode(FILE *in, FILE *out) {
 }
 
 // ---------------------------------------------------------------------------
-// Server mode
+// Server mode (native protocol, host byte order)
 //
-// Loop: read u64 BE frame_length, read that many bytes as the frame,
-// pass to run_test_case(), flush, repeat until EOF.
-// Frame format: u64 BE n + payload (same as one batch test without the
-// outer num_tests wrapper).
+// Loop: read u64 frame_length, read that many bytes as the frame,
+// pass to run_server_case(), flush, repeat until EOF.
+// Frame format: u64 n + native payload (raw bytes for lexer/both;
+// n × sizeof(terminal_t) token ids for parser).
 // ---------------------------------------------------------------------------
 
 static int server_mode(FILE *in, FILE *out) {
     for (;;) {
-        uint64_t frame_len = read_u64be(in);
+        uint64_t frame_len = read_u64le(in);
         if (feof(in)) break;
         if (frame_len == (uint64_t)-1 || frame_len < 8) {
             fprintf(stderr, "error: bad frame length\n"); return 1;
@@ -146,13 +168,14 @@ static int server_mode(FILE *in, FILE *out) {
         if (fread(frame, 1, frame_len, in) != frame_len) {
             fprintf(stderr, "error: truncated frame\n"); free(frame); return 1;
         }
-        // First 8 bytes of frame are n (big-endian).
-        uint64_t n = decode_u64(frame);
-        uint64_t byte_n = INPUT_BYTES(n);
+        // First 8 bytes of frame are n (host byte order).
+        uint64_t n;
+        memcpy(&n, frame, sizeof n);
+        uint64_t byte_n = SERVER_INPUT_BYTES(n);
         if (frame_len != 8 + byte_n) {
             fprintf(stderr, "error: frame length mismatch\n"); free(frame); return 1;
         }
-        run_test_case(n, frame + 8, out);
+        run_server_case(n, frame + 8, out);
         fflush(out);
         free(frame);
     }

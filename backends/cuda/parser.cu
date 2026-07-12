@@ -518,7 +518,7 @@ static void launchParserFused(ParserFused& p, index_t m) {
 
 // Copy input, run, read back validity and productions.
 static bool runParserFused(ParserFused& p, const terminal_t* h_arr, index_t m,
-                           std::vector<uint64_t>& out_prods)
+                           std::vector<production_t>& out_prods)
 {
     gpuAssert(cudaMemcpy(p.d_arr, h_arr, (size_t)m * sizeof(terminal_t), cudaMemcpyHostToDevice));
     int one = 1;
@@ -539,10 +539,9 @@ static bool runParserFused(ParserFused& p, const terminal_t* h_arr, index_t m,
     gpuAssert(cudaMemcpy(totals, p.bufs.d_totals, 2 * sizeof(index_t), cudaMemcpyDeviceToHost));
     index_t num_prods = totals[1];
     if (num_prods > (index_t)0) {
-        std::vector<production_t> h_prods((size_t)num_prods);
-        gpuAssert(cudaMemcpy(h_prods.data(), p.bufs.d_productions,
+        out_prods.resize((size_t)num_prods);
+        gpuAssert(cudaMemcpy(out_prods.data(), p.bufs.d_productions,
                              (size_t)num_prods * sizeof(production_t), cudaMemcpyDeviceToHost));
-        out_prods.assign(h_prods.begin(), h_prods.end());
     }
     return true;
 }
@@ -551,8 +550,8 @@ static bool runParserFused(ParserFused& p, const terminal_t* h_arr, index_t m,
 // One-shot pipeline used by the CLI
 // ---------------------------------------------------------------------------
 
-static bool runParserPipeline(const uint64_t* h_tokens_u64, uint64_t n,
-                              std::vector<uint64_t>& out_prods)
+static bool runParserPipeline(const terminal_t* h_tokens, uint64_t n,
+                              std::vector<production_t>& out_prods)
 {
     if (n > (uint64_t)(std::numeric_limits<index_t>::max() - 2)) return false;
     index_t m = (index_t)(n + 2);
@@ -564,7 +563,7 @@ static bool runParserPipeline(const uint64_t* h_tokens_u64, uint64_t n,
 
     std::vector<terminal_t> h_arr((size_t)m);
     h_arr[0] = START_TERMINAL;
-    for (index_t i = 0; i < (index_t)n; i++) h_arr[(size_t)(i + 1)] = (terminal_t)h_tokens_u64[(size_t)i];
+    for (index_t i = 0; i < (index_t)n; i++) h_arr[(size_t)(i + 1)] = h_tokens[(size_t)i];
     h_arr[(size_t)m - 1] = END_TERMINAL;
 
     ParserFused p = allocParserFused(m);
@@ -580,11 +579,11 @@ static bool runParserPipeline(const uint64_t* h_tokens_u64, uint64_t n,
 // ---------------------------------------------------------------------------
 
 struct BothNodes {
-    std::vector<uint8_t>  is_term;
-    std::vector<uint64_t> parents;
-    std::vector<uint64_t> ids;      // terminal id for terminal nodes, else production id
-    std::vector<uint64_t> starts;
-    std::vector<uint64_t> ends;
+    std::vector<uint8_t>      is_term;
+    std::vector<index_t>      parents;
+    std::vector<production_t> ids;   // terminal id for terminal nodes, else production id
+    std::vector<index_t>      starts;
+    std::vector<index_t>      ends;
 };
 
 static bool runBothFused(ParserFused& p,
@@ -624,25 +623,16 @@ static bool runBothFused(ParserFused& p,
     out.starts.resize((size_t)np);
     out.ends.resize((size_t)np);
     if (np > (index_t)0) {
-        std::vector<index_t>      h_par((size_t)np);
-        std::vector<production_t> h_ids((size_t)np);
-        std::vector<index_t>      h_starts((size_t)np), h_ends((size_t)np);
         gpuAssert(cudaMemcpy(out.is_term.data(), p.bufs.d_node_is_term,
                              (size_t)np * sizeof(uint8_t), cudaMemcpyDeviceToHost));
-        gpuAssert(cudaMemcpy(h_par.data(), p.bufs.d_match,
+        gpuAssert(cudaMemcpy(out.parents.data(), p.bufs.d_match,
                              (size_t)np * sizeof(index_t), cudaMemcpyDeviceToHost));
-        gpuAssert(cudaMemcpy(h_ids.data(), p.bufs.d_node_ids,
+        gpuAssert(cudaMemcpy(out.ids.data(), p.bufs.d_node_ids,
                              (size_t)np * sizeof(production_t), cudaMemcpyDeviceToHost));
-        gpuAssert(cudaMemcpy(h_starts.data(), p.bufs.d_node_starts,
+        gpuAssert(cudaMemcpy(out.starts.data(), p.bufs.d_node_starts,
                              (size_t)np * sizeof(index_t), cudaMemcpyDeviceToHost));
-        gpuAssert(cudaMemcpy(h_ends.data(), p.bufs.d_node_ends,
+        gpuAssert(cudaMemcpy(out.ends.data(), p.bufs.d_node_ends,
                              (size_t)np * sizeof(index_t), cudaMemcpyDeviceToHost));
-        for (index_t i = 0; i < np; i++) {
-            out.parents[(size_t)i] = (uint64_t)h_par[(size_t)i];
-            out.ids[(size_t)i]     = (uint64_t)h_ids[(size_t)i];
-            out.starts[(size_t)i]  = (uint64_t)h_starts[(size_t)i];
-            out.ends[(size_t)i]    = (uint64_t)h_ends[(size_t)i];
-        }
     }
     return true;
 }

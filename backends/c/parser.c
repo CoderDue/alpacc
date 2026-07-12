@@ -46,20 +46,20 @@ static bool lookup_key(const terminal_t *key, key_spans_t *spans) {
 
 // One test case: n terminal ids -> production ids.  Returns validity; on
 // success *prods_out (malloc'd, caller frees) holds *num_prods_out ids.
-static bool parse_test(const uint64_t *tokens, uint64_t n,
-                       uint64_t **prods_out, uint64_t *num_prods_out) {
+static bool parse_test(const terminal_t *tokens, uint64_t n,
+                       production_t **prods_out, uint64_t *num_prods_out) {
   bool ok = false;
   uint64_t m = n + 2;
-  terminal_t *arr    = (terminal_t *) malloc(m * sizeof(terminal_t));
-  bracket_t  *stack  = (bracket_t *)  malloc(m * MAX_BRACKETS_PER_POSITION * sizeof(bracket_t));
-  uint64_t   *prods  = (uint64_t *)   malloc(m * MAX_PRODS_PER_POSITION    * sizeof(uint64_t));
+  terminal_t   *arr    = (terminal_t *)   malloc(m * sizeof(terminal_t));
+  bracket_t    *stack  = (bracket_t *)    malloc(m * MAX_BRACKETS_PER_POSITION * sizeof(bracket_t));
+  production_t *prods  = (production_t *) malloc(m * MAX_PRODS_PER_POSITION    * sizeof(production_t));
   terminal_t key[Q + K];
   uint64_t np = 0;
   int64_t top = -1;
 
   arr[0] = START_TERMINAL;
   for (uint64_t i = 0; i < n; i++)
-    arr[i + 1] = (terminal_t) tokens[i];
+    arr[i + 1] = tokens[i];
   arr[m - 1] = END_TERMINAL;
 
   for (uint64_t i = 0; i < m; i++) {
@@ -81,7 +81,7 @@ static bool parse_test(const uint64_t *tokens, uint64_t n,
       }
     }
     for (int64_t j = spans.prod_start; j < spans.prod_end; j++)
-      prods[np++] = (uint64_t) PRODUCTIONS[j];
+      prods[np++] = PRODUCTIONS[j];
   }
   if (top != -1)
     goto done;
@@ -100,8 +100,8 @@ done:
 #ifdef ALPACC_WITH_TREE
 // Compute the parent index of each production node.  Mirrors `parents` in
 // futhark/parser.fut.  Used by the combined lexer+parser run_test_case().
-static void compute_parents(const uint64_t *prods, uint64_t np,
-                            uint64_t *parents_out) {
+static void compute_parents(const production_t *prods, uint64_t np,
+                            index_t *parents_out) {
   uint64_t *remaining = (uint64_t *) malloc(np * sizeof(uint64_t));
   uint64_t *stk       = (uint64_t *) malloc(np * sizeof(uint64_t));
   int64_t top = -1;

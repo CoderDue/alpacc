@@ -53,55 +53,13 @@ echo "nvcc arch: $arch"
 echo "Running with $parallel_jobs parallel jobs"
 
 # ---------------------------------------------------------------------------
-# Python helper for server-mode testing.
-# Converts the batch binary format to length-prefixed server frames,
-# drives the CUDA binary in --server mode, and collects the responses.
-# Usage: python3 server_test.py <binary> <inputs_file> <output_file> <kind>
-# where <kind> is "tokens" (parser mode: 8-byte token IDs per element)
-# or "bytes" (lexer/combined mode: raw bytes).
-# Writes output in the same batch format as batch mode (with num_tests prefix)
-# so `alpacc test compare` can check it directly.
+# Server-mode helper: tests/server_test.py builds native request frames
+# from the u64-BE test inputs (querying `binary --layout` for type sizes)
+# and transcodes the native responses back to the u64-BE test format so
+# they can be diffed against batch output.
 # ---------------------------------------------------------------------------
-SERVERTEST_PY='
-import sys, struct, subprocess
-
-def u64be(v): return struct.pack(">Q", v)
-def read_u64be(data, off): return struct.unpack_from(">Q", data, off)[0], off + 8
-
-binary, inputs_file, output_file, kind = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-width = 8 if kind == "tokens" else 1
-
-with open(inputs_file, "rb") as f:
-    data = f.read()
-
-off = 0
-num_tests, off = read_u64be(data, off)
-
-proc = subprocess.Popen([binary, "--server"],
-                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                        stderr=subprocess.DEVNULL)
-
-# Send all frames then close stdin
-frames = b""
-for _ in range(num_tests):
-    n, off = read_u64be(data, off)
-    payload = data[off:off + width*n]
-    off += width*n
-    content = u64be(n) + payload
-    frames += u64be(len(content)) + content
-proc.stdin.write(frames)
-proc.stdin.close()
-
-raw = proc.stdout.read()
-ret = proc.wait()
-if ret != 0:
-    sys.stderr.write(f"server exit {ret}\n")
-    sys.exit(1)
-
-# Prefix with num_tests to match batch output format
-with open(output_file, "wb") as f:
-    f.write(u64be(num_tests) + raw)
-'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVERTEST_PY="$SCRIPT_DIR/server_test.py"
 
 temp_dir=$(mktemp -d)
 trap "rm -rf $temp_dir" EXIT
@@ -126,18 +84,16 @@ run_test() {
     mkdir -p "$work_dir"
     cd "$work_dir"
 
-    # Write the server-test helper locally
-    echo "$servertest_py" > server_test.py
-
     # Lexer-only binaries need --inputs to read framed test batches
-    # (their default mode is a raw byte stream). Parser mode frames hold
-    # 8-byte token IDs; lexer/combined frames hold raw bytes.
+    # (their default mode is a raw byte stream). The server-helper kind
+    # selects the native frame format per mode.
     local batch_flags=""
-    local frame_kind="bytes"
+    local frame_kind="both"
     if [ "$type_flag" = "--lexer" ]; then
         batch_flags="--inputs"
+        frame_kind="lexer"
     elif [ "$type_flag" = "--parser" ]; then
-        frame_kind="tokens"
+        frame_kind="parser"
     fi
 
     local codegen_fails=0
@@ -213,8 +169,8 @@ ALPEOF
 
         if ! $all_ok; then return 1; fi
 
-        # ---- Test 2: server mode (default BS/IPT) ----
-        if ! python3 server_test.py ./random random.inputs server_results.bin "$frame_kind" 2>/dev/null; then
+        # ---- Test 2: server mode (default BS/IPT, native protocol) ----
+        if ! python3 "$servertest_py" ./random random.inputs server_results.bin "$frame_kind" 2>/dev/null; then
             echo "===== FAIL: server mode crashed, job $job_id ====="
             all_ok=false
         elif ! diff -q results_128_2.bin server_results.bin &>/dev/null; then

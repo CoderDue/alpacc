@@ -3,6 +3,8 @@
 # Differential test of the C backend (sequential LLP reference implementation).
 # Generates random grammars, compiles the generated C program with cc, runs it
 # on `alpacc test generate` inputs and checks results with `alpacc test compare`.
+# Also runs the binary in --server mode (native-type protocol; see
+# tests/server_test.py) and checks it matches the batch output.
 # Supports --lexer, --parser, and combined (no flag) modes.
 # Runs without a GPU (usable in hosted CI).
 
@@ -43,6 +45,9 @@ echo "Target: $target successful runs"
 echo "Using -q $q_value -k $k_value ${type_flag:-<combined>}"
 echo "Running with $parallel_jobs parallel jobs"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVERTEST_PY="$SCRIPT_DIR/server_test.py"
+
 temp_dir=$(mktemp -d)
 trap "rm -rf $temp_dir" EXIT
 
@@ -59,10 +64,19 @@ run_test() {
     local target=$6
     local done_file=$7
     local type_flag=$8
+    local servertest_py=$9
 
     local work_dir="$temp_dir/job_$job_id"
     mkdir -p "$work_dir"
     cd "$work_dir"
+
+    # Server-helper kind selects the native frame format per mode.
+    local frame_kind="both"
+    if [ "$type_flag" = "--lexer" ]; then
+        frame_kind="lexer"
+    elif [ "$type_flag" = "--parser" ]; then
+        frame_kind="parser"
+    fi
 
     while [ ! -f "$done_file" ]; do
         if ! alpacc random &> /dev/null; then
@@ -90,6 +104,17 @@ EOF
 
         alpacc test generate random.alp $type_flag &> /dev/null
         ./random < random.inputs > random.results
+
+        # Server mode (native protocol) must match the batch output.
+        if ! python3 "$servertest_py" ./random random.inputs server_results.bin "$frame_kind" 2>/dev/null; then
+            echo "===== FAIL: server mode crashed, job $job_id ====="
+            cat random.alp
+            return 1
+        elif ! diff -q random.results server_results.bin &>/dev/null; then
+            echo "===== FAIL: server mode output differs from batch, job $job_id ====="
+            cat random.alp
+            return 1
+        fi
 
         if alpacc test compare random.alp random.inputs random.outputs random.results $type_flag &> /dev/null; then
             (
@@ -126,7 +151,7 @@ EOF
 export -f run_test
 
 seq 1 $target | parallel --no-notice -j "$parallel_jobs" --halt soon,fail=1 --line-buffer \
-    "run_test {} $q_value $k_value $temp_dir $counter_file $target $done_file '$type_flag'"
+    "run_test {} $q_value $k_value $temp_dir $counter_file $target $done_file '$type_flag' $(printf '%q' "$SERVERTEST_PY")"
 
 final_count=$(cat "$counter_file")
 if [ "$final_count" -ge "$target" ]; then

@@ -29,8 +29,8 @@ static bool state_accept(state_t s) {
 
 typedef struct {
   terminal_t terminal;
-  uint64_t   start;
-  uint64_t   end;
+  index_t    start;
+  index_t    end;
 } lexeme_t;
 
 // Lex `n` bytes from `str`.  On success returns a malloc'd array of lexemes
