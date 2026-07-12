@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# Differential test of the CUDA parser backend.
+# Differential test of the CUDA backend (lexer, parser, or combined mode).
 #
 # For each random grammar this script:
 #   1. Generates test inputs with `alpacc test generate --length 4`.
-#   2. Runs the CUDA parser in batch mode across all six (BS, IPT) combinations
+#   2. Runs the CUDA binary in batch mode across all six (BS, IPT) combinations
 #      and checks each against `alpacc test compare`.
-#   3. Runs the CUDA parser in server mode (one frame per test) and checks
+#   3. Runs the CUDA binary in server mode (one frame per test) and checks
 #      the results match the batch output.
 #   4. Verifies -i/-o file mode gives identical output to stdin/stdout mode.
 #
@@ -18,7 +18,7 @@ show_usage() {
     echo "  k_value:       -k parameter for alpacc (default: 1)"
     echo "  target_runs:   number of successful grammars (default: 10)"
     echo "  parallel_jobs: number of parallel jobs (default: 1)"
-    echo "  type_flag:     --lexer, --parser, or empty — ignored (CUDA always tests parser)"
+    echo "  type_flag:     --lexer, --parser, or empty for combined (default: empty)"
     echo "  arch:          nvcc -arch value (default: native)"
     echo "Example: $0 1 1 20 1 '' native"
 }
@@ -33,8 +33,7 @@ q_value="${1:-1}"
 k_value="${2:-1}"
 target="${3:-10}"
 parallel_jobs="${4:-1}"
-# arg5 is type_flag (--lexer/--parser/empty) passed by the Makefile run_random_c
-# macro — ignored here since CUDA always tests the full parser.
+type_flag="${5:-}"
 arch="${6:-native}"
 
 if ! [[ "$q_value" =~ ^[0-9]+$ ]] || ! [[ "$k_value" =~ ^[0-9]+$ ]] || ! [[ "$target" =~ ^[0-9]+$ ]]; then
@@ -47,17 +46,19 @@ if ! [[ "$parallel_jobs" =~ ^[0-9]+$ ]]; then
     show_usage; exit 1
 fi
 
-echo "Starting alpacc CUDA parser testing..."
+echo "Starting alpacc CUDA testing..."
 echo "Target: $target successful grammars"
-echo "Using -q $q_value -k $k_value --parser"
+echo "Using -q $q_value -k $k_value ${type_flag:-<combined>}"
 echo "nvcc arch: $arch"
 echo "Running with $parallel_jobs parallel jobs"
 
 # ---------------------------------------------------------------------------
 # Python helper for server-mode testing.
 # Converts the batch binary format to length-prefixed server frames,
-# drives the CUDA parser in --server mode, and collects the responses.
-# Usage: python3 server_test.py <binary> <inputs_file> <output_file>
+# drives the CUDA binary in --server mode, and collects the responses.
+# Usage: python3 server_test.py <binary> <inputs_file> <output_file> <kind>
+# where <kind> is "tokens" (parser mode: 8-byte token IDs per element)
+# or "bytes" (lexer/combined mode: raw bytes).
 # Writes output in the same batch format as batch mode (with num_tests prefix)
 # so `alpacc test compare` can check it directly.
 # ---------------------------------------------------------------------------
@@ -67,7 +68,8 @@ import sys, struct, subprocess
 def u64be(v): return struct.pack(">Q", v)
 def read_u64be(data, off): return struct.unpack_from(">Q", data, off)[0], off + 8
 
-binary, inputs_file, output_file = sys.argv[1], sys.argv[2], sys.argv[3]
+binary, inputs_file, output_file, kind = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+width = 8 if kind == "tokens" else 1
 
 with open(inputs_file, "rb") as f:
     data = f.read()
@@ -83,9 +85,9 @@ proc = subprocess.Popen([binary, "--server"],
 frames = b""
 for _ in range(num_tests):
     n, off = read_u64be(data, off)
-    tokens = data[off:off + 8*n]
-    off += 8*n
-    content = u64be(n) + tokens
+    payload = data[off:off + width*n]
+    off += width*n
+    content = u64be(n) + payload
     frames += u64be(len(content)) + content
 proc.stdin.write(frames)
 proc.stdin.close()
@@ -118,6 +120,7 @@ run_test() {
     local done_file=$7
     local arch=$8
     local servertest_py=$9
+    local type_flag="${10}"
 
     local work_dir="$temp_dir/job_$job_id"
     mkdir -p "$work_dir"
@@ -125,6 +128,19 @@ run_test() {
 
     # Write the server-test helper locally
     echo "$servertest_py" > server_test.py
+
+    # Lexer-only binaries need --inputs to read framed test batches
+    # (their default mode is a raw byte stream). Parser mode frames hold
+    # 8-byte token IDs; lexer/combined frames hold raw bytes.
+    local batch_flags=""
+    local frame_kind="bytes"
+    if [ "$type_flag" = "--lexer" ]; then
+        batch_flags="--inputs"
+    elif [ "$type_flag" = "--parser" ]; then
+        frame_kind="tokens"
+    fi
+
+    local codegen_fails=0
 
     while [ ! -f "$done_file" ]; do
         # Generate random grammar
@@ -141,32 +157,45 @@ ALPEOF
         cat random.alp >> random.alp.tmp
         mv random.alp.tmp random.alp
 
-        # Try to generate CUDA parser; skip grammars that fail codegen
-        if ! alpacc cuda random.alp --parser &> /dev/null; then
+        # Try to generate CUDA code; skip grammars that fail codegen,
+        # but fail fast on configuration errors or endless codegen failures.
+        if ! alpacc cuda random.alp $type_flag &> codegen_err.txt; then
+            if grep -q "must be positive" codegen_err.txt; then
+                echo "ERROR: alpacc rejected the configuration itself (job $job_id):"
+                cat codegen_err.txt
+                return 1
+            fi
+            codegen_fails=$((codegen_fails + 1))
+            if [ "$codegen_fails" -ge 1000 ]; then
+                echo "ERROR: codegen failed $codegen_fails consecutive times for job $job_id; giving up. Last error:"
+                cat codegen_err.txt
+                return 1
+            fi
             continue
         fi
+        codegen_fails=0
 
         if ! nvcc -std=c++17 -arch="$arch" -o random random.cu &> /dev/null; then
             echo "nvcc compilation failed for job $job_id"; return 1
         fi
 
         # Generate test inputs (small, to keep GPU memory bounded)
-        alpacc test generate random.alp --parser --length 4 &> /dev/null
+        alpacc test generate random.alp $type_flag --length 4 &> /dev/null
 
         local all_ok=true
 
         # ---- Test 1: batch mode across all six (BS, IPT) combinations ----
         for bs in 128 256; do
             for ipt in 2 4 8; do
-                ./random --block-size "$bs" --items-per-thread "$ipt" \
+                ./random --block-size "$bs" --items-per-thread "$ipt" $batch_flags \
                     -i random.inputs -o "results_${bs}_${ipt}.bin" 2>/dev/null
 
                 if ! alpacc test compare random.alp random.inputs random.outputs \
-                        "results_${bs}_${ipt}.bin" --parser &> /dev/null; then
+                        "results_${bs}_${ipt}.bin" $type_flag &> /dev/null; then
                     echo "===== FAIL: batch BS=$bs IPT=$ipt, job $job_id ====="
                     cat random.alp
                     alpacc test compare random.alp random.inputs random.outputs \
-                        "results_${bs}_${ipt}.bin" --parser
+                        "results_${bs}_${ipt}.bin" $type_flag
                     all_ok=false
                     break 2
                 fi
@@ -185,7 +214,7 @@ ALPEOF
         if ! $all_ok; then return 1; fi
 
         # ---- Test 2: server mode (default BS/IPT) ----
-        if ! python3 server_test.py ./random random.inputs server_results.bin 2>/dev/null; then
+        if ! python3 server_test.py ./random random.inputs server_results.bin "$frame_kind" 2>/dev/null; then
             echo "===== FAIL: server mode crashed, job $job_id ====="
             all_ok=false
         elif ! diff -q results_128_2.bin server_results.bin &>/dev/null; then
@@ -216,7 +245,7 @@ ALPEOF
 export -f run_test
 
 seq 1 $target | parallel --no-notice -j "$parallel_jobs" --halt soon,fail=1 --line-buffer \
-    "run_test {} $q_value $k_value $temp_dir $counter_file $target $done_file $arch $(printf '%q' "$SERVERTEST_PY")"
+    "run_test {} $q_value $k_value $temp_dir $counter_file $target $done_file $arch $(printf '%q' "$SERVERTEST_PY") '$type_flag'"
 
 final_count=$(cat "$counter_file")
 if [ "$final_count" -ge "$target" ]; then
