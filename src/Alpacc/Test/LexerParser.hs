@@ -30,12 +30,13 @@ import System.IO (Handle, SeekMode (..), hSeek, hTell)
 import Data.Either.Extra
 import Data.Foldable
 import Data.List (zip4)
-import Data.Array (Array, listArray, bounds, (!))
+import Data.Array.IArray (Array, accumArray, bounds, elems, listArray, (!))
+import Data.Array.ST (newArray, readArray, runSTUArray, writeArray)
+import Data.Array.Unboxed (UArray)
 import Data.Map (Map)
 import Data.Map qualified as Map hiding (Map)
 import Data.Maybe
-import Data.Sequence (Seq (..))
-import Data.Sequence qualified as Seq hiding (Seq (..), (<|), (><), (|>))
+import Data.Ord (comparing)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -155,184 +156,275 @@ parse cfg q k str = do
   where
     toTuple (Lexeme t m) = (t, m)
 
--- | Compute the shortest byte sequence that lexes to each token using BFS.
--- Used for budget accounting and as a fallback when the byte budget is tight.
-computeMinTokenBytesMap ::
-  (Ord s) =>
-  DFALexer Word8 s T ->
-  Map T [Word8]
-computeMinTokenBytesMap dfa_lexer =
-  go (Seq.singleton (initial_state, [])) (Set.singleton initial_state) Map.empty
-  where
-    dfa = fsa dfa_lexer
-    initial_state = initial dfa
-    trans = transitions' dfa
-    accept_states = accepting dfa
-    token_map = tokenMap dfa_lexer
-    produces = producesToken dfa_lexer
-
-    trans_by_state =
-      Map.fromListWith
-        Map.union
-        [ (s, Map.singleton sym s')
-        | ((s, sym), s') <- Map.toList trans
-        ]
-
-    go Empty _ result = result
-    go ((state, path) :<| queue) visited result =
-      let result' = case Map.lookup state token_map of
-            Just tok
-              | Set.member state accept_states,
-                not (Map.member tok result) ->
-                  Map.insert tok (reverse path) result
-            _ -> result
-          neighbors =
-            Seq.fromList
-              [ (next_state, sym : path)
-              | (sym, next_state) <-
-                  Map.toList $
-                    Map.findWithDefault Map.empty state trans_by_state,
-                not (next_state `Set.member` visited),
-                not ((state, sym) `Set.member` produces)
-              ]
-          visited' = Set.union visited (Set.fromList (fst <$> toList neighbors))
-       in go (queue <> neighbors) visited' result'
-
--- | Precomputed DFA structures shared across all per-token random walks.
+-- | Precomputed dense-indexed DFA structures for the token-targeted DFA walk.
 -- States are renumbered to dense Ints so the hot walk loop uses O(1) array
 -- indexing instead of Map/Set operations on expensive Ord instances.
 data WalkEnv = WalkEnv
-  { weInitial :: Int
-  , weTrans :: Map (Int, Word8) Int
-  , weProducesToken :: Set (Int, Word8)
-  , weTokenAccepting :: Map T (Array Int Bool)
-  , weValidTrans :: Array Int (Array Int (Word8, Int))
-  , weNonAcceptTrans :: Array Int (Array Int (Word8, Int))  -- transitions to non-accepting states
+  { weInitial :: Int,
+    weNumStates :: Int,
+    -- | Token-producing transitions per state (taking one emits a boundary).
+    weProducing :: Array Int [(Word8, Int)],
+    -- | Non-producing transitions per state (safe to take mid-token).
+    weNonProducing :: Array Int [(Word8, Int)],
+    -- | Predecessors along non-producing transitions, for reverse BFS.
+    weRevNonProducing :: Array Int [Int],
+    weAcceptingOf :: Map T [Int]
   }
 
 mkWalkEnv :: (Ord s) => DFALexer Word8 s T -> WalkEnv
-mkWalkEnv dfa_lexer = WalkEnv
-  { weInitial = ix (initial dfa)
-  , weTrans = trI
-  , weProducesToken = prodI
-  , weTokenAccepting = Map.map toBoolArray tokAccSets
-  , weValidTrans = toStateArray validByState
-  , weNonAcceptTrans = toStateArray nonAcceptByState
-  }
+mkWalkEnv dfa_lexer =
+  WalkEnv
+    { weInitial = ix (initial dfa),
+      weNumStates = n,
+      weProducing = accumArray (flip (:)) [] (0, n - 1) producing,
+      weNonProducing = accumArray (flip (:)) [] (0, n - 1) non_producing,
+      weRevNonProducing = accumArray (flip (:)) [] (0, n - 1) rev_non_producing,
+      weAcceptingOf = accepting_of
+    }
   where
     dfa = fsa dfa_lexer
-    tr  = transitions' dfa
+    trs = Map.toList $ transitions' dfa
     prod = producesToken dfa_lexer
     acc = accepting dfa
-    stIdx = Map.fromList $ zip (Set.toList (states dfa)) [0 ..]
-    numStates = Map.size stIdx
-    ix s = stIdx Map.! s
-    trI = Map.fromList
-      [ ((ix s, sym), ix s') | ((s, sym), s') <- Map.toList tr ]
-    prodI = Set.map (\(s, sym) -> (ix s, sym)) prod
-    tokAccSets = Map.fromListWith Set.union
-      [ (tok, Set.singleton (ix s))
-      | (s, tok) <- Map.toList (tokenMap dfa_lexer)
-      , Set.member s acc
-      ]
-    toBoolArray ss =
-      listArray (0, numStates - 1) [Set.member i ss | i <- [0 .. numStates - 1]]
-    toStateArray m =
-      listArray (0, numStates - 1)
-        [ let xs = Map.findWithDefault [] i m
+    st_idx = Map.fromList $ zip (Set.toList (states dfa)) [0 ..]
+    n = Map.size st_idx
+    ix s = st_idx Map.! s
+    producing =
+      [(ix s, (sym, ix s')) | ((s, sym), s') <- trs, (s, sym) `Set.member` prod]
+    non_producing =
+      [(ix s, (sym, ix s')) | ((s, sym), s') <- trs, not ((s, sym) `Set.member` prod)]
+    rev_non_producing =
+      [(ix s', ix s) | ((s, sym), s') <- trs, not ((s, sym) `Set.member` prod)]
+    accepting_of =
+      Map.fromListWith
+        (++)
+        [(tok, [ix s]) | (s, tok) <- Map.toList (tokenMap dfa_lexer), s `Set.member` acc]
+
+-- | Walk data for one (token, follow token) pair: the distance from every
+-- state to the nearest target accepting state along non-producing transitions
+-- (-1 = unreachable), and per state the non-producing transitions that stay
+-- inside the live subgraph.  A walk restricted to 'ttAllowed' transitions can
+-- always still reach a target state, so it never dead-ends.
+data TokenTarget = TokenTarget
+  { ttDist :: UArray Int Int,
+    ttAllowed :: Array Int (Array Int (Word8, Int)),
+    -- | Per state, the producing transitions whose destination is live;
+    -- these are the valid entry transitions into this token.
+    ttEntry :: Array Int (Array Int (Word8, Int)),
+    -- | Per state, one shortest-path successor toward a target state.
+    ttStep :: Array Int (Maybe (Word8, Int))
+  }
+
+-- | Multi-source BFS from the target states along reversed non-producing
+-- transitions.
+bfsDist :: Int -> Array Int [Int] -> [Int] -> UArray Int Int
+bfsDist n rev targets = runSTUArray $ do
+  dist <- newArray (0, n - 1) (-1)
+  mapM_ (\s -> writeArray dist s 0) targets
+  let expand d acc s =
+        foldM
+          ( \acc' p -> do
+              dp <- readArray dist p
+              if dp < 0
+                then writeArray dist p (d + 1) >> pure (p : acc')
+                else pure acc'
+          )
+          acc
+          (rev ! s)
+      go _ [] = pure ()
+      go d frontier = go (d + 1) =<< foldM (expand d) [] frontier
+  go (0 :: Int) targets
+  pure dist
+
+mkTokenTarget :: WalkEnv -> [Int] -> TokenTarget
+mkTokenTarget env targets =
+  TokenTarget
+    { ttDist = dist,
+      ttAllowed = filterLive (weNonProducing env),
+      ttEntry = filterLive (weProducing env),
+      ttStep = step
+    }
+  where
+    n = weNumStates env
+    dist = bfsDist n (weRevNonProducing env) targets
+    filterLive edges =
+      listArray
+        (0, n - 1)
+        [ let xs = [t | t@(_, s') <- edges ! s, dist ! s' >= 0]
            in listArray (0, length xs - 1) xs
-        | i <- [0 .. numStates - 1]
+        | s <- [0 .. n - 1]
         ]
-    validByState = Map.fromListWith (++)
-      [ (ix s, [(sym, ix s')])
-      | ((s, sym), s') <- Map.toList tr
-      , not ((s, sym) `Set.member` prod)
-      ]
-    nonAcceptByState = Map.fromListWith (++)
-      [ (ix s, [(sym, ix s')])
-      | ((s, sym), s') <- Map.toList tr
-      , not ((s, sym) `Set.member` prod)
-      , not (Set.member s' acc)
-      ]
+    step =
+      listArray
+        (0, n - 1)
+        [ listToMaybe
+            [t | t@(_, s') <- weNonProducing env ! s, dist ! s' == dist ! s - 1]
+        | s <- [0 .. n - 1]
+        ]
 
--- | Compute the DFA state reached after reading @bs@ starting from @s0@.
--- Returns Nothing if the DFA has no transition for some byte.
-dfaStateAfter :: Map (Int, Word8) Int -> Int -> [Word8] -> Maybe Int
-dfaStateAfter trans s0 = foldl' step (Just s0)
+-- | Whether a walk explores randomly or heads straight for a target state.
+data WalkMode = WalkRandom | WalkShortest
+
+-- | The result of walking one token: its bytes (excluding the entry byte),
+-- the DFA state it ended in, and the advanced generator.
+data TokenWalk g = TokenWalk
+  { twBytes :: [Word8],
+    twEnd :: !Int,
+    twGen :: !g
+  }
+
+-- | Walk one token, starting just after the entry byte.  The walk only takes
+-- allowed (live) transitions, so it can always still reach a target accepting
+-- state.  At target states it stops with probability increasing in the number
+-- of steps taken; once the per-token byte budget is reached it follows a
+-- shortest path to the nearest target state, so token lengths stay bounded.
+-- In 'WalkShortest' mode it converges via a shortest path immediately.
+walkToken :: (RandomGen g) => TokenTarget -> Int -> WalkMode -> Int -> g -> TokenWalk g
+walkToken tt budget mode s0 g0 =
+  case mode of
+    WalkRandom -> go g0 s0 1 []
+    WalkShortest ->
+      let (bs, s_end) = converge s0 []
+       in TokenWalk {twBytes = bs, twEnd = s_end, twGen = g0}
   where
-    step Nothing _ = Nothing
-    step (Just s) b = Map.lookup (s, b) trans
-
--- | Attempt a single random walk that produces a byte sequence lexing to
--- @tok@.  To stay within the right DFA subgraph, the walk replays the minimum
--- path up to (but not including) its last byte, then continues randomly from
--- that interior state.  Stop probability increases linearly with steps so path
--- lengths are roughly uniformly distributed up to @maxSteps@.
-randomWalkToToken ::
-  (RandomGen g) =>
-  WalkEnv ->
-  T ->
-  [Word8] ->
-  Int ->
-  g ->
-  (Maybe [Word8], g)
-randomWalkToToken env tok min_path maxSteps g0 =
-  let prefix = if null min_path then [] else init min_path
-      start_state = foldl' stepDFA (weInitial env) prefix
-   in walk g0 start_state 0 (reverse prefix)
-  where
-    stepDFA s sym = Map.findWithDefault s (s, sym) (weTrans env)
-    isOk = case Map.lookup tok (weTokenAccepting env) of
-      Just a -> (a !)
-      Nothing -> const False
-    validArr s = weValidTrans env ! s
-    nonAcceptArr s = weNonAcceptTrans env ! s
-
-    walk g state steps acc
-      | steps >= maxSteps =
-          if isOk state then (Just (reverse acc), g) else (Nothing, g)
-      | isOk state =
-          let arr = validArr state
-              n   = snd (bounds arr) + 1
-           in if n == 0
-                then (Just (reverse acc), g)
-                else
-                  let (r, g') = randomR (0 :: Int, maxSteps - 1) g
-                   in if r < steps
-                        then (Just (reverse acc), g')
-                        else
-                          let (i, g'') = randomR (0, n - 1) g'
-                              (sym, ns)  = arr ! i
-                           in if isOk ns
-                                then
-                                  let naArr = nonAcceptArr state
-                                      nna   = snd (bounds naArr) + 1
-                                   in if nna == 0
-                                        then walk g'' ns (steps + 1) (sym : acc)
-                                        else let (j, g''') = randomR (0, nna - 1) g''
-                                                 (sym', ns') = naArr ! j
-                                             in walk g''' ns' (steps + 1) (sym' : acc)
-                                else walk g'' ns (steps + 1) (sym : acc)
+    dist s = ttDist tt ! s
+    converge s acc
+      | dist s <= 0 = (reverse acc, s)
       | otherwise =
-          let arr = validArr state
-              n   = snd (bounds arr) + 1
-           in if n == 0
-                then (Nothing, g)
-                else
-                  let (i, g') = randomR (0, n - 1) g
-                      (sym, ns) = arr ! i
-                   in walk g' ns (steps + 1) (sym : acc)
+          case ttStep tt ! s of
+            Just (b, s') -> converge s' (b : acc)
+            Nothing -> (reverse acc, s)
+    stop g s acc = TokenWalk {twBytes = reverse acc, twEnd = s, twGen = g}
+    go g s m acc
+      | m >= budget =
+          let (bs, s_end) = converge s acc
+           in TokenWalk {twBytes = bs, twEnd = s_end, twGen = g}
+      | dist s == 0 =
+          let (r, g') = randomR (0, budget - 1) g
+           in if r < m then stop g' s acc else step g' s m acc
+      | otherwise = step g s m acc
+    step g s m acc =
+      let arr = ttAllowed tt ! s
+          k = snd (bounds arr) + 1
+       in if k == 0
+            then stop g s acc
+            else
+              let (i, g') = randomR (0, k - 1) g
+                  (b, s') = arr ! i
+               in go g' s' (m + 1) (b : acc)
 
--- | Generate input bytes for a single token, always using the shortest
--- (minimum) path.  Used as a fallback when the byte budget is exhausted.
-minTokenBytes :: Map T [Word8] -> T -> [Word8]
-minTokenBytes min_map tok = Map.findWithDefault [] tok min_map
+-- | Static context shared by the token-emitting functions below.
+data GenEnv = GenEnv
+  { geEnv :: WalkEnv,
+    -- | Target payload byte count; once reached, walks take shortest paths.
+    geTargetLen :: Int,
+    -- | Per-token byte budget for random walks.
+    geTokenBudget :: Int,
+    -- | The ignore terminal, if the lexer has one.
+    geIgnore :: Maybe T,
+    geHandle :: Handle,
+    geTotalRef :: IORef Int,
+    geMemoRef :: IORef (Map (T, Maybe T) TokenTarget)
+  }
 
--- | DFS based approach to generating input. Derives a random token sequence
--- from the grammar, then assigns byte sequences to each token.
+-- | Where the next token starts.
+data WalkStart = AtStart | AfterState !Int
+
+-- | State threaded from one emitted token to the next.
+data WalkState = WalkState
+  { wsGen :: !StdGen,
+    wsStart :: !WalkStart
+  }
+
+-- | The memoized 'TokenTarget' for walking @tok@ such that, when a follow
+-- token is given, the walk ends in a state with a live boundary transition
+-- into that follow token.
+getTarget :: GenEnv -> (T, Maybe T) -> IO TokenTarget
+getTarget genv key@(tok, follow) = do
+  memo <- readIORef (geMemoRef genv)
+  case Map.lookup key memo of
+    Just tt -> pure tt
+    Nothing -> do
+      let env = geEnv genv
+          acc_states = Map.findWithDefault [] tok (weAcceptingOf env)
+      targets <- case follow of
+        Nothing -> pure acc_states
+        Just f -> do
+          tt_f <- getTarget genv (f, Nothing)
+          let boundaryOk s =
+                any (\(_, s') -> ttDist tt_f ! s' >= 0) (weProducing env ! s)
+          pure $ filter boundaryOk acc_states
+      let tt = mkTokenTarget env targets
+      modifyIORef' (geMemoRef genv) (Map.insert key tt)
+      pure tt
+
+-- | The entry transitions for a token, if any exist: the first token starts
+-- from the initial state, while later tokens must enter via a producing
+-- transition so the boundary with the previous token fires.
+viableEntries :: GenEnv -> WalkState -> TokenTarget -> Maybe (Array Int (Word8, Int))
+viableEntries genv ws tt
+  | snd (bounds cands) >= 0 = Just cands
+  | otherwise = Nothing
+  where
+    cands = case wsStart ws of
+      AtStart -> ttAllowed tt ! weInitial (geEnv genv)
+      AfterState s -> ttEntry tt ! s
+
+-- | Emit one token: pick an entry transition, walk the token, and write its
+-- bytes.  Choices are random until the target length is reached; after that
+-- entries and walks take shortest paths so the input finishes quickly.
+emitWith :: GenEnv -> TokenTarget -> Array Int (Word8, Int) -> WalkState -> IO WalkState
+emitWith genv tt cands ws = do
+  written <- readIORef (geTotalRef genv)
+  let mode = if written < geTargetLen genv then WalkRandom else WalkShortest
+      ((b0, s1), g') = pickEntry mode (wsGen ws)
+      walk = walkToken tt (geTokenBudget genv) mode s1 g'
+      out = ByteString.pack (b0 : twBytes walk)
+  ByteString.hPut (geHandle genv) out
+  modifyIORef' (geTotalRef genv) (+ ByteString.length out)
+  pure $! WalkState {wsGen = twGen walk, wsStart = AfterState (twEnd walk)}
+  where
+    pickEntry WalkRandom g =
+      let (i, g') = randomR (0, snd (bounds cands)) g in (cands ! i, g')
+    pickEntry WalkShortest g =
+      (minimumBy (comparing (\(_, s') -> ttDist tt ! s')) (elems cands), g)
+
+boundaryError :: T -> IO a
+boundaryError tok =
+  error $
+    "Error: The lexer cannot realize the token '"
+      <> show tok
+      <> "' at a token boundary here, and no ignore-terminal separator can be inserted."
+
+-- | Emit @tok@ so that @follow@ can come next, preferring the direct walk
+-- and falling back to an ignore-terminal separator for token pairs the lexer
+-- cannot realize adjacently.
+emitToken :: GenEnv -> WalkState -> T -> Maybe T -> IO WalkState
+emitToken genv ws tok follow = do
+  tt <- getTarget genv (tok, follow)
+  case viableEntries genv ws tt of
+    Just cands -> emitWith genv tt cands ws
+    Nothing -> emitViaIgnore genv ws tok follow
+
+-- | Fallback: emit @tok@ targeting the ignore terminal, then the ignore
+-- token targeting @follow@.
+emitViaIgnore :: GenEnv -> WalkState -> T -> Maybe T -> IO WalkState
+emitViaIgnore genv ws tok follow = do
+  ig <- maybe (boundaryError tok) pure (geIgnore genv)
+  tt_sep <- getTarget genv (tok, Just ig)
+  cands_sep <- maybe (boundaryError tok) pure (viableEntries genv ws tt_sep)
+  ws' <- emitWith genv tt_sep cands_sep ws
+  tt_ig <- getTarget genv (ig, follow)
+  cands_ig <- maybe (boundaryError ig) pure (viableEntries genv ws' tt_ig)
+  emitWith genv tt_ig cands_ig ws'
+
+-- | Generate the input by walking the lexer DFA directly.  The grammar
+-- derivation supplies the intended token sequence; each token is entered via
+-- a token-producing (boundary) transition and walked within transitions from
+-- which its target accepting states remain reachable, so boundaries are
+-- correct by construction.
 --
 -- Writes the payload directly to @h@ and returns the byte count.
--- Uses a single streaming pass with no intermediate list accumulation.
 generateSingleLongLexerParserInput ::
   (Ord s, Ord nt, Show nt) =>
   Int ->
@@ -342,81 +434,32 @@ generateSingleLongLexerParserInput ::
   Handle ->
   IO Int
 generateSingleLongLexerParserInput len _alpha dfa_lexer grammar h = do
-  let gen = mkStdGen randomSeed
-      min_map = computeMinTokenBytesMap dfa_lexer
+  total_ref <- newIORef (0 :: Int)
+  memo_ref <- newIORef Map.empty
+  let (gen_deriv, gen_walk) = split $ mkStdGen randomSeed
       env = mkWalkEnv dfa_lexer
-      maxPathBytes = 16
-      poolSize = 256 :: Int
-      allToks = Map.keys min_map
-      buildPool g tok =
-        let minPath = minTokenBytes min_map tok
-            maxSteps = max (length minPath) maxPathBytes
-            step (g', variants) _ =
-              let (mpath, g'') = randomWalkToToken env tok minPath maxSteps g'
-                  bs = fromMaybe minPath mpath
-               in (g'', ByteString.pack bs : variants)
-            (gFinal, variants') = foldl' step (g, []) [1 .. poolSize]
-         in (gFinal, listArray (0, poolSize - 1) variants')
-      (gen2, pools) =
-        foldl'
-          (\(g, m) tok -> let (g', arr) = buildPool g tok in (g', Map.insert tok arr m))
-          (gen, Map.empty)
-          allToks
-      minCostOf tok = length (minTokenBytes min_map tok)
-      minBytesOf tok = ByteString.pack (minTokenBytes min_map tok)
-      (_, rawToks) = generateRandomDerivationLazy gen len grammar
-      toks = [t | raw <- rawToks, Just t <- [unaug raw]]
-      -- A separator byte (e.g. space) that is accepted by the ignore terminal,
-      -- used to force a token boundary when adjacent byte sequences would merge.
-      -- We find it by looking for a single-byte ignore-token sequence.
-      separatorByte :: Maybe Word8
-      separatorByte = case Map.lookup (T "ignore") min_map of
-        Just (b : _) -> Just b
-        _            -> Nothing
-  totalRef <- newIORef (0 :: Int)
-  let tr    = weTrans env
-      prod  = weProducesToken env
-      s0    = weInitial env
-      -- Write bs and, if needed, a separator byte so the next token's first
-      -- byte does not merge with the last state of the current token.
-      writeSafe bs nextTok = do
-        ByteString.hPut h bs
-        modifyIORef' totalRef (+ ByteString.length bs)
-        case separatorByte of
-          Nothing -> pure ()
-          Just sep ->
-            let bsList = ByteString.unpack bs
-                needsSep = case (dfaStateAfter tr s0 bsList, minTokenBytes min_map nextTok) of
-                  (Just sEnd, firstNext : _) -> not (Set.member (sEnd, firstNext) prod)
-                  _                          -> False
-            in when needsSep $ do
-                 ByteString.hPut h (ByteString.singleton sep)
-                 modifyIORef' totalRef (+ 1)
-      go _ !_minBudget [] = pure ()
-      go g !minBudget [tok] = do
-        nb <- readIORef totalRef
-        let mc         = minCostOf tok
-            arr        = pools Map.! tok
-            (idx, g')  = randomR (0, poolSize - 1 :: Int) g
-            bs         = if minBudget <= 0 || nb + minBudget > len
-                           then minBytesOf tok
-                           else arr ! idx
-        ByteString.hPut h bs
-        modifyIORef' totalRef (+ ByteString.length bs)
-        go g' (minBudget - mc) []
-      go g !minBudget (tok : ts@(nextTok : _)) = do
-        nb <- readIORef totalRef
-        let mc         = minCostOf tok
-            minBudget' = minBudget - mc
-            arr        = pools Map.! tok
-            (idx, g')  = randomR (0, poolSize - 1 :: Int) g
-            bs         = if minBudget <= 0 || nb + minBudget > len
-                           then minBytesOf tok
-                           else arr ! idx
-        writeSafe bs nextTok
-        go g' minBudget' ts
-  go gen2 len toks
-  readIORef totalRef
+      ignore_tok = T "ignore"
+      genv =
+        GenEnv
+          { geEnv = env,
+            geTargetLen = len,
+            geTokenBudget = 16,
+            geIgnore =
+              if ignore_tok `Map.member` weAcceptingOf env
+                then Just ignore_tok
+                else Nothing,
+            geHandle = h,
+            geTotalRef = total_ref,
+            geMemoRef = memo_ref
+          }
+      (_, raw_toks) = generateRandomDerivationLazy gen_deriv len grammar
+      toks = [t | raw <- raw_toks, Just t <- [unaug raw]]
+      go _ [] = pure ()
+      go ws (tok : rest) = do
+        ws' <- emitToken genv ws tok (listToMaybe rest)
+        go ws' rest
+  go WalkState {wsGen = gen_walk, wsStart = AtStart} toks
+  readIORef total_ref
   where
     unaug (AugmentedTerminal (Used t)) = Just t
     unaug _ = Nothing
