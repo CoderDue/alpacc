@@ -7,13 +7,9 @@ DATA_RAW=data-raw-$(INPUT_SIZE).json
 .PHONY: clean bench build bench-futhark bench-cuda
 
 parser.cu: json.alp
-	alpacc cuda json.alp -o $@
+	alpacc cuda json.alp --index32 -o $@
 
 NVCCFLAGS=-O3 -std=c++17 -arch=native
-INDEX32?=1
-ifeq ($(INDEX32),1)
-NVCCFLAGS+= -DINDEX32
-endif
 
 parser-cuda: parser.cu
 	nvcc $(NVCCFLAGS) -o $@ $^

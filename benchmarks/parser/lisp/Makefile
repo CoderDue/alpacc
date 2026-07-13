@@ -7,13 +7,9 @@ DATA_RAW=data-raw-$(INPUT_SIZE).in
 .PHONY: clean bench build bench-futhark bench-cuda
 
 parser.cu: sexp.alp
-	alpacc cuda sexp.alp -o $@
+	alpacc cuda sexp.alp --index32 -o $@
 
 NVCCFLAGS=-O3 -std=c++17 -arch=native
-INDEX32?=1
-ifeq ($(INDEX32),1)
-NVCCFLAGS+= -DINDEX32
-endif
 
 parser-cuda: parser.cu
 	nvcc $(NVCCFLAGS) -o $@ $^

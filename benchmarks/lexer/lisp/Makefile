@@ -12,13 +12,9 @@ lexer-c: lexer.c
 	$(CC) -o $@ $^ $(CFLAGS)
 
 lexer.cu: sexp.alp
-	alpacc cuda sexp.alp --lexer -o $@
+	alpacc cuda sexp.alp --lexer --index32 -o $@
 
 NVCCFLAGS=-O3 -std=c++17 -arch=native
-INDEX32?=1
-ifeq ($(INDEX32),1)
-NVCCFLAGS+= -DINDEX32
-endif
 
 lexer-cuda: lexer.cu
 	nvcc $(NVCCFLAGS) -o $@ $^
