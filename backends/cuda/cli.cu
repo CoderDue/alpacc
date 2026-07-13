@@ -393,7 +393,7 @@ static int lexer_server_impl(FILE* in, FILE* out) {
 #ifdef HAS_PARSER
 
 // Forward declarations from parser.cu (already defined above this file):
-// static bool runParserPipeline(const terminal_t*, uint64_t, std::vector<production_t>&);
+// bool runParserPipeline(const terminal_t*, uint64_t, std::vector<production_t>&);
 
 #if !defined(HAS_LEXER)
 

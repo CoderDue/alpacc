@@ -550,8 +550,8 @@ static bool runParserFused(ParserFused& p, const terminal_t* h_arr, index_t m,
 // One-shot pipeline used by the CLI
 // ---------------------------------------------------------------------------
 
-static bool runParserPipeline(const terminal_t* h_tokens, uint64_t n,
-                              std::vector<production_t>& out_prods)
+bool runParserPipeline(const terminal_t* h_tokens, uint64_t n,
+                       std::vector<production_t>& out_prods)
 {
     if (n > (uint64_t)(std::numeric_limits<index_t>::max() - 2)) return false;
     index_t m = (index_t)(n + 2);
