@@ -28,21 +28,22 @@ generateTerminals terminal_type terminal_names =
     [ cudafyEnum "terminal_t" terminal_type terminal_names
     ]
 
-indexTypeAlias :: Text
-indexTypeAlias =
-  Text.unlines
-    [ "#ifdef INDEX32",
-      "using index_t = int32_t;",
-      "#else",
-      "using index_t = int64_t;",
-      "#endif"
-    ]
+indexTypeAlias :: Bool -> Text
+indexTypeAlias index32 =
+  Text.unlines $
+    (if index32 then ["#define INDEX32"] else [])
+      ++ [ "#ifdef INDEX32",
+           "using index_t = int32_t;",
+           "#else",
+           "using index_t = int64_t;",
+           "#endif"
+         ]
 
 compileHint :: Text
 compileHint = "// Compile: nvcc -O3 -std=c++17 -arch=native <this-file>.cu -o <output>"
 
-auxiliary :: Analyzer [Text] -> Text
-auxiliary analyzer =
+auxiliary :: Bool -> Analyzer [Text] -> Text
+auxiliary index32 analyzer =
   case analyzerKind analyzer of
     Lex lexer ->
       Text.unlines
@@ -50,7 +51,7 @@ auxiliary analyzer =
           Text.unlines (("// " <>) <$> meta analyzer),
           "#define HAS_LEXER",
           common,
-          indexTypeAlias,
+          indexTypeAlias index32,
           generateTerminals terminal_type terminal_names,
           Lexer.generateLexer lexer,
           cudaCli
@@ -61,7 +62,7 @@ auxiliary analyzer =
           Text.unlines (("// " <>) <$> meta analyzer),
           "#define HAS_PARSER",
           common,
-          indexTypeAlias,
+          indexTypeAlias index32,
           generateTerminals terminal_type terminal_names,
           Parser.generateParser parser,
           cudaCli
@@ -74,7 +75,7 @@ auxiliary analyzer =
           "#define HAS_PARSER",
           "#define HAS_RAW_INPUT",
           common,
-          indexTypeAlias,
+          indexTypeAlias index32,
           generateTerminals terminal_type terminal_names,
           Lexer.generateLexer lexer,
           Parser.generateParser parser,
@@ -84,8 +85,8 @@ auxiliary analyzer =
     terminal_type = terminalType analyzer
     terminal_names = terminalToName analyzer
 
-generator :: Generator [Text]
-generator =
+generator :: Bool -> Generator [Text]
+generator index32 =
   Generator
-    { generate = auxiliary
+    { generate = auxiliary index32
     }

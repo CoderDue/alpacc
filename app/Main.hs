@@ -351,9 +351,6 @@ readContents input =
     FileInput path -> TextIO.readFile path
 
 generateProgram :: Backend -> Bool -> Gen -> CFG -> Either Text Text
-generateProgram C _ GenParser cfg = generate C.generator <$> mkParser cfg
-generateProgram C _ GenLexer cfg = generate C.generator <$> mkLexer cfg
-generateProgram C _ GenBoth cfg = generate C.generator <$> mkLexerParser cfg
 generateProgram backend index32 gen cfg =
   case gen of
     GenBoth -> generate generator <$> mkLexerParser cfg
@@ -362,8 +359,9 @@ generateProgram backend index32 gen cfg =
   where
     generator =
       case backend of
-        CUDA -> Cuda.generator
+        CUDA -> Cuda.generator index32
         Futhark -> Futhark.generator index32
+        C -> C.generator index32
 
 pathOfInput :: FilePath -> Input -> FilePath
 pathOfInput p StdInput = p

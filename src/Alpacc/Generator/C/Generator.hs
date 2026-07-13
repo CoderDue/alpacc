@@ -32,15 +32,16 @@ includes =
       "#include <time.h>"
     ]
 
-indexTypedef :: Text
-indexTypedef =
-  Text.unlines
-    [ "#ifdef INDEX32",
-      "typedef int32_t index_t;",
-      "#else",
-      "typedef int64_t index_t;",
-      "#endif"
-    ]
+indexTypedef :: Bool -> Text
+indexTypedef index32 =
+  Text.unlines $
+    (if index32 then ["#define INDEX32"] else [])
+      ++ [ "#ifdef INDEX32",
+           "typedef int32_t index_t;",
+           "#else",
+           "typedef int64_t index_t;",
+           "#endif"
+         ]
 
 -- Forward declarations for the I/O helpers defined in cli.c.
 -- These let the generated test-case code call them without needing
@@ -146,15 +147,15 @@ bothTestCase = Text.unlines
   , "}"
   ]
 
-auxiliary :: Analyzer [Text] -> Text
-auxiliary analyzer =
+auxiliary :: Bool -> Analyzer [Text] -> Text
+auxiliary index32 analyzer =
   case analyzerKind analyzer of
     Lex lexer ->
       Text.unlines
         [ Text.unlines (("// " <>) <$> meta analyzer),
           includes,
           "typedef " <> cudafy (terminalType analyzer) <> " terminal_t;",
-          indexTypedef,
+          indexTypedef index32,
           ioForwardDecls,
           Lexer.generateLexer lexer,
           cLexer,
@@ -166,7 +167,7 @@ auxiliary analyzer =
         [ Text.unlines (("// " <>) <$> meta analyzer),
           includes,
           "typedef " <> cudafy (terminalType analyzer) <> " terminal_t;",
-          indexTypedef,
+          indexTypedef index32,
           ioForwardDecls,
           Parser.generateParser parser,
           cParser,
@@ -178,7 +179,7 @@ auxiliary analyzer =
         [ Text.unlines (("// " <>) <$> meta analyzer),
           includes,
           "typedef " <> cudafy (terminalType analyzer) <> " terminal_t;",
-          indexTypedef,
+          indexTypedef index32,
           ioForwardDecls,
           Lexer.generateLexer lexer,
           cLexer,
@@ -188,8 +189,8 @@ auxiliary analyzer =
           cCli
         ]
 
-generator :: Generator [Text]
-generator =
+generator :: Bool -> Generator [Text]
+generator index32 =
   Generator
-    { generate = auxiliary
+    { generate = auxiliary index32
     }
