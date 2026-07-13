@@ -126,6 +126,10 @@ struct States {
   States() {
   }
 
+  void reset() {
+    if (statuses) cudaMemset((void*) statuses, Invalid, num_blocks * sizeof(AtomicStatus));
+  }
+
   void cleanUp() {
     if (aggregates) cudaFree((void*) aggregates);
     if (prefixes) cudaFree((void*) prefixes);

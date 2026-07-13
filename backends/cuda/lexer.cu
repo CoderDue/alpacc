@@ -165,6 +165,19 @@ public:
     cudaMemset((void*)d_old_last_start, J(), sizeof(J));
   }
 
+  void reset() {
+    offset = 0;
+    cudaMemset((void*)d_dyn_block_index, 0, sizeof(uint32_t));
+    cudaMemset((void*)d_new_size, 0, sizeof(I));
+    cudaMemset((void*)d_new_last_state, IDENTITY, sizeof(state_t));
+    cudaMemset((void*)d_old_last_state, IDENTITY, sizeof(state_t));
+    cudaMemset((void*)d_new_last_start, 0, sizeof(J));
+    cudaMemset((void*)d_old_last_start, 0, sizeof(J));
+    d_index_states.reset();
+    d_state_states.reset();
+    d_take_right_states.reset();
+  }
+
   void cleanUp() {
     if (d_to_state) cudaFree(d_to_state);
     if (d_new_last_start) cudaFree((void*)d_new_last_start);
