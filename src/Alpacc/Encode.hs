@@ -25,7 +25,7 @@ where
 
 import Alpacc.Grammar
 import Alpacc.HashTable
-import Alpacc.LLP
+import Alpacc.Parser.LLP
   ( Bracket (..),
     llpParserTableWithStartsHomomorphisms,
   )

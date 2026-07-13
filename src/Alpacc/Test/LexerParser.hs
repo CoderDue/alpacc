@@ -9,8 +9,8 @@ where
 import Alpacc.CFG
 import Alpacc.Encode
 import Alpacc.Grammar
-import Alpacc.LL (generateRandomDerivationLazy)
-import Alpacc.LLP
+import Alpacc.Parser.LL (generateRandomDerivationLazy)
+import Alpacc.Parser.LLP
 import Alpacc.Lexer.DFA
 import Alpacc.Lexer.FSA
 import Alpacc.Lexer.RegularExpression

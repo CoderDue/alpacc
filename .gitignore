@@ -3,6 +3,7 @@
 !/*/
 !Makefile
 !benchmark.sh
+.claude-artifacts/
 # Do not include futhark test files.
 
 #########

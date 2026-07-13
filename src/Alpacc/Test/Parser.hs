@@ -8,8 +8,8 @@ where
 import Alpacc.CFG
 import Alpacc.Encode
 import Alpacc.Grammar
-import Alpacc.LL (generateRandomDerivation, generateRandomDerivationLazy)
-import Alpacc.LLP
+import Alpacc.Parser.LL (generateRandomDerivation, generateRandomDerivationLazy)
+import Alpacc.Parser.LLP
 import Alpacc.Test.Lexer (TestMode (..), decodeWith, getUInt, putUInt, randomSeed, uintBytes)
 import Alpacc.Types
 import Alpacc.Util

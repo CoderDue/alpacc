@@ -1,4 +1,4 @@
-module Alpacc.LLP
+module Alpacc.Parser.LLP
   ( Item (..),
     DotProduction (..),
     llpParserTableWithStarts,
@@ -14,7 +14,7 @@ module Alpacc.LLP
 where
 
 import Alpacc.Grammar
-import Alpacc.LL hiding (before, follow, llParse)
+import Alpacc.Parser.LL hiding (before, follow, llParse)
 import Control.DeepSeq
 import Control.Monad (foldM, join)
 import Data.IORef

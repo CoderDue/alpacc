@@ -1,4 +1,4 @@
-module Alpacc.LL
+module Alpacc.Parser.LL
   ( first,
     follow,
     last,

@@ -71,8 +71,8 @@ library
     Alpacc.CFG
     Alpacc.Grammar
     Alpacc.Encode
-    Alpacc.LL
-    Alpacc.LLP
+    Alpacc.Parser.LL
+    Alpacc.Parser.LLP
     Alpacc.Util
     Alpacc.HashTable
     Alpacc.Types
