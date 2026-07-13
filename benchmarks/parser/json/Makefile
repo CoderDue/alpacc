@@ -28,7 +28,7 @@ build: parser-cuda json.fut $(DATA_RAW)
 
 bench-cuda: parser-cuda $(DATA)
 	@printf "$(H)Benchmarking CUDA (alpacc) implementation:$(E)\n"
-	-@./parser-cuda --timeit < $(DATA) > /dev/null
+	./parser-cuda --benchmark 10 --warmup 3 < $(DATA)
 
 bench-futhark: json.fut $(DATA_RAW)
 	@printf "$(H)Benchmarking Futhark implementation:$(E)\n"
@@ -38,7 +38,7 @@ bench: parser-cuda json.fut $(DATA)
 	@printf "$(H)JSON Parser Benchmark:$(E)\n"
 
 	@printf "$(H)CUDA (alpacc) implementation:$(E)\n"
-	-@./parser-cuda --timeit < $(DATA) > /dev/null
+	./parser-cuda --benchmark 10 --warmup 3 < $(DATA)
 
 	@printf "$(H)Futhark implementation:$(E)\n"
 	futhark bench --backend $(FUTHARK_BACKEND) json.fut
