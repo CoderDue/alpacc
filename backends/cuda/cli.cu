@@ -637,6 +637,7 @@ static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
         for (uint32_t i = 0; i < warmup_runs; i++)
             runParserFused(pre, h_arr.data(), m, dummy_prods);
 
+        // --- kernel-only timing ---
         std::vector<float> times_ms(n_runs);
         for (uint32_t i = 0; i < n_runs; i++) {
             int one = 1;
@@ -648,23 +649,49 @@ static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
             gpuAssert(cudaEventElapsedTime(&times_ms[i], ev0, ev1));
         }
 
+        // --- IO-bound timing (H->D + kernel + D->H) ---
+        index_t totals[2];
+        std::vector<production_t> h_prods((size_t)pre.max_pr);
+        std::vector<float> times_io_ms(n_runs);
+        for (uint32_t i = 0; i < n_runs; i++) {
+            int one = 1;
+            gpuAssert(cudaMemcpy(pre.bufs.d_valid, &one, sizeof(int), cudaMemcpyHostToDevice));
+            gpuAssert(cudaEventRecord(ev0));
+            gpuAssert(cudaMemcpyAsync(pre.d_arr, h_arr.data(),
+                                      (size_t)m * sizeof(terminal_t), cudaMemcpyHostToDevice));
+            launchParserFused(pre, m);
+            gpuAssert(cudaMemcpyAsync(totals, pre.bufs.d_totals,
+                                      2 * sizeof(index_t), cudaMemcpyDeviceToHost));
+            gpuAssert(cudaMemcpyAsync(h_prods.data(), pre.bufs.d_productions,
+                                      (size_t)pre.max_pr * sizeof(production_t), cudaMemcpyDeviceToHost));
+            gpuAssert(cudaEventRecord(ev1));
+            gpuAssert(cudaEventSynchronize(ev1));
+            gpuAssert(cudaEventElapsedTime(&times_io_ms[i], ev0, ev1));
+        }
+
         freeParserFused(pre);
 
         size_t bytes = (size_t)ni * sizeof(terminal_t);
-        double sample_mean = 0, sample_variance = 0, sample_gbps = 0;
-        double factor = (double)bytes / (1000.0 * n_runs);
-        for (uint32_t i = 0; i < n_runs; i++) {
-            double diff = fmax(1e3 * (double)times_ms[i], 0.5);
-            sample_mean     += diff / n_runs;
-            sample_variance += (diff * diff) / n_runs;
-            sample_gbps     += factor / diff;
-        }
-        double sample_std = sqrt(sample_variance);
-        double bound = (0.95 * sample_std) / sqrt((double)n_runs);
+        auto print_stats = [&](const char* label, std::vector<float>& tms) {
+            double mean = 0, variance = 0, gbps = 0;
+            double factor = (double)bytes / (1000.0 * n_runs);
+            for (uint32_t i = 0; i < n_runs; i++) {
+                double diff = fmax(1e3 * (double)tms[i], 0.5);
+                mean     += diff / n_runs;
+                variance += (diff * diff) / n_runs;
+                gbps     += factor / diff;
+            }
+            double bound = (0.95 * sqrt(variance)) / sqrt((double)n_runs);
+            fprintf(stderr, "%s:\n", label);
+            fprintf(stderr, "        %.0fμs (95%% CI: [%.1fμs, %.1fμs]); %.0fGB/s\n",
+                    mean, mean - bound, mean + bound, gbps);
+        };
 
-        fprintf(stderr, "parse_int (cuda, %zu tokens):\n", (size_t)ni);
-        fprintf(stderr, "        %.0fμs (95%% CI: [%.1fμs, %.1fμs]); %.0fGB/s\n",
-                sample_mean, sample_mean - bound, sample_mean + bound, sample_gbps);
+        char label[64];
+        snprintf(label, sizeof(label), "parse_int (cuda, %zu tokens)", (size_t)ni);
+        print_stats(label, times_ms);
+        snprintf(label, sizeof(label), "parse_int (cuda+io, %zu tokens)", (size_t)ni);
+        print_stats(label, times_io_ms);
     }
 
     gpuAssert(cudaEventDestroy(ev0));
