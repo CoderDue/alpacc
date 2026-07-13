@@ -496,12 +496,7 @@ static int lexer_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
 // Response record: u8 valid; if valid: u64 np + np×production_t prod ids.
 // ---------------------------------------------------------------------------
 
-#ifdef HAS_PARSER
-
-// Forward declarations from parser.cu (already defined above this file):
-// bool runParserPipeline(const terminal_t*, uint64_t, std::vector<production_t>&);
-
-#if !defined(HAS_LEXER)
+#if defined(HAS_PARSER) && !defined(HAS_LEXER)
 
 static void run_one_parser_test(const terminal_t* tokens, uint64_t n,
                                 FILE* out) {
@@ -589,8 +584,9 @@ static int parser_server(FILE* in, FILE* out) {
     return 0;
 }
 
-#endif /* !HAS_LEXER */
+#endif /* HAS_PARSER && !HAS_LEXER */
 
+#ifdef HAS_PARSER
 // Benchmark mode: read all tests from `in`, pre-allocate GPU buffers once,
 // run warmup passes, then time `n_runs` passes with CUDA events.
 static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
