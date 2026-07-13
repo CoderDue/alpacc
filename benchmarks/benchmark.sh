@@ -32,7 +32,7 @@ done
 # --- Benchmark -------------------------------------------------------
 INPUT_SIZE=104857600
 
-make build         FUTHARK_BACKEND=cuda INPUT_SIZE=$INPUT_SIZE
+make build         FUTHARK_BACKEND=cuda INPUT_SIZE=$INPUT_SIZE > build.log 2>&1
 make bench-cuda    INPUT_SIZE=$INPUT_SIZE
 make bench-futhark FUTHARK_BACKEND=cuda INPUT_SIZE=$INPUT_SIZE
 
