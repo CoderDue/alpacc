@@ -350,6 +350,11 @@ readContents input =
     StdInput -> TextIO.getContents
     FileInput path -> TextIO.readFile path
 
+backendGenerator :: Backend -> Bool -> Generator [Text]
+backendGenerator CUDA = Cuda.generator
+backendGenerator Futhark = Futhark.generator
+backendGenerator C = C.generator
+
 generateProgram :: Backend -> Bool -> Gen -> CFG -> Either Text Text
 generateProgram backend index32 gen cfg =
   case gen of
@@ -357,11 +362,7 @@ generateProgram backend index32 gen cfg =
     GenLexer -> generate generator <$> mkLexer cfg
     GenParser -> generate generator <$> mkParser cfg
   where
-    generator =
-      case backend of
-        CUDA -> Cuda.generator index32
-        Futhark -> Futhark.generator index32
-        C -> C.generator index32
+    generator = backendGenerator backend index32
 
 pathOfInput :: FilePath -> Input -> FilePath
 pathOfInput p StdInput = p
