@@ -25,7 +25,7 @@ lexer-rust: lexer.rs Cargo.toml Cargo.lock
 	@cp target/release/lexer-rust .
 
 $(DATA_RAW): $(DATA)
-	dd if=$(DATA) of=$(DATA_RAW) bs=16 skip=1
+	dd if=$(DATA) of=$(DATA_RAW) bs=24 skip=1
 
 sexp.fut: sexp.alp $(DATA_RAW)
 	alpacc futhark sexp.alp --lexer
@@ -46,7 +46,7 @@ bench-c: lexer-c $(DATA_RAW)
 
 bench-cuda: lexer-cuda $(DATA)
 	@printf "$(H)Benchmarking CUDA (alpacc) implementation:$(E)\n"
-	-@./lexer-cuda --inputs --timeit < $(DATA) > /dev/null
+	-@./lexer-cuda --timeit < $(DATA) > /dev/null
 
 bench-futhark: sexp.fut $(DATA_RAW)
 	@printf "$(H)Benchmarking Futhark implementation:$(E)\n"
@@ -60,7 +60,7 @@ bench: lexer-c lexer-cuda sexp.fut $(DATA)
 	@./lexer-c $(DATA_RAW)
 
 	@printf "$(H)CUDA (alpacc) implementation:$(E)\n"
-	-@./lexer-cuda --inputs --timeit < $(DATA) > /dev/null
+	-@./lexer-cuda --timeit < $(DATA) > /dev/null
 
 	@printf "$(H)Futhark implementation:$(E)\n"
 	futhark bench --backend $(FUTHARK_BACKEND) sexp.fut

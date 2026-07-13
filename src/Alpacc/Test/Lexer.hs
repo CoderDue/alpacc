@@ -5,6 +5,10 @@ module Alpacc.Test.Lexer
     lexerBytes,
     TestMode (..),
     randomSeed,
+    putUInt,
+    getUInt,
+    uintBytes,
+    decodeWith,
   )
 where
 
@@ -14,13 +18,13 @@ import Alpacc.Grammar
 import Alpacc.Lexer.DFA
 import Alpacc.Lexer.FSA
 import Alpacc.Lexer.RegularExpression
+import Alpacc.Types
 import Alpacc.Util
 import Control.Monad
 import Data.Bifunctor
 import Data.IORef
-import Data.Binary
-import Data.Binary.Get (getByteString)
-import Data.Binary.Put (putByteString, runPut)
+import Data.Binary.Get (Get, getByteString, getWord16le, getWord32le, getWord64le, getWord8, runGetOrFail)
+import Data.Binary.Put (Put, putByteString, putWord16le, putWord32le, putWord64le, putWord8, runPut)
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Internal
 import Data.ByteString.Lazy qualified as LBS
@@ -31,7 +35,8 @@ import Data.Map qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
-import System.IO (Handle, SeekMode (..), hSeek, hTell)
+import Data.Word (Word64)
+import System.IO (Handle, SeekMode (..), hFlush, hSeek, hSetFileSize, hTell)
 import System.Random
 
 -- | Seed used for reproducible random generation in test cases
@@ -64,63 +69,90 @@ newtype Input = Input ByteString deriving (Show)
 
 newtype Inputs = Inputs [Input] deriving (Show)
 
-instance Binary Output where
-  put (Output Nothing) =
-    put (False :: Bool)
-  put (Output (Just ts)) = do
-    put (True :: Bool)
-    put (fromIntegral $ length ts :: Word64)
-    mapM_ putToken ts
-    where
-      putToken (Lexeme t (i, j)) = do
-        put (fromIntegral t :: Word64)
-        put i
-        put j
+-- | Little-endian putter for a value of the given unsigned native width.
+putUInt :: UInt -> Word64 -> Put
+putUInt U8 = putWord8 . fromIntegral
+putUInt U16 = putWord16le . fromIntegral
+putUInt U32 = putWord32le . fromIntegral
+putUInt U64 = putWord64le
 
-  get = do
-    is_valid <- get :: Get Bool
-    if is_valid
-      then do
-        num_tokens <- get :: Get Word64
-        ts <- mapM (const getLexeme) [1 .. num_tokens]
-        pure $ Output $ Just ts
-      else pure $ Output Nothing
-    where
-      getLexeme = do
-        t <- get :: Get Word64
-        i <- get :: Get Word64
-        j <- get :: Get Word64
-        pure $ Lexeme t (i, j)
+-- | Little-endian getter for a value of the given unsigned native width.
+getUInt :: UInt -> Get Word64
+getUInt U8 = fromIntegral <$> getWord8
+getUInt U16 = fromIntegral <$> getWord16le
+getUInt U32 = fromIntegral <$> getWord32le
+getUInt U64 = getWord64le
 
-instance Binary Input where
-  put (Input str) = do
-    put (fromIntegral $ ByteString.length str :: Word64)
-    putByteString str
+uintBytes :: UInt -> Word64
+uintBytes = fromIntegral . (`div` 8) . numBits
 
-  get = do
-    i <- get :: Get Word64
-    str <- getByteString $ fromIntegral i
-    pure $ Input str
+decodeWith :: Text -> Get a -> ByteString -> Either Text a
+decodeWith err g =
+  bimap (const err) (\(_, _, a) -> a)
+    . runGetOrFail g
+    . LBS.fromStrict
 
-instance Binary Inputs where
-  put (Inputs inps) = do
-    put (fromIntegral $ length inps :: Word64)
-    mapM_ put inps
+putOutput :: UInt -> Output -> Put
+putOutput _ (Output Nothing) = putWord8 0
+putOutput tw (Output (Just ts)) = do
+  putWord8 1
+  putWord64le (fromIntegral $ length ts)
+  mapM_ putToken ts
+  where
+    putToken (Lexeme t (i, j)) = do
+      putUInt tw t
+      putWord64le i
+      putWord64le j
 
-  get = do
-    i <- get :: Get Word64
-    inps <- mapM (const get) [1 .. i]
-    pure $ Inputs inps
+getOutput :: UInt -> Get Output
+getOutput tw = do
+  is_valid <- getWord8
+  if is_valid == 1
+    then do
+      num_tokens <- getWord64le
+      Output . Just <$> replicateM (fromIntegral num_tokens) getLexeme
+    else pure $ Output Nothing
+  where
+    getLexeme = do
+      t <- getUInt tw
+      i <- getWord64le
+      j <- getWord64le
+      pure $ Lexeme t (i, j)
 
-instance Binary Outputs where
-  put (Outputs results) = do
-    put (fromIntegral $ length results :: Word64)
-    mapM_ put results
+putInput :: Input -> Put
+putInput (Input str) = do
+  let n = fromIntegral (ByteString.length str) :: Word64
+  putWord64le (8 + n)
+  putWord64le n
+  putByteString str
 
-  get = do
-    i <- get :: Get Word64
-    results <- mapM (const get) [1 .. i]
-    pure $ Outputs results
+getInput :: Get Input
+getInput = do
+  frame_len <- getWord64le
+  n <- getWord64le
+  when (frame_len /= 8 + n) $
+    fail "Frame length does not match the payload size."
+  Input <$> getByteString (fromIntegral n)
+
+putInputs :: Inputs -> Put
+putInputs (Inputs inps) = do
+  putWord64le (fromIntegral $ length inps)
+  mapM_ putInput inps
+
+getInputs :: Get Inputs
+getInputs = do
+  i <- getWord64le
+  Inputs <$> replicateM (fromIntegral i) getInput
+
+putOutputs :: UInt -> Outputs -> Put
+putOutputs tw (Outputs results) = do
+  putWord64le (fromIntegral $ length results)
+  mapM_ (putOutput tw) results
+
+getOutputs :: UInt -> Get Outputs
+getOutputs tw = do
+  i <- getWord64le
+  Outputs <$> replicateM (fromIntegral i) (getOutput tw)
 
 -- | Generate a single long input by simulating the DFA. Starting from
 -- the initial state, randomly choose valid transitions until we reach
@@ -174,6 +206,7 @@ lexerTests mode cfg k noOutputs = do
   spec <- cfgToDFALexerSpec cfg
   let ts = Map.keys $ regexMap spec
       encoder = encodeTerminals (T "ignore") $ parsingTerminals ts
+  tw <- terminalIntType encoder
   dfa <-
     maybeToEither "Error: Could not encode tokens." $
       mapTokens (fmap fromIntegral . (`terminalLookup` encoder)) $
@@ -189,8 +222,8 @@ lexerTests mode cfg k noOutputs = do
           let singleInput = generateSingleLongInputFromDFA k alpha (fsa dfa)
            in (toInputs [singleInput], if noOutputs then emptyOutputs else toOutputs dfa ignore [singleInput])
   pure
-    ( encode inputs,
-      encode outputs
+    ( runPut $ putInputs inputs,
+      runPut $ putOutputs tw outputs
     )
   where
     toOutputs dfa ignore = Outputs . fmap (Output . tokenize dfa ignore)
@@ -212,43 +245,52 @@ lexerTestsSingleLong cfg k h mOutH = do
     Right spec -> do
       let ts = Map.keys $ regexMap spec
           encoder = encodeTerminals (T "ignore") $ parsingTerminals ts
-      case mapTokens (fmap (fromIntegral :: Integer -> Word64) . (`terminalLookup` encoder)) $
-             lexerDFA (0 :: Integer) $ mapSymbols unBytes spec of
-        Nothing -> pure (Left "Error: Could not encode tokens.")
-        Just dfa -> do
-          let ignore = fromIntegral <$> terminalLookup (T "ignore") encoder
-              alpha  = alphabet $ fsa dfa
-              singleInput = generateSingleLongInputFromDFA k alpha (fsa dfa)
-          LBS.hPut h (encode (1 :: Word64) <> encode (0 :: Word64))
-          LBS.hPut h (LBS.pack singleInput)
-          let payloadLen = fromIntegral (length singleInput) :: Word64
-          hSeek h AbsoluteSeek 8
-          LBS.hPut h (encode payloadLen)
-          case mOutH of
-            Nothing -> pure (Right ())
-            Just outH -> do
-              -- Read back the payload as a compact strict ByteString and tokenize.
-              hSeek h AbsoluteSeek 16
-              payload <- ByteString.hGet h (fromIntegral payloadLen)
-              -- Outputs header: count=1, then Output valid-flag placeholder.
-              LBS.hPut outH (encode (1 :: Word64))
-              validPos <- hTell outH
-              LBS.hPut outH (encode False <> encode (0 :: Word64))
-              tokCountRef <- newIORef (0 :: Word64)
-              let putLexeme (Lexeme t (i, j)) = do
-                    LBS.hPut outH $ runPut $ do
-                      put (fromIntegral t :: Word64)
-                      put i
-                      put j
-                    modifyIORef' tokCountRef (+ 1)
-              mResult <- tokenizeWithBS dfa ignore payload putLexeme
-              case mResult of
-                Nothing -> pure (Right ())   -- leave valid=False as-is
-                Just () -> do
-                  tokCount <- readIORef tokCountRef
-                  hSeek outH AbsoluteSeek validPos
-                  LBS.hPut outH (encode True <> encode tokCount)
-                  pure (Right ())
+      case terminalIntType encoder of
+        Left e -> pure (Left e)
+        Right tw ->
+          case mapTokens (fmap (fromIntegral :: Integer -> Word64) . (`terminalLookup` encoder)) $
+                 lexerDFA (0 :: Integer) $ mapSymbols unBytes spec of
+            Nothing -> pure (Left "Error: Could not encode tokens.")
+            Just dfa -> do
+              let ignore = fromIntegral <$> terminalLookup (T "ignore") encoder
+                  alpha  = alphabet $ fsa dfa
+                  singleInput = generateSingleLongInputFromDFA k alpha (fsa dfa)
+              -- num_tests, then frame_len/n placeholders patched below.
+              LBS.hPut h (runPut $ putWord64le 1 >> putWord64le 0 >> putWord64le 0)
+              LBS.hPut h (LBS.pack singleInput)
+              let payloadLen = fromIntegral (length singleInput) :: Word64
+              hSeek h AbsoluteSeek 8
+              LBS.hPut h (runPut $ putWord64le (8 + payloadLen) >> putWord64le payloadLen)
+              case mOutH of
+                Nothing -> pure (Right ())
+                Just outH -> do
+                  -- Read back the payload as a compact strict ByteString and tokenize.
+                  hSeek h AbsoluteSeek 24
+                  payload <- ByteString.hGet h (fromIntegral payloadLen)
+                  -- Outputs header: num_tests=1, then valid/count placeholder.
+                  LBS.hPut outH (runPut $ putWord64le 1)
+                  validPos <- hTell outH
+                  LBS.hPut outH (runPut $ putWord8 0 >> putWord64le 0)
+                  tokCountRef <- newIORef (0 :: Word64)
+                  let putLexeme (Lexeme t (i, j)) = do
+                        LBS.hPut outH $ runPut $ do
+                          putUInt tw t
+                          putWord64le i
+                          putWord64le j
+                        modifyIORef' tokCountRef (+ 1)
+                  mResult <- tokenizeWithBS dfa ignore payload putLexeme
+                  case mResult of
+                    Nothing -> do
+                      -- An invalid record is a single 0 byte; drop the count
+                      -- placeholder and any partially written lexemes.
+                      hFlush outH
+                      hSetFileSize outH (validPos + 1)
+                      pure (Right ())
+                    Just () -> do
+                      tokCount <- readIORef tokCountRef
+                      hSeek outH AbsoluteSeek validPos
+                      LBS.hPut outH (runPut $ putWord8 1 >> putWord64le tokCount)
+                      pure (Right ())
 
 -- | Generate raw bytes for a single long lexer input, suitable for piping
 -- directly into a lexer benchmark (no binary framing).
@@ -265,23 +307,19 @@ lexerTestsCompare cfg input expected result = do
 
   let ts = Map.keys $ regexMap spec
       encoder = encodeTerminals (T "ignore") $ parsingTerminals ts
+  tw <- terminalIntType encoder
   encodings <-
     maybeToEither "Error: Could not encode tokens." $
       mapM (fmap fromIntegral . (`terminalLookup` encoder)) ts
   let int_to_token = Map.fromList $ zip encodings ts
-  Inputs inp <- dec "Error: Could not parse input file." input
-  Outputs ex <- dec "Error: Could not parse expected output file." expected
-  Outputs res <- dec "Error: Could not parse result output file." result
+  Inputs inp <- decodeWith "Error: Could not parse input file." getInputs input
+  Outputs ex <- decodeWith "Error: Could not parse expected output file." (getOutputs tw) expected
+  Outputs res <- decodeWith "Error: Could not parse result output file." (getOutputs tw) result
   failwith (length inp == length ex) "Error: Input and expected output file do not have the same number of tests."
   failwith (length inp == length res) "Error: Input and result output file do not have the same number of tests."
 
   mapM_ (compareTest int_to_token) $ zip4 [0 :: Integer ..] inp ex res
   where
-    dec str =
-      bimap (const str) (\(_, _, a) -> a)
-        . decodeOrFail
-        . ByteString.fromStrict
-
     failwith b s = unless b (Left s)
 
     showLexeme int_to_token (Lexeme t sp) = do

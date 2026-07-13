@@ -3,7 +3,7 @@
 // typedefs and the grammar constants (Q, K, *_TERMINAL, HASH_TABLE_*,
 // STACKS, PRODUCTIONS).  Mirrors pre_productions_int in futhark/parser.fut.
 //
-// Provides parse_test() and compute_parents() for use by run_test_case().
+// Provides parse_test() and compute_parents() for use by run_case().
 
 static bool is_left(bracket_t b) {
   return (b >> (8 * sizeof(bracket_t) - 1)) & 1;
@@ -99,7 +99,7 @@ done:
 
 #ifdef ALPACC_WITH_TREE
 // Compute the parent index of each production node.  Mirrors `parents` in
-// futhark/parser.fut.  Used by the combined lexer+parser run_test_case().
+// futhark/parser.fut.  Used by the combined lexer+parser run_case().
 static void compute_parents(const production_t *prods, uint64_t np,
                             index_t *parents_out) {
   uint64_t *remaining = (uint64_t *) malloc(np * sizeof(uint64_t));

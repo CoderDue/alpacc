@@ -79,10 +79,6 @@ setup_cuda() { :; }
 run_backend_cuda() {
     local mode_flag="$1" stem="$2"
     local arch="${CUDA_ARCH:-native}"
-    # Lexer-only binaries default to raw-stream mode; --inputs selects the
-    # framed batch format that `alpacc test generate` produces.
-    local batch_flags=""
-    if [ "$mode_flag" = "--lexer" ]; then batch_flags="--inputs"; fi
     # shellcheck disable=SC2086
     if ! alpacc cuda "$GRAMMAR" $mode_flag -o "${stem}.cu"; then
         echo "ERROR: alpacc cuda failed"; return 1
@@ -90,8 +86,7 @@ run_backend_cuda() {
     if ! nvcc -O3 -std=c++17 -arch="$arch" -o "${stem}" "${stem}.cu" &>/dev/null; then
         echo "ERROR: nvcc compilation failed"; return 1
     fi
-    # shellcheck disable=SC2086
-    "./${stem}" $batch_flags < "${stem}.inputs" > "${stem}.results"
+    "./${stem}" < "${stem}.inputs" > "${stem}.results"
 }
 
 # ---------------------------------------------------------------------------

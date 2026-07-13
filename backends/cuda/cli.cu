@@ -2,23 +2,23 @@
 //
 // Appended last (after common.cu, scan.cu, [lexer.cu], pse.cu, [parser.cu]
 // and the grammar constants).  Provides a unified CLI for all three modes:
-//   Lex-only:    default → raw bytes from stdin/file, emits ASCII token spans;
-//                --inputs → framed test batches (C backend results format);
-//                --server → one raw-byte test per frame (native protocol)
-//   Parse-only:  reads binary token-ID frames, emits production IDs
-//   Both:        default → raw-byte test frames → lexer → fused parser with
-//                parents/parse_int phases → CST nodes (C backend format);
-//                --server takes one raw-byte test per frame (native protocol);
-//                --benchmark uses the token-ID frame protocol
+//   Lex-only:    framed test batches → token/span records
+//   Parse-only:  framed token-ID batches → production IDs
+//   Both:        framed raw-byte batches → lexer → fused parser with
+//                parents/parse_int phases → CST nodes
 //
-// Wire formats:
-//   Batch/test protocol (default modes, `alpacc test` compatible): every
-//   integer is u64 big-endian regardless of the grammar's native types.
-//   Server protocol (--server): native types in host byte order (alpacc
-//   targets little-endian hosts).  Frame: u64 frame_len; content: u64 n +
-//   payload (n raw bytes for lexer/both; n × sizeof(terminal_t) token ids
-//   for parser).  Responses use terminal_t / production_t / index_t as
-//   generated for the grammar; `--layout` prints their sizes.
+// Wire format (native little-endian batch protocol, see
+// docs/wire-protocols.md):
+//   batch input : u64 num_tests, then per test a frame:
+//                 u64 frame_len, u64 n, payload
+//                 (payload: n raw bytes for lexer/both;
+//                  n × sizeof(terminal_t) token ids for parser)
+//   batch output: u64 num_tests, then per test a response record:
+//                 u8 valid; if valid: u64 count + native-width fields
+//                 using terminal_t / production_t / index_t as generated
+//                 for the grammar; `--layout` prints their sizes.
+//   --server    : a loop of such counted batches until EOF, flushed
+//                 after each response record.
 //
 // Flags (all optional):
 //   -i FILE              input file (default: stdin)
@@ -27,10 +27,10 @@
 //   --items-per-thread N 2, 4, or 8 (default: auto from shared memory)
 //   --shared-memory N    shared memory budget in bytes (default: device query)
 //   --timeit             print kernel elapsed time to stderr
-//   --server             length-prefixed loop: read u64 frame-length then
-//                        that many bytes, process, write result, flush, repeat
+//   --server             counted-batch loop until EOF (flush after each
+//                        response)
 //   --layout             print native type sizes (key=value lines) and exit
-//   --raw-input          (Both mode only) input is raw bytes; run full pipeline
+//   --benchmark N        time N runs (GPU-only, pre-alloc, no I/O in loop)
 
 #include <cstdio>
 #include <cstdlib>
@@ -39,10 +39,11 @@
 #include <cinttypes>
 #include <vector>
 
-static inline uint64_t decode_be64(const uint8_t* p) {
-    return ((uint64_t)p[0]<<56)|((uint64_t)p[1]<<48)|((uint64_t)p[2]<<40)|
-           ((uint64_t)p[3]<<32)|((uint64_t)p[4]<<24)|((uint64_t)p[5]<<16)|
-           ((uint64_t)p[6]<< 8)|((uint64_t)p[7]);
+// Hosts are little-endian; decode by memcpy.
+static inline uint64_t decode_le64(const uint8_t* p) {
+    uint64_t v;
+    memcpy(&v, p, sizeof v);
+    return v;
 }
 
 // ---------------------------------------------------------------------------
@@ -68,11 +69,10 @@ static void usage(const char* prog) {
         "  --items-per-thread N 2, 4, or 8 (default: auto)\n"
         "  --shared-memory N    shared memory budget bytes (default: device)\n"
         "  --timeit             print kernel time to stderr\n"
-        "  --server             length-prefixed binary frame loop mode (native types)\n"
+        "  --server             counted-batch loop until EOF (flush per response)\n"
         "  --layout             print native type sizes and exit\n"
         "  --benchmark N        time N runs (GPU-only, pre-alloc, no I/O in loop)\n"
         "  --warmup N           warmup runs before timing (default: 3)\n"
-        "  --inputs             read framed .inputs file (from alpacc test generate)\n"
         , prog);
 }
 
@@ -84,7 +84,6 @@ struct CliArgs {
     uint32_t    shared_mem   = 0;         // 0 = device query
     bool        timeit       = false;
     bool        server       = false;
-    bool        raw_input    = false;
     uint32_t    benchmark    = 0;    // 0 = off; >0 = number of timed runs
     uint32_t    warmup       = 3;    // warmup runs before timing (used when benchmark > 0)
 };
@@ -108,9 +107,6 @@ static CliArgs parse_args(int argc, char* argv[]) {
             a.server = true;
         } else if (strcmp(argv[i], "--layout") == 0) {
             print_layout(); exit(0);
-        } else if (strcmp(argv[i], "--raw-input") == 0 ||
-                   strcmp(argv[i], "--inputs") == 0) {
-            a.raw_input = true;
         } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
             a.input_file = argv[++i];
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
@@ -186,24 +182,7 @@ static uint32_t auto_ipt(uint32_t shmem_budget, uint32_t bs) {
 // I/O helpers (reused across modes)
 // ---------------------------------------------------------------------------
 
-static __attribute__((unused)) uint64_t read_u64_be(FILE* f) {
-    uint8_t p[8];
-    if (fread(p, 1, 8, f) != 8) return (uint64_t)-1;
-    return ((uint64_t)p[0]<<56)|((uint64_t)p[1]<<48)|((uint64_t)p[2]<<40)|
-           ((uint64_t)p[3]<<32)|((uint64_t)p[4]<<24)|((uint64_t)p[5]<<16)|
-           ((uint64_t)p[6]<< 8)|((uint64_t)p[7]);
-}
-
-static __attribute__((unused)) void write_u64_be(FILE* f, uint64_t v) {
-    uint8_t p[8];
-    p[0]=(uint8_t)(v>>56); p[1]=(uint8_t)(v>>48);
-    p[2]=(uint8_t)(v>>40); p[3]=(uint8_t)(v>>32);
-    p[4]=(uint8_t)(v>>24); p[5]=(uint8_t)(v>>16);
-    p[6]=(uint8_t)(v>> 8); p[7]=(uint8_t)(v);
-    fwrite(p, 1, 8, f);
-}
-
-// Host-byte-order (little-endian) helpers for the native server protocol.
+// Host-byte-order (little-endian) helpers for the native protocol.
 static __attribute__((unused)) uint64_t read_u64_le(FILE* f) {
     uint64_t v;
     if (fread(&v, sizeof v, 1, f) != 1) return (uint64_t)-1;
@@ -254,20 +233,10 @@ static uint8_t* slurp(FILE* f, size_t* out_len) {
     }())
 
 // ---------------------------------------------------------------------------
-// Lexer-only mode
-//
-// Reads raw bytes from `in`, emits ASCII token spans to `out`.
-// One call per input (file mode / single-shot server frame).
+// Lexer-only mode (framed test batches)
 // ---------------------------------------------------------------------------
 
 #ifdef HAS_LEXER
-
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
-static int run_lexer_stream_impl(bool timeit) {
-    constexpr uint32_t CHUNK_SIZE = 100u * (1u << 20);  // 100 MiB
-    return lexer_stream<WriteAscii, CHUNK_SIZE, BLOCK_SIZE, ITEMS_PER_THREAD>(
-        WriteAscii(), timeit);
-}
 
 // Run the lexer on one framed test; on success fills toks/starts/ends and
 // returns true, otherwise returns false (rejected input).
@@ -311,32 +280,11 @@ static bool lex_one(const uint8_t* bytes, uint64_t n,
     return valid;
 }
 
-// Run the lexer on one framed test and write the result in the C backend's
-// lexer test format (what `alpacc test compare --lexer` expects):
-//   u8 valid; if valid: u64 BE num_lexemes; per lexeme:
-//   u64 BE terminal, u64 BE span start, u64 BE span end
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
-static void run_one_lexer_test(const uint8_t* bytes, uint64_t n, FILE* out) {
-    std::vector<terminal_t> toks;
-    std::vector<index_t>    starts, ends;
-    if (!lex_one<BLOCK_SIZE, ITEMS_PER_THREAD>(bytes, n, toks, starts, ends)) {
-        fputc(0, out);
-        return;
-    }
-    fputc(1, out);
-    write_u64_be(out, (uint64_t)toks.size());
-    for (size_t i = 0; i < toks.size(); i++) {
-        write_u64_be(out, (uint64_t)toks[i]);
-        write_u64_be(out, (uint64_t)starts[i]);
-        write_u64_be(out, (uint64_t)ends[i]);
-    }
-}
-
-// Native server response (host byte order):
+// Response record (host byte order):
 //   u8 valid; if valid: u64 num_lexemes; per lexeme:
 //   terminal_t terminal, index_t span start, index_t span end
 template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
-static void run_one_lexer_test_native(const uint8_t* bytes, uint64_t n, FILE* out) {
+static void run_one_lexer_test(const uint8_t* bytes, uint64_t n, FILE* out) {
     std::vector<terminal_t> toks;
     std::vector<index_t>    starts, ends;
     if (!lex_one<BLOCK_SIZE, ITEMS_PER_THREAD>(bytes, n, toks, starts, ends)) {
@@ -352,9 +300,9 @@ static void run_one_lexer_test_native(const uint8_t* bytes, uint64_t n, FILE* ou
     }
 }
 
-// Framed lexer mode: reads the binary format produced by `alpacc test generate --lexer`
-// (u64 BE num_tests; per test: u64 BE n + n raw bytes) and writes
-// u64 BE num_tests followed by per-test results (see run_one_lexer_test).
+// Batch mode: u64 num_tests, then per test a frame (u64 frame_len,
+// u64 n, n raw bytes).  Writes u64 num_tests followed by per-test
+// response records (see run_one_lexer_test).
 template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
 static int run_lexer_batch_impl(FILE* in, FILE* out, bool timeit) {
     size_t buf_len = 0;
@@ -370,13 +318,15 @@ static int run_lexer_batch_impl(FILE* in, FILE* out, bool timeit) {
 
     const uint8_t* p   = buf;
     const uint8_t* end = buf + buf_len;
-    uint64_t num_tests = decode_be64(p); p += 8;
-    write_u64_be(out, num_tests);
+    uint64_t num_tests = decode_le64(p); p += 8;
+    write_u64_le(out, num_tests);
     int ret = 0;
 
     for (uint64_t t = 0; t < num_tests; t++) {
-        if (p + 8 > end) { fprintf(stderr, "error: truncated input\n"); ret = 1; break; }
-        uint64_t n = decode_be64(p); p += 8;
+        if (p + 16 > end) { fprintf(stderr, "error: truncated input\n"); ret = 1; break; }
+        uint64_t frame_len = decode_le64(p); p += 8;
+        uint64_t n = decode_le64(p); p += 8;
+        if (frame_len != 8 + n) { fprintf(stderr, "error: frame length mismatch\n"); ret = 1; break; }
         if (n > (uint64_t)(end - p)) { fprintf(stderr, "error: truncated input\n"); ret = 1; break; }
         run_one_lexer_test<BLOCK_SIZE, ITEMS_PER_THREAD>(p, n, out);
         p += n;
@@ -396,29 +346,37 @@ static int run_lexer_batch_impl(FILE* in, FILE* out, bool timeit) {
     return ret;
 }
 
-// Server mode: length-prefixed frames of raw bytes, one test per frame,
-// native protocol (host byte order).
+// Server mode: counted batches (u64 num_tests, then that many frames) in
+// a loop until EOF, flush after each response.
 // Frame: u64 frame_len; content: u64 n + n raw bytes.
 template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
 static int lexer_server_impl(FILE* in, FILE* out) {
     std::vector<uint8_t> frame;
     for (;;) {
-        uint64_t frame_len = read_u64_le(in);
+        uint64_t num_tests = read_u64_le(in);
         if (feof(in)) break;
-        if (frame_len == (uint64_t)-1 || frame_len < 8) {
-            fprintf(stderr, "error: bad frame length\n"); return 1;
+        if (num_tests == (uint64_t)-1) {
+            fprintf(stderr, "error: truncated input\n"); return 1;
         }
-        frame.resize(frame_len);
-        if (fread(frame.data(), 1, frame_len, in) != frame_len) {
-            fprintf(stderr, "error: truncated frame\n"); return 1;
-        }
-        uint64_t n;
-        memcpy(&n, frame.data(), sizeof n);
-        if (frame_len != 8 + n) {
-            fprintf(stderr, "error: frame length mismatch\n"); return 1;
-        }
-        run_one_lexer_test_native<BLOCK_SIZE, ITEMS_PER_THREAD>(frame.data() + 8, n, out);
+        write_u64_le(out, num_tests);
         fflush(out);
+        for (uint64_t t = 0; t < num_tests; t++) {
+            uint64_t frame_len = read_u64_le(in);
+            if (feof(in) || frame_len == (uint64_t)-1 || frame_len < 8) {
+                fprintf(stderr, "error: bad frame length\n"); return 1;
+            }
+            frame.resize(frame_len);
+            if (fread(frame.data(), 1, frame_len, in) != frame_len) {
+                fprintf(stderr, "error: truncated frame\n"); return 1;
+            }
+            uint64_t n;
+            memcpy(&n, frame.data(), sizeof n);
+            if (frame_len != 8 + n) {
+                fprintf(stderr, "error: frame length mismatch\n"); return 1;
+            }
+            run_one_lexer_test<BLOCK_SIZE, ITEMS_PER_THREAD>(frame.data() + 8, n, out);
+            fflush(out);
+        }
     }
     return 0;
 }
@@ -426,14 +384,10 @@ static int lexer_server_impl(FILE* in, FILE* out) {
 #endif // HAS_LEXER
 
 // ---------------------------------------------------------------------------
-// Parser-only mode (binary token-ID frames)
+// Parser-only mode (framed token-ID batches)
 //
-// Protocol (same as c/parser.c and testcuda.sh):
-//   Input:  u64 BE num_tests; per test: u64 BE n + n×u64 BE token ids
-//   Output: u64 BE num_tests; per test: u8 valid; if valid: u64 BE np + np×u64 BE prod ids
-//
-// In server mode the framing differs: each "frame" is a single test
-// (no outer num_tests count; the server loop provides that).
+// Frame payload: n × terminal_t token ids (host byte order).
+// Response record: u8 valid; if valid: u64 np + np×production_t prod ids.
 // ---------------------------------------------------------------------------
 
 #ifdef HAS_PARSER
@@ -443,24 +397,8 @@ static int lexer_server_impl(FILE* in, FILE* out) {
 
 #if !defined(HAS_LEXER)
 
-// Test-format result: u8 valid; if valid: u64 BE np + np×u64 BE prod ids.
 static void run_one_parser_test(const terminal_t* tokens, uint64_t n,
                                 FILE* out) {
-    std::vector<production_t> prods;
-    bool ok = runParserPipeline(tokens, n, prods);
-    if (ok) {
-        fputc(1, out);
-        write_u64_be(out, (uint64_t)prods.size());
-        for (production_t p : prods) write_u64_be(out, (uint64_t)p);
-    } else {
-        fputc(0, out);
-    }
-}
-
-// Native server result (host byte order): u8 valid; if valid:
-// u64 np + np×production_t prod ids.
-static void run_one_parser_test_native(const terminal_t* tokens, uint64_t n,
-                                       FILE* out) {
     std::vector<production_t> prods;
     bool ok = runParserPipeline(tokens, n, prods);
     if (ok) {
@@ -484,17 +422,22 @@ static int parser_batch(FILE* in, FILE* out) {
     const uint8_t* p   = buf;
     const uint8_t* end = buf + buf_len;
 
-    uint64_t num_tests = decode_be64(p); p += 8;
-    write_u64_be(out, num_tests);
+    uint64_t num_tests = decode_le64(p); p += 8;
+    write_u64_le(out, num_tests);
 
     std::vector<terminal_t> tokens;
     for (uint64_t t = 0; t < num_tests; t++) {
-        if (p + 8 > end) { free(buf); fprintf(stderr, "truncated\n"); return 1; }
-        uint64_t n = decode_be64(p); p += 8;
-        if (p + n * 8 > end) { free(buf); fprintf(stderr, "truncated\n"); return 1; }
+        if (p + 16 > end) { free(buf); fprintf(stderr, "truncated\n"); return 1; }
+        uint64_t frame_len = decode_le64(p); p += 8;
+        uint64_t n = decode_le64(p); p += 8;
+        if (frame_len != 8 + n * sizeof(terminal_t)) {
+            free(buf); fprintf(stderr, "error: frame length mismatch\n"); return 1;
+        }
+        if (p + n * sizeof(terminal_t) > end) { free(buf); fprintf(stderr, "truncated\n"); return 1; }
         tokens.resize(n);
-        for (uint64_t i = 0; i < n; i++, p += 8)
-            tokens[i] = (terminal_t)decode_be64(p);
+        if (n > 0)
+            memcpy(tokens.data(), p, n * sizeof(terminal_t));
+        p += n * sizeof(terminal_t);
         run_one_parser_test(tokens.data(), n, out);
     }
     free(buf);
@@ -502,32 +445,40 @@ static int parser_batch(FILE* in, FILE* out) {
     return 0;
 }
 
-// Server mode: loop on length-prefixed frames, native protocol (host byte
-// order).  Each frame: u64 frame_byte_length, then frame_byte_length bytes
-// containing u64 n + n×terminal_t token ids.
+// Server mode: counted batches (u64 num_tests, then that many frames) in
+// a loop until EOF, flush after each response.  Each frame: u64
+// frame_byte_length, then u64 n + n×terminal_t token ids.
 static int parser_server(FILE* in, FILE* out) {
     std::vector<terminal_t> tokens;
     std::vector<uint8_t>    frame;
     for (;;) {
-        uint64_t frame_len = read_u64_le(in);
+        uint64_t num_tests = read_u64_le(in);
         if (feof(in)) break;
-        if (frame_len == (uint64_t)-1 || frame_len < 8) {
-            fprintf(stderr, "error: bad frame length\n"); return 1;
+        if (num_tests == (uint64_t)-1) {
+            fprintf(stderr, "error: truncated input\n"); return 1;
         }
-        frame.resize(frame_len);
-        if (fread(frame.data(), 1, frame_len, in) != frame_len) {
-            fprintf(stderr, "error: truncated frame\n"); return 1;
-        }
-        uint64_t n;
-        memcpy(&n, frame.data(), sizeof n);
-        if (frame_len != 8 + n * sizeof(terminal_t)) {
-            fprintf(stderr, "error: frame length mismatch\n"); return 1;
-        }
-        tokens.resize(n);
-        if (n > 0)
-            memcpy(tokens.data(), frame.data() + 8, n * sizeof(terminal_t));
-        run_one_parser_test_native(tokens.data(), n, out);
+        write_u64_le(out, num_tests);
         fflush(out);
+        for (uint64_t t = 0; t < num_tests; t++) {
+            uint64_t frame_len = read_u64_le(in);
+            if (feof(in) || frame_len == (uint64_t)-1 || frame_len < 8) {
+                fprintf(stderr, "error: bad frame length\n"); return 1;
+            }
+            frame.resize(frame_len);
+            if (fread(frame.data(), 1, frame_len, in) != frame_len) {
+                fprintf(stderr, "error: truncated frame\n"); return 1;
+            }
+            uint64_t n;
+            memcpy(&n, frame.data(), sizeof n);
+            if (frame_len != 8 + n * sizeof(terminal_t)) {
+                fprintf(stderr, "error: frame length mismatch\n"); return 1;
+            }
+            tokens.resize(n);
+            if (n > 0)
+                memcpy(tokens.data(), frame.data() + 8, n * sizeof(terminal_t));
+            run_one_parser_test(tokens.data(), n, out);
+            fflush(out);
+        }
     }
     return 0;
 }
@@ -542,16 +493,19 @@ static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
     // Slurp input
     size_t buf_len = 0;
     uint8_t* buf = slurp(in, &buf_len);
-    if (!buf || buf_len < 16) {
+    if (!buf || buf_len < 24) {
         free(buf);
         fprintf(stderr, "error: benchmark input too short\n");
         return 1;
     }
     const uint8_t* p = buf;
-    // uint64_t num_tests = decode_be64(p);  // use only first test
+    // u64 num_tests (only the first test is used), then the first frame:
+    // u64 frame_len, u64 n, n×terminal_t token ids.
     p += 8;
-    uint64_t n = decode_be64(p); p += 8;
-    if (buf_len < 16 + n * 8) {
+    uint64_t frame_len = decode_le64(p); p += 8;
+    uint64_t n = decode_le64(p); p += 8;
+    if (frame_len != 8 + n * sizeof(terminal_t) ||
+        buf_len < 24 + n * sizeof(terminal_t)) {
         free(buf); fprintf(stderr, "error: input truncated\n"); return 1;
     }
 
@@ -561,7 +515,8 @@ static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
     // Build host-side extended token array (terminal_t)
     std::vector<terminal_t> h_arr((size_t)m);
     h_arr[0] = START_TERMINAL;
-    for (index_t i = 0; i < ni; i++) h_arr[i + 1] = (terminal_t)decode_be64(p + i * 8);
+    if (ni > 0)
+        memcpy(h_arr.data() + 1, p, (size_t)ni * sizeof(terminal_t));
     h_arr[(size_t)m - 1] = END_TERMINAL;
     free(buf);
 
@@ -644,11 +599,10 @@ static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
 // ---------------------------------------------------------------------------
 // Both mode: full pipeline (raw bytes → lexer → fused parser with parents)
 //
-// Input:  u64 BE num_tests; per test: u64 BE n + n raw bytes
-// Output: u64 BE num_tests; per test: u8 valid; if valid:
-//         u64 BE num_nodes; per node: u8 is_terminal, u64 BE parent,
-//         u64 BE id (terminal id for terminal nodes, else production id),
-//         u64 BE span start, u64 BE span end (0, 0 for nonterminal nodes)
+// Frame payload: n raw bytes.  Response record: u8 valid; if valid:
+// u64 num_nodes; per node: u8 is_terminal, index_t parent,
+// production_t id (terminal ids fit in production_t; see d_node_ids in
+// parser.cu), index_t start, index_t end (0, 0 for nonterminal nodes).
 // Same format as the generated C backend's combined mode.
 // ---------------------------------------------------------------------------
 
@@ -703,32 +657,8 @@ static bool both_one(const uint8_t* bytes, uint64_t n, BothNodes& nodes) {
     return valid;
 }
 
-// Test-format result: u8 valid; if valid: u64 BE num_nodes; per node:
-// u8 is_terminal, u64 BE parent, u64 BE id, u64 BE start, u64 BE end.
 template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
 static void run_one_both_test(const uint8_t* bytes, uint64_t n, FILE* out) {
-    BothNodes nodes;
-    if (!both_one<BLOCK_SIZE, ITEMS_PER_THREAD>(bytes, n, nodes)) {
-        fputc(0, out);
-        return;
-    }
-    fputc(1, out);
-    write_u64_be(out, (uint64_t)nodes.ids.size());
-    for (size_t i = 0; i < nodes.ids.size(); i++) {
-        fputc(nodes.is_term[i] ? 1 : 0, out);
-        write_u64_be(out, (uint64_t)nodes.parents[i]);
-        write_u64_be(out, (uint64_t)nodes.ids[i]);
-        write_u64_be(out, (uint64_t)nodes.starts[i]);
-        write_u64_be(out, (uint64_t)nodes.ends[i]);
-    }
-}
-
-// Native server result (host byte order): u8 valid; if valid: u64 num_nodes;
-// per node: u8 is_terminal, index_t parent, production_t id (terminal ids
-// fit in production_t; see d_node_ids in parser.cu), index_t start,
-// index_t end.
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
-static void run_one_both_test_native(const uint8_t* bytes, uint64_t n, FILE* out) {
     BothNodes nodes;
     if (!both_one<BLOCK_SIZE, ITEMS_PER_THREAD>(bytes, n, nodes)) {
         fputc(0, out);
@@ -756,12 +686,16 @@ static int both_batch_impl(FILE* in, FILE* out) {
     const uint8_t* p   = buf;
     const uint8_t* end = buf + buf_len;
 
-    uint64_t num_tests = decode_be64(p); p += 8;
-    write_u64_be(out, num_tests);
+    uint64_t num_tests = decode_le64(p); p += 8;
+    write_u64_le(out, num_tests);
 
     for (uint64_t t = 0; t < num_tests; t++) {
-        if (p + 8 > end) { free(buf); fprintf(stderr, "truncated\n"); return 1; }
-        uint64_t n = decode_be64(p); p += 8;
+        if (p + 16 > end) { free(buf); fprintf(stderr, "truncated\n"); return 1; }
+        uint64_t frame_len = decode_le64(p); p += 8;
+        uint64_t n = decode_le64(p); p += 8;
+        if (frame_len != 8 + n) {
+            free(buf); fprintf(stderr, "error: frame length mismatch\n"); return 1;
+        }
         if (n > (uint64_t)(end - p)) { free(buf); fprintf(stderr, "truncated\n"); return 1; }
         run_one_both_test<BLOCK_SIZE, ITEMS_PER_THREAD>(p, n, out);
         p += n;
@@ -771,29 +705,37 @@ static int both_batch_impl(FILE* in, FILE* out) {
     return 0;
 }
 
-// Server mode for the full pipeline: same raw-byte tests as batch mode,
-// one per length-prefixed frame, native protocol (host byte order).
+// Server mode for the full pipeline: counted batches (u64 num_tests, then
+// that many raw-byte frames) in a loop until EOF, flush after each response.
 // Frame: u64 frame_len; content: u64 n + n raw bytes.
 template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
 static int both_server_impl(FILE* in, FILE* out) {
     std::vector<uint8_t> frame;
     for (;;) {
-        uint64_t frame_len = read_u64_le(in);
+        uint64_t num_tests = read_u64_le(in);
         if (feof(in)) break;
-        if (frame_len == (uint64_t)-1 || frame_len < 8) {
-            fprintf(stderr, "error: bad frame length\n"); return 1;
+        if (num_tests == (uint64_t)-1) {
+            fprintf(stderr, "error: truncated input\n"); return 1;
         }
-        frame.resize(frame_len);
-        if (fread(frame.data(), 1, frame_len, in) != frame_len) {
-            fprintf(stderr, "error: truncated frame\n"); return 1;
-        }
-        uint64_t n;
-        memcpy(&n, frame.data(), sizeof n);
-        if (frame_len != 8 + n) {
-            fprintf(stderr, "error: frame length mismatch\n"); return 1;
-        }
-        run_one_both_test_native<BLOCK_SIZE, ITEMS_PER_THREAD>(frame.data() + 8, n, out);
+        write_u64_le(out, num_tests);
         fflush(out);
+        for (uint64_t t = 0; t < num_tests; t++) {
+            uint64_t frame_len = read_u64_le(in);
+            if (feof(in) || frame_len == (uint64_t)-1 || frame_len < 8) {
+                fprintf(stderr, "error: bad frame length\n"); return 1;
+            }
+            frame.resize(frame_len);
+            if (fread(frame.data(), 1, frame_len, in) != frame_len) {
+                fprintf(stderr, "error: truncated frame\n"); return 1;
+            }
+            uint64_t n;
+            memcpy(&n, frame.data(), sizeof n);
+            if (frame_len != 8 + n) {
+                fprintf(stderr, "error: frame length mismatch\n"); return 1;
+            }
+            run_one_both_test<BLOCK_SIZE, ITEMS_PER_THREAD>(frame.data() + 8, n, out);
+            fflush(out);
+        }
     }
     return 0;
 }
@@ -826,29 +768,16 @@ int main(int argc, char* argv[]) {
 #if defined(HAS_LEXER) && !defined(HAS_PARSER)
     // ---- Lex-only mode ----
     int ret;
-    if (a.server) {
+    if (a.server)
         ret = DISPATCH_BS_IPT(bs, ipt, lexer_server_impl, in, out);
-    } else if (a.raw_input) {
-        // --inputs: read framed format from alpacc test generate --lexer
+    else
         ret = DISPATCH_BS_IPT(bs, ipt, run_lexer_batch_impl, in, out, a.timeit);
-    } else {
-        // lexer_stream reads from stdin; redirect fd if user gave -i FILE
-        if (in != stdin) {
-            if (dup2(fileno(in), STDIN_FILENO) < 0) { perror("dup2"); return 1; }
-            fclose(in); in = stdin;
-        }
-        ret = DISPATCH_BS_IPT(bs, ipt, run_lexer_stream_impl, a.timeit);
-    }
     if (in  != stdin)  fclose(in);
     if (out != stdout) fclose(out);
     return ret;
 
 #elif defined(HAS_PARSER) && !defined(HAS_LEXER)
     // ---- Parse-only mode ----
-    if (a.raw_input) {
-        fprintf(stderr, "error: --raw-input requires both lexer and parser\n");
-        return 1;
-    }
     int ret;
     if (a.benchmark > 0)
         ret = parser_benchmark(in, a.warmup, a.benchmark);
@@ -862,8 +791,8 @@ int main(int argc, char* argv[]) {
 
 #elif defined(HAS_LEXER) && defined(HAS_PARSER)
     // ---- Both mode: raw bytes → lexer → parser → CST nodes (default) ----
-    // --server keeps the raw-byte test protocol (one test per frame);
-    // --benchmark uses the token-ID protocol of parse-only mode.
+    // --server loops counted raw-byte batches; --benchmark uses the
+    // token-ID protocol of parse-only mode.
     int ret;
     if (a.benchmark > 0)
         ret = parser_benchmark(in, a.warmup, a.benchmark);

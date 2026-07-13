@@ -488,7 +488,7 @@ mainTestCompare params = do
       putStrLn "Tests passes."
       pure ()
     GenParser -> do
-      () <- eitherToIO $ parserTestsCompare input_bytes expected_bytes result_bytes
+      () <- eitherToIO $ parserTestsCompare cfg input_bytes expected_bytes result_bytes
       putStrLn "Tests passes."
       pure ()
     GenBoth -> do

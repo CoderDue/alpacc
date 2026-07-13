@@ -19,7 +19,7 @@ $(DATA): json.alp
 	alpacc test generate json.alp --lexer --single-long --no-outputs --length $(INPUT_SIZE) -o data-$(INPUT_SIZE)
 
 $(DATA_RAW): $(DATA)
-	dd if=$(DATA) of=$(DATA_RAW) bs=16 skip=1
+	dd if=$(DATA) of=$(DATA_RAW) bs=24 skip=1
 
 lexer-rust: lexer.rs Cargo.toml Cargo.lock
 	cargo build --release
@@ -39,7 +39,7 @@ bench-rust: lexer-rust $(DATA_RAW)
 
 bench-cuda: lexer-cuda $(DATA)
 	@printf "$(H)Benchmarking CUDA (alpacc) implementation:$(E)\n"
-	-@./lexer-cuda --inputs --timeit < $(DATA) > /dev/null
+	-@./lexer-cuda --timeit < $(DATA) > /dev/null
 
 bench-futhark: json.fut $(DATA_RAW)
 	@printf "$(H)Benchmarking Futhark implementation:$(E)\n"
@@ -49,7 +49,7 @@ bench: lexer-cuda json.fut $(DATA)
 	@printf "$(H)JSON Lexer Benchmark:$(E)\n"
 
 	@printf "$(H)CUDA (alpacc) implementation:$(E)\n"
-	-@./lexer-cuda --inputs --timeit < $(DATA) > /dev/null
+	-@./lexer-cuda --timeit < $(DATA) > /dev/null
 
 	@printf "$(H)Futhark implementation:$(E)\n"
 	futhark bench --backend $(FUTHARK_BACKEND) json.fut

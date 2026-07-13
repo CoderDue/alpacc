@@ -6,8 +6,8 @@
 #   1. Generates test inputs with `alpacc test generate --length 4`.
 #   2. Runs the CUDA binary in batch mode across all six (BS, IPT) combinations
 #      and checks each against `alpacc test compare`.
-#   3. Runs the CUDA binary in server mode (one frame per test) and checks
-#      the results match the batch output.
+#   3. Runs the CUDA binary in server mode (a loop of counted batches) with
+#      the batch fed twice and checks it matches the batch output twice over.
 #   4. Verifies -i/-o file mode gives identical output to stdin/stdout mode.
 #
 # Requires nvcc and an NVIDIA GPU; not run in hosted CI (GPU-less).
@@ -52,15 +52,6 @@ echo "Using -q $q_value -k $k_value ${type_flag:-<combined>}"
 echo "nvcc arch: $arch"
 echo "Running with $parallel_jobs parallel jobs"
 
-# ---------------------------------------------------------------------------
-# Server-mode helper: tests/server_test.py builds native request frames
-# from the u64-BE test inputs (querying `binary --layout` for type sizes)
-# and transcodes the native responses back to the u64-BE test format so
-# they can be diffed against batch output.
-# ---------------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SERVERTEST_PY="$SCRIPT_DIR/server_test.py"
-
 temp_dir=$(mktemp -d)
 trap "rm -rf $temp_dir" EXIT
 
@@ -77,24 +68,11 @@ run_test() {
     local target=$6
     local done_file=$7
     local arch=$8
-    local servertest_py=$9
-    local type_flag="${10}"
+    local type_flag=$9
 
     local work_dir="$temp_dir/job_$job_id"
     mkdir -p "$work_dir"
     cd "$work_dir"
-
-    # Lexer-only binaries need --inputs to read framed test batches
-    # (their default mode is a raw byte stream). The server-helper kind
-    # selects the native frame format per mode.
-    local batch_flags=""
-    local frame_kind="both"
-    if [ "$type_flag" = "--lexer" ]; then
-        batch_flags="--inputs"
-        frame_kind="lexer"
-    elif [ "$type_flag" = "--parser" ]; then
-        frame_kind="parser"
-    fi
 
     local codegen_fails=0
 
@@ -143,7 +121,7 @@ ALPEOF
         # ---- Test 1: batch mode across all six (BS, IPT) combinations ----
         for bs in 128 256; do
             for ipt in 2 4 8; do
-                ./random --block-size "$bs" --items-per-thread "$ipt" $batch_flags \
+                ./random --block-size "$bs" --items-per-thread "$ipt" \
                     -i random.inputs -o "results_${bs}_${ipt}.bin" 2>/dev/null
 
                 if ! alpacc test compare random.alp random.inputs random.outputs \
@@ -169,11 +147,13 @@ ALPEOF
 
         if ! $all_ok; then return 1; fi
 
-        # ---- Test 2: server mode (default BS/IPT, native protocol) ----
-        if ! python3 "$servertest_py" ./random random.inputs server_results.bin "$frame_kind" 2>/dev/null; then
+        # ---- Test 2: server mode (default BS/IPT) ----
+        # Server mode loops counted batches: feeding the batch file twice
+        # must yield the batch output twice.
+        if ! cat random.inputs random.inputs | ./random --server > server_results.bin 2>/dev/null; then
             echo "===== FAIL: server mode crashed, job $job_id ====="
             all_ok=false
-        elif ! diff -q results_128_2.bin server_results.bin &>/dev/null; then
+        elif ! cat results_128_2.bin results_128_2.bin | cmp -s - server_results.bin; then
             echo "===== FAIL: server mode output differs from batch, job $job_id ====="
             all_ok=false
         fi
@@ -201,7 +181,7 @@ ALPEOF
 export -f run_test
 
 seq 1 $target | parallel --no-notice -j "$parallel_jobs" --halt soon,fail=1 --line-buffer \
-    "run_test {} $q_value $k_value $temp_dir $counter_file $target $done_file $arch $(printf '%q' "$SERVERTEST_PY") '$type_flag'"
+    "run_test {} $q_value $k_value $temp_dir $counter_file $target $done_file $arch '$type_flag'"
 
 final_count=$(cat "$counter_file")
 if [ "$final_count" -ge "$target" ]; then

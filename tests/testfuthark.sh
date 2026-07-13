@@ -18,6 +18,8 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     exit 0
 fi
 
+export PATH="$HOME/bin:$PATH"
+
 # Get arguments with validation
 q_value="${1:-1}"
 k_value="${2:-1}"

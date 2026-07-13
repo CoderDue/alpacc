@@ -4,7 +4,8 @@
 # It shows the intended embedding pattern:
 #   1. Run `<binary> --layout` once to learn the native type sizes.
 #   2. Start `<binary> --server` and keep it running.
-#   3. Per request: write one frame, flush, read exactly one response.
+#   3. Per request: write one counted batch (u64 count=1 + one frame),
+#      flush, read the echoed count and exactly one response.
 #
 # All integers are in host byte order (little-endian).
 #
@@ -35,10 +36,10 @@ def u64(v):
 
 
 def send_request(proc, payload_items, n):
-    """Write one request frame: u64 frame_len, u64 n, payload."""
+    """Write one counted batch: u64 count=1, u64 frame_len, u64 n, payload."""
     payload = b"".join(payload_items)
     content = u64(n) + payload
-    proc.stdin.write(u64(len(content)) + content)
+    proc.stdin.write(u64(1) + u64(len(content)) + content)
     proc.stdin.flush()
 
 
@@ -58,6 +59,10 @@ def read_response(proc, kind, layout):
     terminal = layout["terminal_t"]
     production = layout.get("production_t")
     index = layout.get("index_t")
+
+    num_responses = read_int(proc.stdout, 8)
+    if num_responses != 1:
+        raise ValueError(f"expected an echoed count of 1, got {num_responses}")
 
     valid = read_exact(proc.stdout, 1)[0]
     if valid == 0:

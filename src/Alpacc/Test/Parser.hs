@@ -10,19 +10,20 @@ import Alpacc.Encode
 import Alpacc.Grammar
 import Alpacc.LL (generateRandomDerivation, generateRandomDerivationLazy)
 import Alpacc.LLP
-import Alpacc.Test.Lexer (TestMode (..), randomSeed)
+import Alpacc.Test.Lexer (TestMode (..), decodeWith, getUInt, putUInt, randomSeed, uintBytes)
+import Alpacc.Types
 import Alpacc.Util
 import Control.Monad
-import Data.Bifunctor
-import Data.Binary
-import Data.ByteString qualified as ByteString
+import Data.Binary.Get (Get, getWord64le, getWord8)
+import Data.Binary.Put (Put, putWord64le, putWord8, runPut)
 import Data.ByteString.Internal
 import Data.ByteString.Lazy qualified as LBS
 import Data.List (zip4)
 import Data.Maybe
 import Data.Text (Text)
 import Data.Text qualified as Text
-import System.IO (Handle, SeekMode (..), hSeek, hTell)
+import Data.Word (Word64)
+import System.IO (Handle, SeekMode (..), hSeek)
 import System.Random
 
 newtype Output
@@ -41,52 +42,56 @@ newtype Input = Input [Word64] deriving (Show)
 
 newtype Inputs = Inputs [Input] deriving (Show)
 
-instance Binary Output where
-  put (Output Nothing) =
-    put (False :: Bool)
-  put (Output (Just prods)) = do
-    put (True :: Bool)
-    put (fromIntegral $ length prods :: Word64)
-    mapM_ put prods
+putOutput :: UInt -> Output -> Put
+putOutput _ (Output Nothing) = putWord8 0
+putOutput pw (Output (Just prods)) = do
+  putWord8 1
+  putWord64le (fromIntegral $ length prods)
+  mapM_ (putUInt pw) prods
 
-  get = do
-    is_valid <- get :: Get Bool
-    if is_valid
-      then do
-        num_prods <- get :: Get Word64
-        prods <- mapM (const (get :: Get Word64)) [1 .. num_prods]
-        pure $ Output $ Just prods
-      else pure $ Output Nothing
+getOutput :: UInt -> Get Output
+getOutput pw = do
+  is_valid <- getWord8
+  if is_valid == 1
+    then do
+      num_prods <- getWord64le
+      Output . Just <$> replicateM (fromIntegral num_prods) (getUInt pw)
+    else pure $ Output Nothing
 
-instance Binary Input where
-  put (Input tokens) = do
-    put (fromIntegral $ length tokens :: Word64)
-    mapM_ put tokens
+putInput :: UInt -> Input -> Put
+putInput tw (Input tokens) = do
+  let n = fromIntegral (length tokens) :: Word64
+  putWord64le (8 + n * uintBytes tw)
+  putWord64le n
+  mapM_ (putUInt tw) tokens
 
-  get = do
-    i <- get :: Get Word64
-    tokens <- mapM (const get) [1 .. i]
-    pure $ Input tokens
+getInput :: UInt -> Get Input
+getInput tw = do
+  frame_len <- getWord64le
+  n <- getWord64le
+  when (frame_len /= 8 + n * uintBytes tw) $
+    fail "Frame length does not match the payload size."
+  Input <$> replicateM (fromIntegral n) (getUInt tw)
 
-instance Binary Inputs where
-  put (Inputs inps) = do
-    put (fromIntegral $ length inps :: Word64)
-    mapM_ put inps
+putInputs :: UInt -> Inputs -> Put
+putInputs tw (Inputs inps) = do
+  putWord64le (fromIntegral $ length inps)
+  mapM_ (putInput tw) inps
 
-  get = do
-    i <- get :: Get Word64
-    inps <- mapM (const get) [1 .. i]
-    pure $ Inputs inps
+getInputs :: UInt -> Get Inputs
+getInputs tw = do
+  i <- getWord64le
+  Inputs <$> replicateM (fromIntegral i) (getInput tw)
 
-instance Binary Outputs where
-  put (Outputs results) = do
-    put (fromIntegral $ length results :: Word64)
-    mapM_ put results
+putOutputs :: UInt -> Outputs -> Put
+putOutputs pw (Outputs results) = do
+  putWord64le (fromIntegral $ length results)
+  mapM_ (putOutput pw) results
 
-  get = do
-    i <- get :: Get Word64
-    results <- mapM (const get) [1 .. i]
-    pure $ Outputs results
+getOutputs :: UInt -> Get Outputs
+getOutputs pw = do
+  i <- getWord64le
+  Outputs <$> replicateM (fromIntegral i) (getOutput pw)
 
 -- | Generate a parseable token sequence using derivations from the
 -- grammar.  Start with the start symbol and randomly choose
@@ -110,7 +115,9 @@ parserTests mode cfg n noOutputs = do
   grammar <- cfgToGrammar cfg
   table <- llpParserTableWithStarts q k $ getGrammar grammar
   let s_encoder = encodeSymbols (T "ignore") grammar
-      p x =
+  tw <- symbolTerminalIntType s_encoder
+  pw <- productionIntType grammar
+  let p x =
         x /= AugmentedTerminal Unused
           && x /= LeftTurnstile
           && x /= RightTurnstile
@@ -134,8 +141,8 @@ parserTests mode cfg n noOutputs = do
               )
       parse = llpParse q k table
   pure
-    ( encode inputs,
-      encode outputs
+    ( runPut $ putInputs tw inputs,
+      runPut $ putOutputs pw outputs
     )
   where
     unaug (AugmentedTerminal t) = Just t
@@ -160,59 +167,64 @@ parserTestsSingleLong cfg n h mOutH = do
         Left e -> pure (Left e)
         Right table -> do
           let s_encoder = encodeSymbols (T "ignore") grammar
-              encode' x = fromJust $ Terminal x `symbolLookup` s_encoder
-              gen = mkStdGen randomSeed
-              -- Stream-write phase: consume the lazy derivation list one token at a
-              -- time, writing each to h.  GHC reclaims list cells as we go, so the
-              -- live set is O(1).
-              (_, rawLazy) = generateRandomDerivationLazy gen n (getGrammar grammar)
-              lazySeq = mapMaybe unaug rawLazy
-          LBS.hPut h (encode (1 :: Word64))
-          tokenCountPos <- hTell h
-          LBS.hPut h (encode (0 :: Word64))
-          totalToks <- foldM (\(!cnt) t -> do
-                let w = fromIntegral (encode' (AugmentedTerminal t)) :: Word64
-                LBS.hPut h (encode w)
-                pure (cnt + 1)) (0 :: Word64) lazySeq
-          hSeek h AbsoluteSeek tokenCountPos
-          LBS.hPut h (encode totalToks)
-          case mOutH of
-            Nothing -> pure (Right ())
-            Just outH -> do
-              -- Parse phase: re-derive with same seed (same sequence) for llpParse.
-              let (_, rawSeq) = generateRandomDerivation gen n (getGrammar grammar)
-                  singleSeq = mapMaybe unaug rawSeq
-                  mProds = fmap (fmap fromIntegral) $ llpParse q k table singleSeq
-              case mProds of
-                Nothing -> do
-                  LBS.hPut outH (encode (1 :: Word64) <> encode False)
-                  pure (Right ())
-                Just prods -> do
-                  LBS.hPut outH $ encode (1 :: Word64) <> encode True
-                              <> encode (fromIntegral (length prods) :: Word64)
-                  mapM_ (\p -> LBS.hPut outH (encode (p :: Word64))) prods
-                  pure (Right ())
+          case (,) <$> symbolTerminalIntType s_encoder <*> productionIntType grammar of
+            Left e -> pure (Left e)
+            Right (tw, pw) -> do
+              let encode' x = fromJust $ Terminal x `symbolLookup` s_encoder
+                  gen = mkStdGen randomSeed
+                  -- Stream-write phase: consume the lazy derivation list one token at a
+                  -- time, writing each to h.  GHC reclaims list cells as we go, so the
+                  -- live set is O(1).
+                  (_, rawLazy) = generateRandomDerivationLazy gen n (getGrammar grammar)
+                  lazySeq = mapMaybe unaug rawLazy
+              -- num_tests, then frame_len/n placeholders patched below.
+              LBS.hPut h (runPut $ putWord64le 1 >> putWord64le 0 >> putWord64le 0)
+              totalToks <- foldM (\(!cnt) t -> do
+                    let w = fromIntegral (encode' (AugmentedTerminal t)) :: Word64
+                    LBS.hPut h (runPut $ putUInt tw w)
+                    pure (cnt + 1)) (0 :: Word64) lazySeq
+              hSeek h AbsoluteSeek 8
+              LBS.hPut h $ runPut $ do
+                putWord64le (8 + totalToks * uintBytes tw)
+                putWord64le totalToks
+              case mOutH of
+                Nothing -> pure (Right ())
+                Just outH -> do
+                  -- Parse phase: re-derive with same seed (same sequence) for llpParse.
+                  let (_, rawSeq) = generateRandomDerivation gen n (getGrammar grammar)
+                      singleSeq = mapMaybe unaug rawSeq
+                      mProds = fmap (fmap fromIntegral) $ llpParse q k table singleSeq
+                  case mProds of
+                    Nothing -> do
+                      LBS.hPut outH (runPut $ putWord64le 1 >> putWord8 0)
+                      pure (Right ())
+                    Just prods -> do
+                      LBS.hPut outH $ runPut $ do
+                        putWord64le 1
+                        putWord8 1
+                        putWord64le (fromIntegral (length prods))
+                      mapM_ (\p -> LBS.hPut outH (runPut $ putUInt pw p)) prods
+                      pure (Right ())
   where
     q = paramsLookback $ cfgParams cfg
     k = paramsLookahead $ cfgParams cfg
     unaug (AugmentedTerminal t) = Just t
     unaug _ = Nothing
 
-parserTestsCompare :: ByteString -> ByteString -> ByteString -> Either Text ()
-parserTestsCompare input expected result = do
-  Inputs inp <- dec "Error: Could not parse input file." input
-  Outputs ex <- dec "Error: Could not parse expected output file." expected
-  Outputs res <- dec "Error: Could not parse result output file." result
+parserTestsCompare :: CFG -> ByteString -> ByteString -> ByteString -> Either Text ()
+parserTestsCompare cfg input expected result = do
+  grammar <- cfgToGrammar cfg
+  let s_encoder = encodeSymbols (T "ignore") grammar
+  tw <- symbolTerminalIntType s_encoder
+  pw <- productionIntType grammar
+  Inputs inp <- decodeWith "Error: Could not parse input file." (getInputs tw) input
+  Outputs ex <- decodeWith "Error: Could not parse expected output file." (getOutputs pw) expected
+  Outputs res <- decodeWith "Error: Could not parse result output file." (getOutputs pw) result
   failwith (length inp == length ex) "Error: Input and expected output file do not have the same number of tests."
   failwith (length inp == length res) "Error: Input and result output file do not have the same number of tests."
 
   mapM_ compareTest $ zip4 [0 :: Integer ..] inp ex res
   where
-    dec str =
-      bimap (const str) (\(_, _, a) -> a)
-        . decodeOrFail
-        . ByteString.fromStrict
-
     failwith b s = unless b (Left s)
 
     showOutput Nothing = "Unable to parse."

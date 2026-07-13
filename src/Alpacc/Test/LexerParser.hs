@@ -14,15 +14,15 @@ import Alpacc.LLP
 import Alpacc.Lexer.DFA
 import Alpacc.Lexer.FSA
 import Alpacc.Lexer.RegularExpression
-import Alpacc.Test.Lexer (TestMode (..), randomSeed)
+import Alpacc.Test.Lexer (TestMode (..), decodeWith, getUInt, putUInt, randomSeed)
+import Alpacc.Types
 import Alpacc.Util
 import Codec.Binary.UTF8.String (encodeChar)
 import Control.Monad
 import Data.IORef
 import Data.Bifunctor
-import Data.Binary
-import Data.Binary.Get (getByteString)
-import Data.Binary.Put (putByteString, runPut)
+import Data.Binary.Get (Get, getByteString, getWord64le, getWord8)
+import Data.Binary.Put (Put, putByteString, putWord64le, putWord8, runPut)
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Internal
 import Data.ByteString.Lazy qualified as LBS
@@ -41,6 +41,7 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
+import Data.Word (Word64, Word8)
 import System.Random
 
 newtype Output
@@ -59,82 +60,91 @@ newtype Input = Input ByteString deriving (Show)
 
 newtype Inputs = Inputs [Input] deriving (Show)
 
-instance Binary Output where
-  put (Output Nothing) =
-    put (False :: Bool)
-  put (Output (Just ts)) = do
-    put (True :: Bool)
-    put (fromIntegral $ length ts :: Word64)
-    mapM_ putNode ts
-    where
-      putNode (FlatProduction p t) = do
-        put (0 :: Word8)
-        put p
-        put t
-        put (0 :: Word64)
-        put (0 :: Word64)
-      putNode (FlatTerminal p (i, j) t) = do
-        put (1 :: Word8)
-        put p
-        put t
-        put i
-        put j
+-- | Wire order of a CST node: node type (u8), parent (index_t), id
+-- (production_t; terminal ids fit in production_t), start, end (index_t;
+-- zero for production nodes).
+putFlatNode :: UInt -> FlatNode Word64 (Word64, Word64) Word64 -> Put
+putFlatNode pw (FlatProduction p t) = do
+  putWord8 0
+  putWord64le p
+  putUInt pw t
+  putWord64le 0
+  putWord64le 0
+putFlatNode pw (FlatTerminal p (i, j) t) = do
+  putWord8 1
+  putWord64le p
+  putUInt pw t
+  putWord64le i
+  putWord64le j
 
-  get = do
-    is_valid <- get :: Get Bool
-    if is_valid
-      then do
-        num_tokens <- get :: Get Word64
-        ns <- mapM (const getNode) [1 .. num_tokens]
-        pure $ Output $ Just ns
-      else pure $ Output Nothing
-    where
-      getNode = do
-        node_type <- get :: Get Word8
-        case node_type of
-          0 -> do
-            p <- get :: Get Word64
-            t <- get :: Get Word64
-            0 <- get :: Get Word64
-            0 <- get :: Get Word64
-            pure $ FlatProduction p t
-          1 -> do
-            p <- get :: Get Word64
-            t <- get :: Get Word64
-            i <- get :: Get Word64
-            j <- get :: Get Word64
-            pure $ FlatTerminal p (i, j) t
-          _ -> fail "Error: Could not parse input due to invalid CST node type."
+getFlatNode :: UInt -> Get (FlatNode Word64 (Word64, Word64) Word64)
+getFlatNode pw = do
+  node_type <- getWord8
+  case node_type of
+    0 -> do
+      p <- getWord64le
+      t <- getUInt pw
+      0 <- getWord64le
+      0 <- getWord64le
+      pure $ FlatProduction p t
+    1 -> do
+      p <- getWord64le
+      t <- getUInt pw
+      i <- getWord64le
+      j <- getWord64le
+      pure $ FlatTerminal p (i, j) t
+    _ -> fail "Error: Could not parse input due to invalid CST node type."
 
-instance Binary Input where
-  put (Input str) = do
-    put (fromIntegral $ ByteString.length str :: Word64)
-    putByteString str
+putOutput :: UInt -> Output -> Put
+putOutput _ (Output Nothing) = putWord8 0
+putOutput pw (Output (Just ts)) = do
+  putWord8 1
+  putWord64le (fromIntegral $ length ts)
+  mapM_ (putFlatNode pw) ts
 
-  get = do
-    i <- get :: Get Word64
-    str <- getByteString $ fromIntegral i
-    pure $ Input str
+getOutput :: UInt -> Get Output
+getOutput pw = do
+  is_valid <- getWord8
+  if is_valid == 1
+    then do
+      num_nodes <- getWord64le
+      Output . Just <$> replicateM (fromIntegral num_nodes) (getFlatNode pw)
+    else pure $ Output Nothing
 
-instance Binary Inputs where
-  put (Inputs inps) = do
-    put (fromIntegral $ length inps :: Word64)
-    mapM_ put inps
+putInput :: Input -> Put
+putInput (Input str) = do
+  let n = fromIntegral (ByteString.length str) :: Word64
+  putWord64le (8 + n)
+  putWord64le n
+  putByteString str
 
-  get = do
-    i <- get :: Get Word64
-    inps <- mapM (const get) [1 .. i]
-    pure $ Inputs inps
+getInput :: Get Input
+getInput = do
+  frame_len <- getWord64le
+  n <- getWord64le
+  when (frame_len /= 8 + n) $
+    fail "Frame length does not match the payload size."
+  Input <$> getByteString (fromIntegral n)
 
-instance Binary Outputs where
-  put (Outputs results) = do
-    put (fromIntegral $ length results :: Word64)
-    mapM_ put results
+putInputs :: Inputs -> Put
+putInputs (Inputs inps) = do
+  putWord64le (fromIntegral $ length inps)
+  mapM_ putInput inps
 
-  get = do
-    i <- get :: Get Word64
-    results <- mapM (const get) [1 .. i]
-    pure $ Outputs results
+getInputs :: Get Inputs
+getInputs = do
+  i <- getWord64le
+  Inputs <$> replicateM (fromIntegral i) getInput
+
+putOutputs :: UInt -> Outputs -> Put
+putOutputs pw (Outputs results) = do
+  putWord64le (fromIntegral $ length results)
+  mapM_ (putOutput pw) results
+
+getOutputs :: UInt -> Get Outputs
+getOutputs pw = do
+  i <- getWord64le
+  Outputs <$> replicateM (fromIntegral i) (getOutput pw)
 
 parse :: CFG -> Int -> Int -> Text -> Either Text (Maybe [FlatNode Word64 (Word64, Word64) Word64])
 parse cfg q k str = do
@@ -471,6 +481,7 @@ lexerParserTests mode cfg n noOutputs = do
   spec <- cfgToDFALexerSpec cfg
   grammar <- cfgToGrammar cfg
   table <- llpParserTableWithStarts q k $ getGrammar grammar
+  pw <- productionIntType grammar
   let regex_map = regexMap spec
       ignore = T "ignore"
       encoder = fromSymbolToTerminalEncoder $ encodeSymbols ignore grammar
@@ -482,7 +493,7 @@ lexerParserTests mode cfg n noOutputs = do
       let comb = listProducts n $ Set.toList alpha
           inp  = toInputs comb
           out  = if noOutputs then Outputs [] else toOutputs q k encoder dfa maybe_ignore (getGrammar grammar) table comb
-      pure (encode inp, encode out)
+      pure (runPut $ putInputs inp, runPut $ putOutputs pw out)
     SingleLong ->
       Left "SingleLong mode must be handled via lexerParserTestsSingleLong"
   where
@@ -515,52 +526,52 @@ lexerParserTestsSingleLong cfg n h mOutH = do
       Left e -> pure (Left e)
       Right grammar -> case llpParserTableWithStartsHomomorphisms q k $ getGrammar grammar of
         Left e -> pure (Left e)
-        Right homoTable -> do
-          let regex_map = regexMap spec
-              ignore = T "ignore"
-              encoder = fromSymbolToTerminalEncoder $ encodeSymbols ignore grammar
-              dfa = lexerDFA (0 :: Integer) $ mapSymbols unBytes spec
-              alpha = alphabet $ fsa dfa
-              maybe_ignore = if ignore `Map.member` regex_map then Just ignore else Nothing
-          -- Write placeholder header, then payload; patch payloadLen afterward.
-          LBS.hPut h (encode (1 :: Word64) <> encode (0 :: Word64))
-          payloadLen <- generateSingleLongLexerParserInput n alpha dfa (getGrammar grammar) h
-          hSeek h AbsoluteSeek 8
-          LBS.hPut h (encode (fromIntegral payloadLen :: Word64))
-          case mOutH of
-            Nothing -> pure (Right ())
-            Just outH -> do
-              -- Read back the payload as a compact strict ByteString (no [Word8] list).
-              hSeek h AbsoluteSeek 16
-              payload <- ByteString.hGet h payloadLen
-              let encTok t = fromIntegral (fromJust (terminalLookup t encoder)) :: Word64
-              LBS.hPut outH (runPut $ put (1 :: Word64) >> put True)
-              nodeCountPos <- hTell outH
-              LBS.hPut outH (runPut $ put (0 :: Word64))
-              -- Tokenize and parse in one pass: tokenizeWithBS pushes each lexeme
-              -- into the push-mode parser step function; no intermediate token list.
-              let emitNode node = LBS.hPut outH (runPut (putFlatNode (fmap encTok node)))
-              (stepFn, finalize) <- llpParseDirectPush (getGrammar grammar) q k homoTable emitNode
-              let pushTok (Lexeme t m) = stepFn (AugmentedTerminal (Used t), m)
-              mLex <- tokenizeWithBS dfa maybe_ignore payload pushTok
-              mCount <- case mLex of
-                Nothing -> pure Nothing
-                Just () -> finalize
-              case mCount of
-                Nothing -> pure (Left "Error: generated combined input failed to lex or parse.")
-                Just nodeCount -> do
-                  hSeek outH AbsoluteSeek nodeCountPos
-                  LBS.hPut outH (runPut $ put nodeCount)
-                  pure (Right ())
-  where
-    putFlatNode (FlatProduction p t) =
-      put (0 :: Word8) >> put p >> put t >> put (0 :: Word64) >> put (0 :: Word64)
-    putFlatNode (FlatTerminal p (i, j) t) =
-      put (1 :: Word8) >> put p >> put t >> put i >> put j
+        Right homoTable -> case productionIntType grammar of
+          Left e -> pure (Left e)
+          Right pw -> do
+            let regex_map = regexMap spec
+                ignore = T "ignore"
+                encoder = fromSymbolToTerminalEncoder $ encodeSymbols ignore grammar
+                dfa = lexerDFA (0 :: Integer) $ mapSymbols unBytes spec
+                alpha = alphabet $ fsa dfa
+                maybe_ignore = if ignore `Map.member` regex_map then Just ignore else Nothing
+            -- num_tests, then frame_len/n placeholders patched below.
+            LBS.hPut h (runPut $ putWord64le 1 >> putWord64le 0 >> putWord64le 0)
+            payloadLen <- generateSingleLongLexerParserInput n alpha dfa (getGrammar grammar) h
+            hSeek h AbsoluteSeek 8
+            LBS.hPut h $ runPut $ do
+              putWord64le (8 + fromIntegral payloadLen)
+              putWord64le (fromIntegral payloadLen)
+            case mOutH of
+              Nothing -> pure (Right ())
+              Just outH -> do
+                -- Read back the payload as a compact strict ByteString (no [Word8] list).
+                hSeek h AbsoluteSeek 24
+                payload <- ByteString.hGet h payloadLen
+                let encTok t = fromIntegral (fromJust (terminalLookup t encoder)) :: Word64
+                LBS.hPut outH (runPut $ putWord64le 1 >> putWord8 1)
+                nodeCountPos <- hTell outH
+                LBS.hPut outH (runPut $ putWord64le 0)
+                -- Tokenize and parse in one pass: tokenizeWithBS pushes each lexeme
+                -- into the push-mode parser step function; no intermediate token list.
+                let emitNode node = LBS.hPut outH (runPut (putFlatNode pw (fmap encTok node)))
+                (stepFn, finalize) <- llpParseDirectPush (getGrammar grammar) q k homoTable emitNode
+                let pushTok (Lexeme t m) = stepFn (AugmentedTerminal (Used t), m)
+                mLex <- tokenizeWithBS dfa maybe_ignore payload pushTok
+                mCount <- case mLex of
+                  Nothing -> pure Nothing
+                  Just () -> finalize
+                case mCount of
+                  Nothing -> pure (Left "Error: generated combined input failed to lex or parse.")
+                  Just nodeCount -> do
+                    hSeek outH AbsoluteSeek nodeCountPos
+                    LBS.hPut outH (runPut $ putWord64le nodeCount)
+                    pure (Right ())
 
 lexerParserTestsCompare :: CFG -> ByteString -> ByteString -> ByteString -> Either Text ()
 lexerParserTestsCompare cfg input expected result = do
   grammar <- cfgToGrammar cfg
+  pw <- productionIntType grammar
   let ignore = T "ignore"
       encoder = fromSymbolToTerminalEncoder $ encodeSymbols ignore grammar
       int_to_token =
@@ -568,19 +579,14 @@ lexerParserTestsCompare cfg input expected result = do
           [ (fromIntegral i, t)
           | (i, Used t) <- zip [0 :: Integer ..] (toTerminals encoder)
           ]
-  Inputs inp <- dec "Error: Could not parse input file." input
-  Outputs ex <- dec "Error: Could not parse expected output file." expected
-  Outputs res <- dec "Error: Could not parse result output file." result
+  Inputs inp <- decodeWith "Error: Could not parse input file." getInputs input
+  Outputs ex <- decodeWith "Error: Could not parse expected output file." (getOutputs pw) expected
+  Outputs res <- decodeWith "Error: Could not parse result output file." (getOutputs pw) result
   failwith (length inp == length ex) "Error: Input and expected output file do not have the same number of tests."
   failwith (length inp == length res) "Error: Input and result output file do not have the same number of tests."
 
   mapM_ (compareTest int_to_token) $ zip4 [0 :: Integer ..] inp ex res
   where
-    dec str =
-      bimap (const str) (\(_, _, a) -> a)
-        . decodeOrFail
-        . ByteString.fromStrict
-
     failwith b s = unless b (Left s)
 
     showNode _ p@(FlatProduction _ _) = pure $ Text.pack $ show p

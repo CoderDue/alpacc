@@ -1,32 +1,36 @@
 -- Start of test.fut
 --
--- The generic parallel lexer tester, expressed as a parameterised
--- module.
+-- The generic parallel test harness, expressed as parameterised
+-- modules.
+--
+-- Wire format (native little-endian batch protocol, see
+-- docs/wire-protocols.md):
+--   input : u64 num_tests, then per test a request frame:
+--           u64 frame_len, u64 n, payload
+--           (payload: n raw bytes for lexer/combined;
+--            n × sizeof(terminal) token ids for parser)
+--   output: u64 num_tests, then per test a response record:
+--           u8 valid; if valid: u64 count, then native-width fields.
+-- All integers are little-endian; token/production ids use the
+-- grammar's native widths, spans and parents are 8 bytes.
 
 import "lib/github.com/diku-dk/containers/core/opt"
 
 #[inline]
-def encode_u64 (a: u64) : [8]u8 =
-  [ u8.u64 (a >> 56)
-  , u8.u64 (a >> 48)
-  , u8.u64 (a >> 40)
-  , u8.u64 (a >> 32)
-  , u8.u64 (a >> 24)
-  , u8.u64 (a >> 16)
-  , u8.u64 (a >> 8)
-  , u8.u64 (a >> 0)
-  ]
+def encode_le (num_bytes: i64) (v: u64) : [num_bytes]u8 =
+  tabulate num_bytes (\i -> u8.u64 (v >> (8 * u64.i64 i)))
 
 #[inline]
-def decode_u64 (a: [8]u8) : u64 =
-  (u64.u8 a[0] << 56)
-  | (u64.u8 a[1] << 48)
-  | (u64.u8 a[2] << 40)
-  | (u64.u8 a[3] << 32)
-  | (u64.u8 a[4] << 24)
-  | (u64.u8 a[5] << 16)
-  | (u64.u8 a[6] << 8)
-  | (u64.u8 a[7] << 0)
+def decode_le [n] (bytes: [n]u8) : u64 =
+  loop acc = 0u64
+  for i < n do
+    acc | (u64.u8 bytes[i] << (8 * u64.i64 i))
+
+#[inline]
+def encode_u64 (a: u64) : [8]u8 = encode_le 8 a
+
+#[inline]
+def decode_u64 (a: [8]u8) : u64 = decode_le a
 
 module lexer_test
   (L: {
@@ -36,11 +40,14 @@ module lexer_test
   (T: integral with t = L.terminal_int) = {
   type terminal = L.terminal_int
 
+  def terminal_bytes : i64 = i64.i32 T.num_bits / 8
+  def lexeme_bytes : i64 = terminal_bytes + 16
+
   #[inline]
-  def encode_terminal ((t, (i, j)): (terminal, (i64, i64))) : [24]u8 =
-    sized 24 (encode_u64 (T.to_i64 t |> u64.i64)
-              ++ encode_u64 (u64.i64 i)
-              ++ encode_u64 (u64.i64 j))
+  def encode_terminal ((t, (i, j)): (terminal, (i64, i64))) : [lexeme_bytes]u8 =
+    sized lexeme_bytes (encode_le terminal_bytes (u64.i64 (T.to_i64 t))
+                        ++ encode_u64 (u64.i64 i)
+                        ++ encode_u64 (u64.i64 j))
 
   #[inline]
   def encode_terminals [n] (ts: opt ([n](terminal, (i64, i64)))) : []u8 =
@@ -57,10 +64,12 @@ module lexer_test
     let (a, _, size) =
       loop (result, inputs, size) = copy (num, drop 8 bytes, length num)
       for _i < u64.to_i64 num_tests do
-        let input_size = u64.to_i64 (decode_u64 (take 8 inputs))
+        -- Skip the u64 frame_len; the u64 n that follows determines the size.
         let inputs' = drop 8 inputs
-        let input = take input_size inputs'
-        let inputs'' = drop input_size inputs'
+        let input_size = u64.to_i64 (decode_u64 (take 8 inputs'))
+        let inputs'' = drop 8 inputs'
+        let input = take input_size inputs''
+        let inputs''' = drop input_size inputs''
         let output = L.lex_int chunk_size input |> encode_terminals
         let new_size = size + length output
         let result =
@@ -68,7 +77,7 @@ module lexer_test
           then scatter (replicate (2 * new_size) 0) (indices result) result
           else result
         let result = scatter result (map (+ size) (indices output)) output
-        in (result, inputs'', new_size)
+        in (result, inputs''', new_size)
     in take size a
 }
 
@@ -83,13 +92,16 @@ module parser_test
   type terminal = P.terminal_int
   type production = P.production_int
 
+  def terminal_bytes : i64 = i64.i32 T.num_bits / 8
+  def production_bytes : i64 = i64.i32 Q.num_bits / 8
+
   #[inline]
   def encode_productions [n] (ts: opt ([n]production)) : []u8 =
     match ts
     case #some ts' ->
       [u8.bool true]
       ++ encode_u64 (u64.i64 n)
-      ++ flatten (map (encode_u64 <-< u64.i64 <-< Q.to_i64) ts')
+      ++ flatten (map (encode_le production_bytes <-< u64.i64 <-< Q.to_i64) ts')
     case #none -> [u8.bool false]
 
   def test [n] (bytes: [n]u8) : []u8 =
@@ -98,13 +110,15 @@ module parser_test
     let (a, _, size) =
       loop (result, inputs, size) = copy (num, drop 8 bytes, length num)
       for _i < u64.to_i64 num_tests do
-        let input_size = u64.to_i64 (decode_u64 (take 8 inputs))
+        -- Skip the u64 frame_len; the u64 n that follows determines the size.
         let inputs' = drop 8 inputs
+        let input_size = u64.to_i64 (decode_u64 (take 8 inputs'))
+        let inputs'' = drop 8 inputs'
+        let payload = take (input_size * terminal_bytes) inputs''
         let input =
-          take (input_size * 8) inputs'
-          |> unflatten
-          |> map (T.u64 <-< decode_u64)
-        let inputs'' = drop (input_size * 8) inputs'
+          tabulate input_size
+                   (\q -> T.u64 (decode_le payload[q * terminal_bytes:(q + 1) * terminal_bytes]))
+        let inputs''' = drop (input_size * terminal_bytes) inputs''
         let output =
           P.pre_productions_int input
           |> encode_productions
@@ -114,7 +128,7 @@ module parser_test
           then scatter (replicate (2 * new_size) 0) (indices result) result
           else result
         let result = scatter result (map (+ size) (indices output)) output
-        in (result, inputs'', new_size)
+        in (result, inputs''', new_size)
     in take size a
 }
 
@@ -131,21 +145,27 @@ module lexer_parser_test
   type production = P.production_int
   type node 't 'p = P.node t p
 
+  def production_bytes : i64 = i64.i32 Q.num_bits / 8
+  def node_bytes : i64 = 25 + production_bytes
+
+  -- Node ids use the production width: terminal ids always fit in
+  -- production_int (the invariant the backends rely on).
   #[inline]
-  def encode_node (p: i64) (n: node terminal production) : []u8 =
-    match n
-    case #production t ->
-      [0u8]
-      ++ ((encode_u64 <-< u64.i64) p)
-      ++ ((encode_u64 <-< u64.i64 <-< Q.to_i64) t)
-      ++ encode_u64 0
-      ++ encode_u64 0
-    case #terminal t (i, j) ->
-      [1u8]
-      ++ ((encode_u64 <-< u64.i64) p)
-      ++ ((encode_u64 <-< u64.i64 <-< T.to_i64) t)
-      ++ ((encode_u64 <-< u64.i64) i)
-      ++ ((encode_u64 <-< u64.i64) j)
+  def encode_node (p: i64) (n: node terminal production) : [node_bytes]u8 =
+    sized node_bytes
+          (match n
+           case #production t ->
+             [0u8]
+             ++ encode_u64 (u64.i64 p)
+             ++ encode_le production_bytes (u64.i64 (Q.to_i64 t))
+             ++ encode_u64 0
+             ++ encode_u64 0
+           case #terminal t (i, j) ->
+             [1u8]
+             ++ encode_u64 (u64.i64 p)
+             ++ encode_le production_bytes (u64.i64 (T.to_i64 t))
+             ++ encode_u64 (u64.i64 i)
+             ++ encode_u64 (u64.i64 j))
 
   #[inline]
   def encode_tree [n] (ns: opt ([n](i64, P.node terminal production))) : []u8 =
@@ -162,10 +182,12 @@ module lexer_parser_test
     let (a, _, size) =
       loop (result, inputs, size) = copy (num, drop 8 bytes, length num)
       for _i < u64.to_i64 num_tests do
-        let input_size = u64.to_i64 (decode_u64 (take 8 inputs))
+        -- Skip the u64 frame_len; the u64 n that follows determines the size.
         let inputs' = drop 8 inputs
-        let input = take input_size inputs'
-        let inputs'' = drop input_size inputs'
+        let input_size = u64.to_i64 (decode_u64 (take 8 inputs'))
+        let inputs'' = drop 8 inputs'
+        let input = take input_size inputs''
+        let inputs''' = drop input_size inputs''
         let output =
           P.parse_int input
           |> encode_tree
@@ -175,7 +197,7 @@ module lexer_parser_test
           then scatter (replicate (2 * new_size) 0) (indices result) result
           else result
         let result = scatter result (map (+ size) (indices output)) output
-        in (result, inputs'', new_size)
+        in (result, inputs''', new_size)
     in take size a
 }
 
