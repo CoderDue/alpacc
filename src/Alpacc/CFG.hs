@@ -3,17 +3,10 @@ module Alpacc.CFG
     cfgToGrammar,
     cfgToDFALexerSpec,
     CFG (..),
-    TRule (..),
-    NTRule (..),
     Params (..),
-    everyTRule,
-    dfaFromCfgFile,
     printDfaSpec,
     properties,
     printGrammar,
-    printRandomSpec,
-    printExampleRandomSpec,
-    printSpecFromText,
   )
 where
 
@@ -32,12 +25,8 @@ import Data.String.Interpolate (i)
 import Data.Text (Text)
 import Data.Text qualified as Text hiding (Text)
 import Data.Void
-import Data.Word (Word8)
-import System.Exit (exitFailure)
-import System.IO (hPutStrLn, stderr)
 import Test.QuickCheck
   ( Property,
-    generate,
     property,
   )
 import Text.Megaparsec
@@ -138,11 +127,6 @@ cfgToGrammar (CFG {tRules, ntRules}) = do
     ruleProds NTRule {ruleNT, ruleProductions} =
       Production ruleNT ruleProductions
 
-everyTRule :: CFG -> Either Text [TRule]
-everyTRule cfg@(CFG {tRules}) = do
-  implicit_t_rules <- implicitTRules cfg
-  return $ tRules ++ implicit_t_rules
-
 implicitTRules :: CFG -> Either Text [TRule]
 implicitTRules (CFG {tRules, ntRules}) = mapM implicitLitToRegEx implicit
   where
@@ -234,19 +218,6 @@ cfgFromText :: FilePath -> Text -> Either Text CFG
 cfgFromText fname s =
   either (Left . Text.pack . errorBundlePretty) Right $ parse (space *> pCFG <* eof) fname s
 
-eitherToIO :: Either Text a -> IO a
-eitherToIO (Right x) = return x
-eitherToIO (Left err) = do
-  hPutStrLn stderr (Text.unpack $ "Error: " <> err)
-  exitFailure
-
-dfaFromCfgFile :: FilePath -> IO (DFALexer Word8 Integer T)
-dfaFromCfgFile path = do
-  content <- Text.pack <$> readFile path
-  cfg <- eitherToIO $ cfgFromText path content
-  spec <- eitherToIO $ cfgToDFALexerSpec cfg
-  pure $ lexerDFA (0 :: Integer) $ mapSymbols unBytes spec
-
 printRegEx :: RegEx Bytes -> Text
 printRegEx Epsilon = ""
 printRegEx (Literal c) = bytesToText c
@@ -303,58 +274,3 @@ properties :: [(String, Property)]
 properties =
   [("CFG properties", property parsePrinted)]
 
-printExampleRandomSpec :: IO ()
-printExampleRandomSpec = printRandomSpec 3 3
-
-printSpecFromText :: String -> IO ()
-printSpecFromText input = do
-  let grammarText = Text.pack input
-
-  putStrLn "Input:"
-  putStrLn input
-
-  putStrLn "\nParsed:"
-  case cfgFromText "input" grammarText of
-    Left err -> putStrLn $ "Error: " <> Text.unpack err
-    Right cfg -> case cfgToDFALexerSpec cfg of
-      Left err -> putStrLn $ "Error: " <> Text.unpack err
-      Right parsedSpec -> do
-        let printed = printDfaSpec parsedSpec
-        putStrLn $ Text.unpack printed
-
-        putStrLn "\nEquivalent:"
-        case cfgFromText "reparsed" printed of
-          Left err -> putStrLn $ "Error: " <> Text.unpack err
-          Right cfg' -> case cfgToDFALexerSpec cfg' of
-            Left err -> putStrLn $ "Error: " <> Text.unpack err
-            Right reparsedSpec ->
-              print $
-                dfaLexerSpecEquivalence
-                  (0 :: Integer)
-                  (mapSymbols unBytes parsedSpec)
-                  (mapSymbols unBytes reparsedSpec)
-
-printRandomSpec :: Int -> Int -> IO ()
-printRandomSpec num_chars num_terminals = do
-  spec <- generate (genDfaLexerSpec num_terminals chrs)
-  let grammarText = printDfaSpec spec
-
-  putStrLn "Generated:"
-  putStrLn $ Text.unpack grammarText
-
-  putStrLn "\nParsed:"
-  case cfgFromText "generated" grammarText of
-    Left err -> putStrLn $ "Error: " <> Text.unpack err
-    Right cfg -> case cfgToDFALexerSpec cfg of
-      Left err -> putStrLn $ "Error: " <> Text.unpack err
-      Right parsedSpec -> do
-        putStrLn $ Text.unpack $ printDfaSpec parsedSpec
-        putStrLn "\nEquivalent:"
-        print $
-          dfaLexerSpecEquivalence
-            (0 :: Integer)
-            (mapSymbols unBytes spec)
-            (mapSymbols unBytes parsedSpec)
-  where
-    chrs = chars num_chars
-    chars n = take n ['a' .. 'z']

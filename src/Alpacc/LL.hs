@@ -3,30 +3,20 @@ module Alpacc.LL
     follow,
     last,
     before,
-    llTable,
     llParse,
-    leftmostDerivations,
-    leftmostDerive,
     derivations,
     naiveFirst,
     naiveFollow,
-    alphaBeta,
     firstMemoized,
     lastMemoized,
     initFirstMemoizedContext,
-    initLastMemoizedContext,
     AlphaBetaMemoizedContext (..),
     derivableNLengths,
     nonderivableNLengths,
     firstAndFollow,
     lastAndBefore,
-    firstMap,
-    truncatedProduct,
     llTableM,
-    minTerminalCounts,
-    canDeriveRecursively,
     generateRandomDerivation,
-    generateRandomDerivationFold,
     generateRandomDerivationLazy,
   )
 where
@@ -89,23 +79,6 @@ nonderivableNLengths n grammar = nonderivable
 rightProductons :: Production nt t -> [(nt, (nt, [Symbol nt t]))]
 rightProductons (Production aj symbols') = (aj,) <$> rightSymbols symbols'
 
--- | Given a string of symbols create all the leftmost derivations.
-leftmostDerive ::
-  (Ord t, Ord nt, Show nt, Show t) =>
-  Grammar nt t ->
-  [Symbol nt t] ->
-  Seq [Symbol nt t]
-leftmostDerive grammar = derive Seq.empty . Seq.fromList
-  where
-    toSequences = fmap (fmap Seq.fromList)
-    production_map = toSequences . toProductionsMap $ productions grammar
-    derive _ Empty = Empty
-    derive ys ((Terminal x) :<| xs) = derive (ys :|> Terminal x) xs
-    derive ys ((Nonterminal x) :<| xs) = ps
-      where
-        smallDerive e = ys >< e >< xs
-        ps = Seq.fromList $ toList . smallDerive <$> (production_map Map.! x)
-
 -- | Given a string of symbols create all derivations.
 derivations ::
   (Ord t, Ord nt, Show nt, Show t) =>
@@ -139,22 +112,6 @@ naiveFirst k grammar = Set.fromList . bfs Set.empty . Seq.singleton
         k_terms = take k top
         k_plus_one_terms = take (k + 1) top
         new_visited = Set.insert k_plus_one_terms visited
-
--- | Naïvely creates creates all leftmost derivations which results in
--- terminals.
-leftmostDerivations :: (Show nt, Show t, Ord nt, Ord t) => Int -> Grammar nt t -> [Symbol nt t] -> Set [t]
-leftmostDerivations k grammar = Set.map (take k) . bfs Set.empty Set.empty . Seq.singleton
-  where
-    leftmostDerive' = leftmostDerive grammar
-    bfs set _ Empty = set
-    bfs set visited (top :<| queue)
-      | k_terms `Set.member` visited = bfs set visited queue
-      | all isTerminal k_terms = bfs new_set new_visited (queue >< leftmostDerive' top)
-      | otherwise = bfs set new_visited (queue >< leftmostDerive' top)
-      where
-        new_set = Set.insert (unpackTerminal <$> k_terms) set
-        k_terms = take (k + 1) top
-        new_visited = Set.insert k_terms visited
 
 -- | Naïvely creates the follow sets for a given string of symbols. This is done
 -- using breadth first search and applying first and to the symbols after the
@@ -278,19 +235,6 @@ initFirstMemoizedContext k grammar =
     { alphaBetaFunction = mkMemoAlphaBetaProducts k grammar,
       alphaBetaState = Map.empty,
       look = k
-    }
-
--- | Creates the initial context used for the memoized last function.
-initLastMemoizedContext ::
-  (Show nt, Show t, Ord nt, Ord t) =>
-  Int ->
-  Grammar nt t ->
-  AlphaBetaMemoizedContext nt t
-initLastMemoizedContext q grammar =
-  AlphaBetaMemoizedContext
-    { alphaBetaFunction = mkMemoAlphaBetaProducts q (reverseGrammar grammar),
-      alphaBetaState = Map.empty,
-      look = q
     }
 
 -- | Every possible way to split a string in two.

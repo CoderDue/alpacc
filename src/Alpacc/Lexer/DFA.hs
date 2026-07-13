@@ -1,7 +1,6 @@
 module Alpacc.Lexer.DFA
   ( DFA,
     isMatch,
-    invertSetMap,
     lexerDFA,
     DFALexer,
     fromRegExToDFA,
@@ -11,7 +10,6 @@ module Alpacc.Lexer.DFA
     dfaTerminals,
     tokenize,
     tokenizeWithBS,
-    regExEquivalence,
     dfaLexerSpecEquivalence,
     genDfaLexerSpec,
     Lexeme (..),
@@ -166,16 +164,6 @@ isMatch dfa = runDFA' start_state
         Nothing -> False
       where
         maybe_state = Map.lookup (s, x) trans
-
-invertSetMap :: (Ord t, Ord s) => Map t (Set s) -> Map s (Set t)
-invertSetMap mapping = Map.fromList $ setMap <$> codomain
-  where
-    codomain = toList $ Set.unions mapping
-    domain = Map.keys mapping
-    setMap s =
-      (s,) $
-        Set.fromList $
-          filter ((s `Set.member`) . (mapping Map.!)) domain
 
 -- | http://www.cs.um.edu.mt/gordon.pace/Research/Software/Relic/Transformations/FSA/remove-useless.html
 removeUselessStates :: (Ord s, Ord t) => DFA t s -> DFA t s
