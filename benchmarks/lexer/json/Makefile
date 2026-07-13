@@ -48,6 +48,7 @@ bench-cuda: lexer-cuda $(DATA)
 	./lexer-cuda --benchmark 10 --warmup 3 < $(DATA)
 
 bench-futhark: json.fut $(DATA_RAW)
+	futhark pkg sync
 	@printf "$(H)Benchmarking Futhark implementation:$(E)\n"
 	futhark bench --backend $(FUTHARK_BACKEND) json.fut
 
