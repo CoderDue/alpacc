@@ -16,6 +16,11 @@ import Data.Text qualified as Text
 futharkTest :: Text
 futharkTest = $(embedStringFile "backends/futhark/test.fut")
 
+-- | Emitted once per generated file, before all templates.
+-- Change 'i64' to 'i32' here to switch span and parent index width.
+idxModule :: Text
+idxModule = "module idx = i64"
+
 bothFunction :: UInt -> UInt -> Text
 bothFunction terminal_type production_type =
   Text.strip $
@@ -120,6 +125,7 @@ auxiliary analyzer =
     Lex lexer ->
       Text.unlines
         [ Text.unlines (("-- " <>) <$> meta analyzer),
+          idxModule,
           terminalDefinitions terminal_names,
           Lexer.generateLexer terminal_type lexer,
           futharkTest,
@@ -128,6 +134,7 @@ auxiliary analyzer =
     Parse parser ->
       Text.unlines
         [ Text.unlines (("-- " <>) <$> meta analyzer),
+          idxModule,
           terminalDefinitions terminal_names,
           Parser.generateParser terminal_type parser,
           futharkTest,
@@ -136,6 +143,7 @@ auxiliary analyzer =
     Both lexer parser ->
       Text.unlines
         [ Text.unlines (("-- " <>) <$> meta analyzer),
+          idxModule,
           terminalDefinitions terminal_names,
           Lexer.generateLexer terminal_type lexer,
           Parser.generateParser terminal_type parser,

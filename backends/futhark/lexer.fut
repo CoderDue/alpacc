@@ -29,8 +29,8 @@ module type lexer_context = {
 module type lexer = {
   type terminal_int
   type terminal
-  val lex_int [n] : i32 -> [n]u8 -> opt ([](terminal_int, (i64, i64)))
-  val lex [n] : i32 -> [n]u8 -> opt ([](terminal, (i64, i64)))
+  val lex_int [n] : i32 -> [n]u8 -> opt ([](terminal_int, (idx.t, idx.t)))
+  val lex [n] : i32 -> [n]u8 -> opt ([](terminal, (idx.t, idx.t)))
 }
 
 module mk_lexer (L: lexer_context)
@@ -81,7 +81,7 @@ module mk_lexer (L: lexer_context)
     |> scan compose L.identity_state
 
   def take_right a b =
-    if b == i64.highest then a else b
+    if b == idx.highest then a else b
 
   def is_ignore t =
     match L.ignore_terminal
@@ -89,15 +89,15 @@ module mk_lexer (L: lexer_context)
     case #none -> false
 
   def lex_step [m] [n]
-               (offset: i64)
+               (offset: idx.t)
                (prev_state: state)
-               (prev_start: i64)
-               (prev_size: i64)
-               (dest: *[m](terminal_int, (i64, i64)))
-               (str: [n]u8) : ?[k].( [k](terminal_int, (i64, i64))
+               (prev_start: idx.t)
+               (prev_size: idx.t)
+               (dest: *[m](terminal_int, (idx.t, idx.t)))
+               (str: [n]u8) : ?[k].( [k](terminal_int, (idx.t, idx.t))
                                    , state
-                                   , i64
-                                   , i64
+                                   , idx.t
+                                   , idx.t
                                    ) =
     let states = traverse prev_state str
     let flags =
@@ -113,73 +113,73 @@ module mk_lexer (L: lexer_context)
       tabulate n (\i ->
                     if is_produce states[i]
                     && (not <-< is_ignore <-< to_terminal) states[i]
-                    then i
+                    then idx.i64 i
                     else if i == 0
-                    then take_right (prev_start - offset) i64.highest
-                    else i64.highest)
-      |> scan take_right i64.highest
-    let ends = iota n
+                    then take_right (prev_start - offset) idx.highest
+                    else idx.highest)
+      |> scan take_right idx.highest
+    let ends = map idx.i64 (iota n)
     let vs = zip (map to_terminal states) (zip starts ends)
     let size = last is
-    let extra_size = prev_size + size + 1
+    let extra_size = idx.to_i64 prev_size + size + 1
     let dest =
       if m <= extra_size
       then let new_dest =
-             replicate (2 * extra_size) (L.terminal_int_module.u8 0, (0, 0))
+             replicate (2 * extra_size) (L.terminal_int_module.u8 0, (idx.i64 0, idx.i64 0))
            in scatter new_dest (indices dest) dest
       else dest
     let result =
-      scatter dest (map (+ prev_size) offsets) vs
-      |> map (\(t, (s, e)) -> (t, (s + offset, 1 + e + offset)))
+      scatter dest (map (+ idx.to_i64 prev_size) offsets) vs
+      |> map (\(t, (s, e)) -> (t, (s + offset, idx.i64 1 + e + offset)))
     let last_state = last states
     let last_start = last starts
     in ( result
        , last_state
-       , if last_start != i64.highest
+       , if last_start != idx.highest
          then offset + last_start
          else prev_start
-       , prev_size + size
+       , idx.i64 (idx.to_i64 prev_size + size)
        )
 
   def lex_int_flag [n]
                    (chunk_size: i32)
-                   (str: [n]u8) : (bool, [](terminal_int, (i64, i64))) =
-    let chunk_size = i64.i32 chunk_size
+                   (str: [n]u8) : (bool, [](terminal_int, (idx.t, idx.t))) =
+    let chunk_size = idx.i32 chunk_size
     let (result, state, start, size) =
       loop (dest, state, start, size) =
-             ( [(L.terminal_int_module.u8 0, (0, 0))]
+             ( [(L.terminal_int_module.u8 0, (idx.i64 0, idx.i64 0))]
              , L.identity_state
-             , 0
-             , 0
+             , idx.i64 0
+             , idx.i64 0
              )
-      for offset in 0..chunk_size..<n do
-        let m = i64.min (offset + chunk_size + 1) n
+      for offset in 0..idx.to_i64 chunk_size..<n do
+        let m = i64.min (offset + idx.to_i64 chunk_size + 1) n
         let s = copy str[offset:m]
         let (dest, last_state, last_start, size) =
-          lex_step offset state start size dest s
+          lex_step (idx.i64 offset) state start size dest s
         in (dest, copy last_state, last_start, size)
     let last_terminal = to_terminal state
     let (result, size) =
       if is_ignore last_terminal
       then (result, size)
-      else ( result with [size] = ( to_terminal state
-                                  , (start, n)
-                                  )
-           , size + 1
+      else ( result with [idx.to_i64 size] = ( to_terminal state
+                                              , (start, idx.i64 n)
+                                              )
+           , size + idx.i64 1
            )
     in if is_accept state
-       then (true, take size result)
+       then (true, take (idx.to_i64 size) result)
        else (false, [])
 
   def lex_int [n]
               (chunk_size: i32)
-              (str: [n]u8) : opt ([](terminal_int, (i64, i64))) =
+              (str: [n]u8) : opt ([](terminal_int, (idx.t, idx.t))) =
     let (is_valid, result) = lex_int_flag chunk_size str
     in if is_valid then #some result else #none
 
   def lex [n]
           (chunk_size: i32)
-          (str: [n]u8) : opt ([](terminal, (i64, i64))) =
+          (str: [n]u8) : opt ([](terminal, (idx.t, idx.t))) =
     let (is_valid, result) = lex_int_flag chunk_size str
     in if is_valid
        then #some (map (\(t, s) ->

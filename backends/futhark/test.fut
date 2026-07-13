@@ -35,7 +35,7 @@ def decode_u64 (a: [8]u8) : u64 = decode_le a
 module lexer_test
   (L: {
     type terminal_int
-    val lex_int [n] : i32 -> [n]u8 -> opt ([](terminal_int, (i64, i64)))
+    val lex_int [n] : i32 -> [n]u8 -> opt ([](terminal_int, (idx.t, idx.t)))
   })
   (T: integral with t = L.terminal_int) = {
   type terminal = L.terminal_int
@@ -44,13 +44,13 @@ module lexer_test
   def lexeme_bytes : i64 = terminal_bytes + 16
 
   #[inline]
-  def encode_terminal ((t, (i, j)): (terminal, (i64, i64))) : [lexeme_bytes]u8 =
+  def encode_terminal ((t, (i, j)): (terminal, (idx.t, idx.t))) : [lexeme_bytes]u8 =
     sized lexeme_bytes (encode_le terminal_bytes (u64.i64 (T.to_i64 t))
-                        ++ encode_u64 (u64.i64 i)
-                        ++ encode_u64 (u64.i64 j))
+                        ++ encode_u64 (u64.idx.to_i64 i)
+                        ++ encode_u64 (u64.idx.to_i64 j))
 
   #[inline]
-  def encode_terminals [n] (ts: opt ([n](terminal, (i64, i64)))) : []u8 =
+  def encode_terminals [n] (ts: opt ([n](terminal, (idx.t, idx.t)))) : []u8 =
     match ts
     case #some ts' ->
       [u8.bool true]
@@ -136,8 +136,8 @@ module lexer_parser_test
   (P: {
     type terminal_int
     type production_int
-    type node 't 'p = #terminal t (i64, i64) | #production p
-    val parse_int [n] : [n]u8 -> opt ([](i64, node terminal_int production_int))
+    type node 't 'p = #terminal t (idx.t, idx.t) | #production p
+    val parse_int [n] : [n]u8 -> opt ([](idx.t, node terminal_int production_int))
   })
   (T: integral with t = P.terminal_int)
   (Q: integral with t = P.production_int) = {
@@ -151,24 +151,24 @@ module lexer_parser_test
   -- Node ids use the production width: terminal ids always fit in
   -- production_int (the invariant the backends rely on).
   #[inline]
-  def encode_node (p: i64) (n: node terminal production) : [node_bytes]u8 =
+  def encode_node (p: idx.t) (n: node terminal production) : [node_bytes]u8 =
     sized node_bytes
           (match n
            case #production t ->
              [0u8]
-             ++ encode_u64 (u64.i64 p)
+             ++ encode_u64 (u64.idx.to_i64 p)
              ++ encode_le production_bytes (u64.i64 (Q.to_i64 t))
              ++ encode_u64 0
              ++ encode_u64 0
            case #terminal t (i, j) ->
              [1u8]
-             ++ encode_u64 (u64.i64 p)
+             ++ encode_u64 (u64.idx.to_i64 p)
              ++ encode_le production_bytes (u64.i64 (T.to_i64 t))
-             ++ encode_u64 (u64.i64 i)
-             ++ encode_u64 (u64.i64 j))
+             ++ encode_u64 (u64.idx.to_i64 i)
+             ++ encode_u64 (u64.idx.to_i64 j))
 
   #[inline]
-  def encode_tree [n] (ns: opt ([n](i64, P.node terminal production))) : []u8 =
+  def encode_tree [n] (ns: opt ([n](idx.t, P.node terminal production))) : []u8 =
     match ns
     case #some ns' ->
       [u8.bool true]

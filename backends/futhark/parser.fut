@@ -37,9 +37,9 @@ module type parser = {
   type terminal
   type production_int
   type production
-  type node 't 'p = #terminal t (i64, i64) | #production p
-  val parse_int [n] : [n](terminal_int, (i64, i64)) -> opt ([](i64, node terminal_int production_int))
-  val parse [n] : [n](terminal_int, (i64, i64)) -> opt ([](i64, node terminal production))
+  type node 't 'p = #terminal t (idx.t, idx.t) | #production p
+  val parse_int [n] : [n](terminal_int, (idx.t, idx.t)) -> opt ([](idx.t, node terminal_int production_int))
+  val parse [n] : [n](terminal_int, (idx.t, idx.t)) -> opt ([](idx.t, node terminal production))
   val pre_productions_int [n] : [n]terminal_int -> opt ([]production_int)
   val pre_productions [n] : [n]terminal_int -> opt ([]production)
 }
@@ -92,13 +92,13 @@ module mk_parser (P: parser_context)
   def find_previous [n] 't
                     (op: t -> t -> bool)
                     (tree: [n]t)
-                    (idx: i64) : i64 =
+                    (pos: i64) : i64 =
     let sibling i = i - i64.bool (i % 2 == 0) + i64.bool (i % 2 == 1)
     let parent i = (i - 1) / 2
     let is_left i = i % 2 == 1
     let h = i64.i32 <| i64.num_bits - i64.clz n
     let offset = size (h - 1)
-    let start = offset + idx
+    let start = offset + pos
     let v = tree[start]
     let ascent i = i != 0 && (is_left i || !(tree[sibling i] `op` v))
     let descent i = 2 * i + 1 + i64.bool (tree[2 * i + 2] `op` v)
@@ -150,17 +150,17 @@ module mk_parser (P: parser_context)
   def valid_keys [n] : [n]((i32, i32), (i32, i32)) -> bool =
     all (\((a, b), (c, d)) -> a != -1 && b != -1 && c != -1 && d != -1)
 
-  def depths [n] (input: [n]bracket) : opt ([n]i64) =
+  def depths [n] (input: [n]bracket) : opt ([n]idx.t) =
     let left_brackets =
       input
       |> map (is_left)
     let bracket_scan =
       left_brackets
-      |> map (\b -> if b then 1 else -1)
-      |> scan (+) 0
+      |> map (\b -> if b then 1i64 else -1i64)
+      |> scan (+) 0i64
     let result =
       bracket_scan
-      |> map2 (\a b -> b - i64.bool a) left_brackets
+      |> map2 (\a b -> idx.i64 (b - i64.bool a)) left_brackets
     in if any (< 0) bracket_scan || (n != 0 && last bracket_scan != 0)
        then #none
        else #some result
@@ -174,7 +174,7 @@ module mk_parser (P: parser_context)
   def brackets_matches [n] (brackets: [n]bracket) : bool =
     match depths brackets
     case #some ds ->
-      let tree = mk_tree i64.min i64.highest ds
+      let tree = mk_tree idx.min idx.highest ds
       in tabulate n (\i ->
                        if is_left brackets[i]
                        then true
@@ -281,22 +281,22 @@ module mk_parser (P: parser_context)
   def production_to_terminal (p: production_int) : opt terminal_int =
     copy P.production_to_terminal[production_int_module.to_i64 p]
 
-  def production_to_arity (p: production_int) : i64 =
-    i64.u8 (copy P.production_to_arity[production_int_module.to_i64 p])
+  def production_to_arity (p: production_int) : idx.t =
+    idx.i64 (i64.u8 (copy P.production_to_arity[production_int_module.to_i64 p]))
 
-  def parents [n] (ps: [n]production_int) : [n]i64 =
+  def parents [n] (ps: [n]production_int) : [n]idx.t =
     let tree =
       map production_to_arity ps
-      |> map (+ -1)
-      |> exscan (+) 0
+      |> map (+ idx.i64 (-1))
+      |> exscan (+) (idx.i64 0)
       |> (.1)
-      |> mk_tree i64.min i64.highest
-    let parents' = map (find_previous (<=) tree) (iota n)
+      |> mk_tree idx.min idx.highest
+    let parents' = map (idx.i64 <-< find_previous (<=) tree) (iota n)
     in if n == 0
        then parents'
-       else let parents'[0] = 0 in parents'
+       else let parents'[0] = idx.i64 0 in parents'
 
-  type node 't 'p = #terminal t (i64, i64) | #production p
+  type node 't 'p = #terminal t (idx.t, idx.t) | #production p
 
   def safe_zip [n] [m] 'a 'b (a: [n]a) (b: [m]b) =
     if n == m
@@ -304,17 +304,17 @@ module mk_parser (P: parser_context)
     else assert true []
 
   def terminal_offsets [n] [m]
-                       (spans: [m](i64, i64))
-                       (ts: [n](opt terminal_int)) : [](i64, node terminal_int production_int) =
+                       (spans: [m](idx.t, idx.t))
+                       (ts: [n](opt terminal_int)) : [](idx.t, node terminal_int production_int) =
     map (opt.is_some) ts
     |> zip3 (iota n) (ts)
     |> filter (\(_, _, b) -> b)
     |> safe_zip spans
     |> map (\(s, (i, t, _)) ->
               opt.from empty_terminal t
-              |> (\t' -> (i, #terminal t' s)))
+              |> (\t' -> (idx.i64 i, #terminal t' s)))
 
-  def parse_int_flag [n] (arr: [n](terminal_int, (i64, i64))) : (bool, [](i64, node terminal_int production_int)) =
+  def parse_int_flag [n] (arr: [n](terminal_int, (idx.t, idx.t))) : (bool, [](idx.t, node terminal_int production_int)) =
     let (ters, spans) = unzip arr
     let prods' = ters |> pre_productions_int
     let result =
@@ -327,24 +327,24 @@ module mk_parser (P: parser_context)
           map (\p -> #production p)
               prods
           :> [](node terminal_int production_int)
-        in scatter prods offsets tprods
+        in scatter prods (map idx.to_i64 offsets) tprods
            |> zip parent_vector
       case _ -> []
     in if opt.is_some prods' then (true, result) else (false, [])
 
-  def parse_int [n] (arr: [n](terminal_int, (i64, i64))) : opt ([](i64, node terminal_int production_int)) =
+  def parse_int [n] (arr: [n](terminal_int, (idx.t, idx.t))) : opt ([](idx.t, node terminal_int production_int)) =
     let (is_valid, prods) = parse_int_flag arr
     in if is_valid then #some prods else #none
 
-  def parse [n] (arr: [n](terminal_int, (i64, i64))) : opt ([](i64, node terminal production)) =
+  def parse [n] (arr: [n](terminal_int, (idx.t, idx.t))) : opt ([](idx.t, node terminal production)) =
     let (is_valid, prods) = parse_int_flag arr
     let result =
       map (\(i, n) ->
              match n
              case #terminal t s ->
-               ((i, #terminal (copy P.terminal_int_to_name[terminal_int_module.to_i64 t]) s) :> (i64, node terminal P.production))
+               ((i, #terminal (copy P.terminal_int_to_name[terminal_int_module.to_i64 t]) s) :> (idx.t, node terminal P.production))
              case #production p ->
-               ((i, #production (copy P.production_int_to_name[production_int_module.to_i64 p])) :> (i64, node terminal production)))
+               ((i, #production (copy P.production_int_to_name[production_int_module.to_i64 p])) :> (idx.t, node terminal production)))
           prods
     in if is_valid
        then #some result
