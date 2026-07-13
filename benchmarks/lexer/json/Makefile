@@ -12,8 +12,14 @@ DATA_RAW=data-raw-$(INPUT_SIZE).json
 lexer.cu: json.alp
 	alpacc cuda json.alp --lexer -o $@
 
+NVCCFLAGS=-O3 -std=c++17 -arch=native
+INDEX32?=0
+ifeq ($(INDEX32),1)
+NVCCFLAGS+= -DINDEX32
+endif
+
 lexer-cuda: lexer.cu
-	nvcc -O3 -std=c++17 -arch=native -o $@ $^
+	nvcc $(NVCCFLAGS) -o $@ $^
 
 $(DATA): json.alp
 	alpacc test generate json.alp --lexer --single-long --no-outputs --length $(INPUT_SIZE) -o data-$(INPUT_SIZE)

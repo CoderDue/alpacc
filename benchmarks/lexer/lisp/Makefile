@@ -14,8 +14,14 @@ lexer-c: lexer.c
 lexer.cu: sexp.alp
 	alpacc cuda sexp.alp --lexer -o $@
 
+NVCCFLAGS=-O3 -std=c++17 -arch=native
+INDEX32?=0
+ifeq ($(INDEX32),1)
+NVCCFLAGS+= -DINDEX32
+endif
+
 lexer-cuda: lexer.cu
-	nvcc -O3 -std=c++17 -arch=native -o $@ $^
+	nvcc $(NVCCFLAGS) -o $@ $^
 
 $(DATA): sexp.alp
 	alpacc test generate sexp.alp --lexer --single-long --no-outputs --length $(INPUT_SIZE) -o data-$(INPUT_SIZE)

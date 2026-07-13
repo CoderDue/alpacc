@@ -28,10 +28,17 @@ generateTerminals terminal_type terminal_names =
     [ cudafyEnum "terminal_t" terminal_type terminal_names
     ]
 
--- | Type alias for byte-position indices (lexer spans, CST node spans).
--- Switch to int32_t for inputs guaranteed to be smaller than 2 GiB.
+-- | Type alias for byte-position indices. Overridable at compile time:
+-- nvcc -DINDEX32 ... switches to int32_t (halves index-array memory).
 indexTypeAlias :: Text
-indexTypeAlias = "using index_t = int64_t;"
+indexTypeAlias =
+  Text.unlines
+    [ "#ifdef INDEX32",
+      "using index_t = int32_t;",
+      "#else",
+      "using index_t = int64_t;",
+      "#endif"
+    ]
 
 compileHint :: Text
 compileHint = "// Compile: nvcc -O3 -std=c++17 -arch=native <this-file>.cu -o <output>"
