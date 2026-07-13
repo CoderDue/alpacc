@@ -46,8 +46,8 @@ module lexer_test
   #[inline]
   def encode_terminal ((t, (i, j)): (terminal, (idx.t, idx.t))) : [lexeme_bytes]u8 =
     sized lexeme_bytes (encode_le terminal_bytes (u64.i64 (T.to_i64 t))
-                        ++ encode_u64 (u64.idx.to_i64 i)
-                        ++ encode_u64 (u64.idx.to_i64 j))
+                        ++ encode_u64 (u64.i64 (idx.to_i64 i))
+                        ++ encode_u64 (u64.i64 (idx.to_i64 j)))
 
   #[inline]
   def encode_terminals [n] (ts: opt ([n](terminal, (idx.t, idx.t)))) : []u8 =
@@ -156,16 +156,16 @@ module lexer_parser_test
           (match n
            case #production t ->
              [0u8]
-             ++ encode_u64 (u64.idx.to_i64 p)
+             ++ encode_u64 (u64.i64 (idx.to_i64 p))
              ++ encode_le production_bytes (u64.i64 (Q.to_i64 t))
              ++ encode_u64 0
              ++ encode_u64 0
            case #terminal t (i, j) ->
              [1u8]
-             ++ encode_u64 (u64.idx.to_i64 p)
+             ++ encode_u64 (u64.i64 (idx.to_i64 p))
              ++ encode_le production_bytes (u64.i64 (T.to_i64 t))
-             ++ encode_u64 (u64.idx.to_i64 i)
-             ++ encode_u64 (u64.idx.to_i64 j))
+             ++ encode_u64 (u64.i64 (idx.to_i64 i))
+             ++ encode_u64 (u64.i64 (idx.to_i64 j)))
 
   #[inline]
   def encode_tree [n] (ns: opt ([n](idx.t, P.node terminal production))) : []u8 =
