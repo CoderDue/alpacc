@@ -28,8 +28,6 @@ generateTerminals terminal_type terminal_names =
     [ cudafyEnum "terminal_t" terminal_type terminal_names
     ]
 
--- | Type alias for byte-position indices. Overridable at compile time:
--- nvcc -DINDEX32 ... switches to int32_t (halves index-array memory).
 indexTypeAlias :: Text
 indexTypeAlias =
   Text.unlines

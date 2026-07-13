@@ -354,13 +354,13 @@ generateProgram :: Backend -> Bool -> Gen -> CFG -> Either Text Text
 generateProgram C _ GenParser cfg = generate C.generator <$> mkParser cfg
 generateProgram C _ GenLexer cfg = generate C.generator <$> mkLexer cfg
 generateProgram C _ GenBoth cfg = generate C.generator <$> mkLexerParser cfg
-generateProgram backend index32 generator cfg =
-  case generator of
-    GenBoth -> generate gen <$> mkLexerParser cfg
-    GenLexer -> generate gen <$> mkLexer cfg
-    GenParser -> generate gen <$> mkParser cfg
+generateProgram backend index32 gen cfg =
+  case gen of
+    GenBoth -> generate generator <$> mkLexerParser cfg
+    GenLexer -> generate generator <$> mkLexer cfg
+    GenParser -> generate generator <$> mkParser cfg
   where
-    gen =
+    generator =
       case backend of
         CUDA -> Cuda.generator
         Futhark -> Futhark.generator index32

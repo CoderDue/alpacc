@@ -32,7 +32,6 @@ includes =
       "#include <time.h>"
     ]
 
--- gcc -DINDEX32 switches index_t from int64_t to int32_t.
 indexTypedef :: Text
 indexTypedef =
   Text.unlines
