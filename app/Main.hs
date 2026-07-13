@@ -67,7 +67,8 @@ data GeneratorParameters = GeneratorParameters
   { generatorInput :: !Input,
     generatorOutput :: !(Maybe String),
     generatorGenerator :: !Gen,
-    generatorBackend :: !Backend
+    generatorBackend :: !Backend,
+    generatorIndex32 :: !Bool
   }
   deriving (Show)
 
@@ -251,6 +252,7 @@ generatorParameters backend =
             <*> outputParameter
             <*> generateParametar
             <*> pure backend
+            <*> switch (long "index32" <> help "Use 32-bit integers for indices (Futhark only).")
         )
 
 randomParameters :: Parser Command
@@ -348,11 +350,11 @@ readContents input =
     StdInput -> TextIO.getContents
     FileInput path -> TextIO.readFile path
 
-generateProgram :: Backend -> Gen -> CFG -> Either Text Text
-generateProgram C GenParser cfg = generate C.generator <$> mkParser cfg
-generateProgram C GenLexer cfg = generate C.generator <$> mkLexer cfg
-generateProgram C GenBoth cfg = generate C.generator <$> mkLexerParser cfg
-generateProgram backend generator cfg =
+generateProgram :: Backend -> Bool -> Gen -> CFG -> Either Text Text
+generateProgram C _ GenParser cfg = generate C.generator <$> mkParser cfg
+generateProgram C _ GenLexer cfg = generate C.generator <$> mkLexer cfg
+generateProgram C _ GenBoth cfg = generate C.generator <$> mkLexerParser cfg
+generateProgram backend index32 generator cfg =
   case generator of
     GenBoth -> generate gen <$> mkLexerParser cfg
     GenLexer -> generate gen <$> mkLexer cfg
@@ -361,7 +363,7 @@ generateProgram backend generator cfg =
     gen =
       case backend of
         CUDA -> Cuda.generator
-        Futhark -> Futhark.generator
+        Futhark -> Futhark.generator index32
 
 pathOfInput :: FilePath -> Input -> FilePath
 pathOfInput p StdInput = p
@@ -386,7 +388,7 @@ mainGenerator :: GeneratorParameters -> IO ()
 mainGenerator params = do
   let program_path = outputPath backend output input
   cfg <- readCfg input
-  let either_program = generateProgram backend gen cfg
+  let either_program = generateProgram backend index32 gen cfg
 
   case either_program of
     Left e -> do
@@ -398,6 +400,7 @@ mainGenerator params = do
     output = generatorOutput params
     input = generatorInput params
     gen = generatorGenerator params
+    index32 = generatorIndex32 params
 
 mainRandom :: RandomParameters -> IO ()
 mainRandom params =

@@ -32,6 +32,17 @@ includes =
       "#include <time.h>"
     ]
 
+-- gcc -DINDEX32 switches index_t from int64_t to int32_t.
+indexTypedef :: Text
+indexTypedef =
+  Text.unlines
+    [ "#ifdef INDEX32",
+      "typedef int32_t index_t;",
+      "#else",
+      "typedef int64_t index_t;",
+      "#endif"
+    ]
+
 -- Forward declarations for the I/O helpers defined in cli.c.
 -- These let the generated test-case code call them without needing
 -- cli.c to come first.
@@ -144,7 +155,7 @@ auxiliary analyzer =
         [ Text.unlines (("// " <>) <$> meta analyzer),
           includes,
           "typedef " <> cudafy (terminalType analyzer) <> " terminal_t;",
-          "typedef int64_t index_t;",
+          indexTypedef,
           ioForwardDecls,
           Lexer.generateLexer lexer,
           cLexer,
@@ -156,7 +167,7 @@ auxiliary analyzer =
         [ Text.unlines (("// " <>) <$> meta analyzer),
           includes,
           "typedef " <> cudafy (terminalType analyzer) <> " terminal_t;",
-          "typedef int64_t index_t;",
+          indexTypedef,
           ioForwardDecls,
           Parser.generateParser parser,
           cParser,
@@ -168,7 +179,7 @@ auxiliary analyzer =
         [ Text.unlines (("// " <>) <$> meta analyzer),
           includes,
           "typedef " <> cudafy (terminalType analyzer) <> " terminal_t;",
-          "typedef int64_t index_t;",
+          indexTypedef,
           ioForwardDecls,
           Lexer.generateLexer lexer,
           cLexer,

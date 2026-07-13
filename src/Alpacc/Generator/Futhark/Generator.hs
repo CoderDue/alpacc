@@ -16,10 +16,8 @@ import Data.Text qualified as Text
 futharkTest :: Text
 futharkTest = $(embedStringFile "backends/futhark/test.fut")
 
--- | Emitted once per generated file, before all templates.
--- Change 'i64' to 'i32' here to switch span and parent index width.
-idxModule :: Text
-idxModule = "module idx = i64"
+idxModule :: Bool -> Text
+idxModule index32 = "module idx = " <> if index32 then "i32" else "i64"
 
 bothFunction :: UInt -> UInt -> Text
 bothFunction terminal_type production_type =
@@ -119,13 +117,13 @@ terminalDefinitions names =
       terminalIntToName names
     ]
 
-auxiliary :: Analyzer [Text] -> Text
-auxiliary analyzer =
+auxiliary :: Bool -> Analyzer [Text] -> Text
+auxiliary index32 analyzer =
   case analyzerKind analyzer of
     Lex lexer ->
       Text.unlines
         [ Text.unlines (("-- " <>) <$> meta analyzer),
-          idxModule,
+          idxModule index32,
           terminalDefinitions terminal_names,
           Lexer.generateLexer terminal_type lexer,
           futharkTest,
@@ -134,7 +132,7 @@ auxiliary analyzer =
     Parse parser ->
       Text.unlines
         [ Text.unlines (("-- " <>) <$> meta analyzer),
-          idxModule,
+          idxModule index32,
           terminalDefinitions terminal_names,
           Parser.generateParser terminal_type parser,
           futharkTest,
@@ -143,7 +141,7 @@ auxiliary analyzer =
     Both lexer parser ->
       Text.unlines
         [ Text.unlines (("-- " <>) <$> meta analyzer),
-          idxModule,
+          idxModule index32,
           terminalDefinitions terminal_names,
           Lexer.generateLexer terminal_type lexer,
           Parser.generateParser terminal_type parser,
@@ -154,8 +152,8 @@ auxiliary analyzer =
     terminal_type = terminalType analyzer
     terminal_names = ("#" <>) <$> terminalToName analyzer
 
-generator :: Generator [Text]
-generator =
+generator :: Bool -> Generator [Text]
+generator index32 =
   Generator
-    { generate = auxiliary
+    { generate = auxiliary index32
     }

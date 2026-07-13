@@ -15,7 +15,7 @@ lexer.cu: sexp.alp
 	alpacc cuda sexp.alp --lexer -o $@
 
 NVCCFLAGS=-O3 -std=c++17 -arch=native
-INDEX32?=0
+INDEX32?=1
 ifeq ($(INDEX32),1)
 NVCCFLAGS+= -DINDEX32
 endif
@@ -34,7 +34,7 @@ $(DATA_RAW): $(DATA)
 	dd if=$(DATA) of=$(DATA_RAW) bs=24 skip=1
 
 sexp.fut: sexp.alp $(DATA_RAW)
-	alpacc futhark sexp.alp --lexer
+	alpacc futhark sexp.alp --lexer --index32
 	@printf -- "\n-- ==\n-- entry: lex_int\n-- script input { \$$loadbytes \"$(DATA_RAW)\" }\n" >> sexp.fut
 	futhark pkg sync
 

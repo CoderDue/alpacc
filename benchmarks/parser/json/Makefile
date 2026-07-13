@@ -10,7 +10,7 @@ parser.cu: json.alp
 	alpacc cuda json.alp -o $@
 
 NVCCFLAGS=-O3 -std=c++17 -arch=native
-INDEX32?=0
+INDEX32?=1
 ifeq ($(INDEX32),1)
 NVCCFLAGS+= -DINDEX32
 endif
@@ -25,7 +25,7 @@ $(DATA_RAW): $(DATA)
 	dd if=$(DATA) of=$(DATA_RAW) bs=16 skip=1
 
 json.fut: json.alp $(DATA_RAW)
-	alpacc futhark json.alp -o $@
+	alpacc futhark json.alp --index32 -o $@
 	@printf -- "\n-- ==\n-- entry: parse_int\n-- script input { \$$loadbytes \"$(DATA_RAW)\" }\n" >> $@
 	futhark pkg sync
 
