@@ -15,8 +15,7 @@ set -e
 # (make sure cuda, futhark, gmp, gcc-11 are installed/available there).
 if command -v module >/dev/null 2>&1; then
     module unload cuda    2>/dev/null || true
-    module load   cuda/11.8
-    module load   futhark
+    module load   cuda/12.8
     module load   gmp
     module unload gcc      2>/dev/null || true
     module load   gcc/11.2.0
