@@ -5,6 +5,8 @@
 #SBATCH --time=3:00:00
 #SBATCH --output=benchmark.log
 
+INPUT_SIZE=${INPUT_SIZE:-104857600}
+
 set -e
 
 # --- Environment setup -----------------------------------------------
@@ -30,7 +32,6 @@ for tool in nvcc futhark gcc; do
 done
 
 # --- Benchmark -------------------------------------------------------
-INPUT_SIZE=104857600
 
 make build         FUTHARK_BACKEND=cuda INPUT_SIZE=$INPUT_SIZE
 make bench-cuda    INPUT_SIZE=$INPUT_SIZE
