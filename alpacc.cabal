@@ -62,7 +62,7 @@ library
     , split
     , utf8-string
     , array
-    , random
+    , random >= 1.3
     , QuickCheck
     , bytestring
     , binary

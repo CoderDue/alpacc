@@ -453,7 +453,7 @@ generateSingleLongLexerParserInput ::
 generateSingleLongLexerParserInput len _alpha dfa_lexer grammar h = do
   total_ref <- newIORef (0 :: Int)
   memo_ref <- newIORef Map.empty
-  let (gen_deriv, gen_walk) = split $ mkStdGen randomSeed
+  let (gen_deriv, gen_walk) = splitGen $ mkStdGen randomSeed
       env = mkWalkEnv dfa_lexer
       ignore_tok = T "ignore"
       genv =
