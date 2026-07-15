@@ -18,7 +18,7 @@ $(DATA): sexp.alp
 	alpacc test generate sexp.alp --single-long --no-outputs --length $(INPUT_SIZE) -o data-$(INPUT_SIZE)
 
 $(DATA_RAW): $(DATA)
-	dd if=$(DATA) of=$(DATA_RAW) bs=16 skip=1
+	dd if=$(DATA) of=$(DATA_RAW) bs=24 skip=1
 
 sexp.fut: sexp.alp $(DATA_RAW)
 	alpacc futhark sexp.alp --index32 -o $@
