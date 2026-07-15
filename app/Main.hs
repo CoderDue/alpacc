@@ -462,13 +462,14 @@ mainTestGenerate params = do
         unless noOutputs $ LBS.writeFile (name <> ".outputs") ouputs
       SingleLong -> do
         let inputsFile = name <> ".inputs"
+            outputsFile = name <> ".outputs"
         h <- openBinaryFile inputsFile ReadWriteMode
         mOutH <- if noOutputs
                    then pure Nothing
-                   else Just <$> openBinaryFile (name <> ".outputs") WriteMode
+                   else Just . (outputsFile,) <$> openBinaryFile outputsFile WriteMode
         result <- lexerParserTestsSingleLong cfg len h mOutH
         hClose h
-        mapM_ hClose mOutH
+        mapM_ (hClose . snd) mOutH
         eitherToIO result
   where
     out = testGenerateOutput params

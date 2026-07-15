@@ -37,8 +37,6 @@ const terminal_t EMPTY_TERMINAL = #{cudafy $ terminalCast empty_terminal};
 const terminal_t START_TERMINAL = #{cudafy $ terminalCast start_terminal};
 const terminal_t END_TERMINAL = #{cudafy $ terminalCast end_terminal};
 const int64_t NUMBER_OF_PRODUCTIONS = #{cudafy number_of_productions};
-__device__ const terminal_t PRODUCTION_TO_TERMINAL[NUMBER_OF_PRODUCTIONS] =
-  #{cudafy $ map terminalCast production_to_tertminal};
 __device__ const bool PRODUCTION_TO_TERMINAL_IS_VALID[NUMBER_OF_PRODUCTIONS] =
   #{cudafy production_to_tertminal_is_valid};
 __device__ const uint8_t PRODUCTION_TO_ARITY[NUMBER_OF_PRODUCTIONS] =
@@ -72,7 +70,6 @@ __device__ const int32_t HASH_TABLE_PRODUCTIONS_SPAN[HASH_TABLE_SIZE][2] =
     start_terminal = startTerminal parser
     end_terminal = endTerminal parser
     number_of_productions = numberOfProductions parser
-    production_to_tertminal = fromMaybe 0 <$> productionToTerminal parser
     production_to_tertminal_is_valid = isJust <$> productionToTerminal parser
     ari = cudafy $ arities parser
     hash_table = llpTable parser

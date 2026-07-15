@@ -37,9 +37,11 @@ module type parser = {
   type terminal
   type production_int
   type production
-  type node 't 'p = #terminal t (idx.t, idx.t) | #production p
-  val parse_int [n] : [n](terminal_int, (idx.t, idx.t)) -> opt ([](idx.t, node terminal_int production_int))
-  val parse [n] : [n](terminal_int, (idx.t, idx.t)) -> opt ([](idx.t, node terminal production))
+  -- | The compact parse tree: per production node its id and parent
+  -- index, plus per input terminal the index of its parent node in
+  -- the tree.
+  val parse_int [n] : [n]terminal_int -> opt ([](production_int, idx.t), [n]idx.t)
+  val parse [n] : [n]terminal_int -> opt ([](production, idx.t), [n]idx.t)
   val pre_productions_int [n] : [n]terminal_int -> opt ([]production_int)
   val pre_productions [n] : [n]terminal_int -> opt ([]production)
 }
@@ -296,59 +298,50 @@ module mk_parser (P: parser_context)
        then parents'
        else let parents'[0] = idx.i64 0 in parents'
 
-  type node 't 'p = #terminal t (idx.t, idx.t) | #production p
-
-  def safe_zip [n] [m] 'a 'b (a: [n]a) (b: [m]b) =
-    if n == m
-    then zip a (sized n b)
-    else assert true []
-
-  def terminal_offsets [n] [m]
-                       (spans: [m](idx.t, idx.t))
-                       (ts: [n](opt terminal_int)) : [](idx.t, node terminal_int production_int) =
-    map (opt.is_some) ts
-    |> zip3 (iota n) (ts)
-    |> filter (\(_, _, b) -> b)
-    |> safe_zip spans
-    |> map (\(s, (i, t, _)) ->
-              opt.from empty_terminal t
-              |> (\t' -> (idx.i64 i, #terminal t' s)))
-
-  def parse_int_flag [n] (arr: [n](terminal_int, (idx.t, idx.t))) : (bool, [](idx.t, node terminal_int production_int)) =
-    let (ters, spans) = unzip arr
-    let prods' = ters |> pre_productions_int
-    let result =
+  -- | Parse a token sequence into the compact tree: the preorder
+  -- production list with terminal-production slots dropped, each
+  -- remaining node paired with its parent index in the compacted
+  -- numbering, plus per input token the parent index of its
+  -- (dropped) terminal slot.  Parents always point at production
+  -- nodes, so remapping is a subtraction of the number of terminal
+  -- slots at or before the old index.
+  def parse_int_flag [n] (ters: [n]terminal_int) : (bool, [](production_int, idx.t), [n]idx.t) =
+    let prods' = pre_productions_int ters
+    let prods =
       match prods'
-      case #some prods ->
-        let parent_vector = parents prods
-        let ts = map production_to_terminal prods
-        let (offsets, tprods) = terminal_offsets spans ts |> unzip
-        let prods =
-          map (\p -> #production p)
-              prods
-          :> [](node terminal_int production_int)
-        in scatter prods (map idx.to_i64 offsets) tprods
-           |> zip parent_vector
-      case _ -> []
-    in if opt.is_some prods' then (true, result) else (false, [])
+      case #some ps -> ps
+      case #none -> []
+    let m = length prods
+    let parent_vector = parents prods
+    let is_term = map (opt.is_some <-< production_to_terminal) prods
+    let t_incl = map i64.bool is_term |> scan (+) 0
+    let num_terms = if m == 0 then 0 else t_incl[m - 1]
+    let is_valid = opt.is_some prods' && num_terms == n
+    let remap p = let p' = idx.to_i64 p in idx.i64 (p' - t_incl[p'])
+    let tree =
+      zip3 prods parent_vector is_term
+      |> filter (\(_, _, b) -> !b)
+      |> map (\(p, par, _) -> (p, remap par))
+    let token_parents =
+      if is_valid
+      then zip is_term parent_vector
+           |> filter (.0)
+           |> map (remap <-< (.1))
+           |> sized n
+      else replicate n (idx.i64 0)
+    in (is_valid, tree, token_parents)
 
-  def parse_int [n] (arr: [n](terminal_int, (idx.t, idx.t))) : opt ([](idx.t, node terminal_int production_int)) =
-    let (is_valid, prods) = parse_int_flag arr
-    in if is_valid then #some prods else #none
+  def parse_int [n] (ters: [n]terminal_int) : opt ([](production_int, idx.t), [n]idx.t) =
+    let (is_valid, tree, token_parents) = parse_int_flag ters
+    in if is_valid then #some (tree, token_parents) else #none
 
-  def parse [n] (arr: [n](terminal_int, (idx.t, idx.t))) : opt ([](idx.t, node terminal production)) =
-    let (is_valid, prods) = parse_int_flag arr
-    let result =
-      map (\(i, n) ->
-             match n
-             case #terminal t s ->
-               ((i, #terminal (copy P.terminal_int_to_name[terminal_int_module.to_i64 t]) s) :> (idx.t, node terminal P.production))
-             case #production p ->
-               ((i, #production (copy P.production_int_to_name[production_int_module.to_i64 p])) :> (idx.t, node terminal production)))
-          prods
-    in if is_valid
-       then #some result
-       else #none
+  def parse [n] (ters: [n]terminal_int) : opt ([](production, idx.t), [n]idx.t) =
+    let (is_valid, tree, token_parents) = parse_int_flag ters
+    let named =
+      map (\(p, par) ->
+             (copy P.production_int_to_name[production_int_module.to_i64 p], par))
+          tree
+    in if is_valid then #some (named, token_parents) else #none
 }
 
 -- End of parser.fut

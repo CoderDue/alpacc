@@ -54,6 +54,7 @@ library
     , parallel
     , mtl
     , filepath
+    , directory
     , deepseq-generics
     , deepseq
     , megaparsec

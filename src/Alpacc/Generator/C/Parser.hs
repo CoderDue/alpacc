@@ -88,11 +88,8 @@ static const uint64_t PRODUCTION_TO_ARITY[NUMBER_OF_PRODUCTIONS] =
   #{cudafy ari};
 static const bool PRODUCTION_TO_TERMINAL_IS_VALID[NUMBER_OF_PRODUCTIONS] =
   #{cudafy production_to_terminal_is_valid};
-static const terminal_t PRODUCTION_TO_TERMINAL[NUMBER_OF_PRODUCTIONS] =
-  #{cudafy $ map terminalCast production_to_terminal_val};
 |]
   where
     number_of_productions = numberOfProductions parser
     ari = arities parser
     production_to_terminal_is_valid = isJust <$> productionToTerminal parser
-    production_to_terminal_val = fromMaybe 0 <$> productionToTerminal parser

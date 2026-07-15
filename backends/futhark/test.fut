@@ -136,44 +136,44 @@ module lexer_parser_test
   (P: {
     type terminal_int
     type production_int
-    type node 't 'p = #terminal t (idx.t, idx.t) | #production p
-    val parse_int [n] : [n]u8 -> opt ([](idx.t, node terminal_int production_int))
+    val parse_int [n] : [n]u8 -> opt ( [](terminal_int, (idx.t, idx.t))
+                                     , [](production_int, idx.t)
+                                     , []idx.t
+                                     )
   })
   (T: integral with t = P.terminal_int)
   (Q: integral with t = P.production_int) = {
   type terminal = P.terminal_int
   type production = P.production_int
-  type node 't 'p = P.node t p
 
+  def terminal_bytes : i64 = i64.i32 T.num_bits / 8
   def production_bytes : i64 = i64.i32 Q.num_bits / 8
-  def node_bytes : i64 = 25 + production_bytes
-
-  -- Node ids use the production width: terminal ids always fit in
-  -- production_int (the invariant the backends rely on).
-  #[inline]
-  def encode_node (p: idx.t) (n: node terminal production) : [node_bytes]u8 =
-    sized node_bytes
-          (match n
-           case #production t ->
-             [0u8]
-             ++ encode_u64 (u64.i64 (idx.to_i64 p))
-             ++ encode_le production_bytes (u64.i64 (Q.to_i64 t))
-             ++ encode_u64 0
-             ++ encode_u64 0
-           case #terminal t (i, j) ->
-             [1u8]
-             ++ encode_u64 (u64.i64 (idx.to_i64 p))
-             ++ encode_le production_bytes (u64.i64 (T.to_i64 t))
-             ++ encode_u64 (u64.i64 (idx.to_i64 i))
-             ++ encode_u64 (u64.i64 (idx.to_i64 j)))
 
   #[inline]
-  def encode_tree [n] (ns: opt ([n](idx.t, P.node terminal production))) : []u8 =
-    match ns
-    case #some ns' ->
-      [u8.bool true]
-      ++ encode_u64 (u64.i64 n)
-      ++ flatten (map (uncurry encode_node) ns')
+  def encode_idx (i: idx.t) : [8]u8 =
+    encode_u64 (u64.i64 (idx.to_i64 i))
+
+  -- SoA response record: u8 valid; u64 num_tokens; token ids, starts,
+  -- ends; u64 num_nodes; production ids, parents; token parents.
+  #[inline]
+  def encode_result (r: opt ( [](terminal, (idx.t, idx.t))
+                            , [](production, idx.t)
+                            , []idx.t
+                            )) : []u8 =
+    match r
+    case #some (tokens, tree, token_parents) ->
+      let (ts, spans) = unzip tokens
+      let (starts, ends) = unzip spans
+      let (prods, parents) = unzip tree
+      in [u8.bool true]
+         ++ encode_u64 (u64.i64 (length tokens))
+         ++ flatten (map (encode_le terminal_bytes <-< u64.i64 <-< T.to_i64) ts)
+         ++ flatten (map encode_idx starts)
+         ++ flatten (map encode_idx ends)
+         ++ encode_u64 (u64.i64 (length tree))
+         ++ flatten (map (encode_le production_bytes <-< u64.i64 <-< Q.to_i64) prods)
+         ++ flatten (map encode_idx parents)
+         ++ flatten (map encode_idx token_parents)
     case #none -> [u8.bool false]
 
   def test [n] (bytes: [n]u8) : []u8 =
@@ -190,7 +190,7 @@ module lexer_parser_test
         let inputs''' = drop input_size inputs''
         let output =
           P.parse_int input
-          |> encode_tree
+          |> encode_result
         let new_size = size + length output
         let result =
           if length result <= new_size

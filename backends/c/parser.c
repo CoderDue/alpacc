@@ -116,4 +116,39 @@ static void compute_parents(const production_t *prods, uint64_t np,
   free(remaining);
   free(stk);
 }
+
+// Compact the production list to a productions-only tree: drop terminal
+// slots, remap parents into the compacted numbering, and record for each
+// lexeme the compacted index of its parent node.  Returns false if the
+// number of terminal slots does not match num_lexemes.  Caller provides
+// tree_prods/tree_parents of capacity np and token_parents of capacity
+// num_lexemes; on success the tree arrays hold np - num_lexemes entries.
+static bool compact_tree(const production_t *prods, uint64_t np,
+                         const index_t *parents, uint64_t num_lexemes,
+                         production_t *tree_prods, index_t *tree_parents,
+                         index_t *token_parents) {
+  uint64_t *t_incl = (uint64_t *) malloc(np * sizeof(uint64_t));
+  uint64_t count = 0;
+  for (uint64_t i = 0; i < np; i++) {
+    if (PRODUCTION_TO_TERMINAL_IS_VALID[prods[i]]) count++;
+    t_incl[i] = count;
+  }
+  if (count != num_lexemes) {
+    free(t_incl);
+    return false;
+  }
+  for (uint64_t i = 0; i < np; i++) {
+    index_t p_old = parents[i];
+    index_t p_new = p_old - (index_t) t_incl[p_old];
+    if (PRODUCTION_TO_TERMINAL_IS_VALID[prods[i]]) {
+      token_parents[t_incl[i] - 1] = p_new;
+    } else {
+      uint64_t j = i - t_incl[i];
+      tree_prods[j] = prods[i];
+      tree_parents[j] = p_new;
+    }
+  }
+  free(t_incl);
+  return true;
+}
 #endif /* ALPACC_WITH_TREE */

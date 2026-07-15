@@ -36,9 +36,7 @@ value domain of the grammar:
 
 - `terminal_t` — token/terminal ids.
 - `production_t` — production ids; only defined in builds that contain a
-  parser. In combined mode, node ids on the wire also use `production_t`:
-  terminal ids always fit in `production_t` (the same invariant the CUDA
-  device code relies on for its node-id arrays).
+  parser.
 - `index_t` — input positions / lexeme spans; `int64_t` in both backends.
 
 All backends derive these types from the same analysis, so a given
@@ -100,17 +98,23 @@ u64          num_productions
 production_t × num_productions
 ```
 
-**Combined** — the concrete syntax tree in preorder; parents are node
-indices in this order (the root's parent is its own index):
+**Combined** — the tokens exactly as the lexer produced them, followed by
+a compact productions-only parse tree. The tree is the preorder leftmost
+derivation with the terminal slots dropped; parents are indices into the
+compacted node arrays (the root's parent is 0, its own index). Each token
+gets its parent node's index in `token_parents`; token `i` corresponds to
+the `i`-th terminal slot of the underlying derivation. All sections are
+structure-of-arrays:
 
 ```
+u64          num_tokens
+terminal_t   × num_tokens   token ids
+index_t      × num_tokens   starts (inclusive byte offsets)
+index_t      × num_tokens   ends   (exclusive byte offsets)
 u64          num_nodes
-per node:
-  u8           is_terminal   1 = leaf/terminal node, 0 = production node
-  index_t      parent        index of parent node
-  production_t id            production id, or terminal id for leaves
-  index_t      start         lexeme span (0 for production nodes)
-  index_t      end           lexeme span (0 for production nodes)
+production_t × num_nodes    production ids (preorder)
+index_t      × num_nodes    parents (index of parent node)
+index_t      × num_tokens   token_parents (index of each token's parent node)
 ```
 
 ## Backend differences

@@ -703,20 +703,27 @@ static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
 #endif // HAS_PARSER
 
 // ---------------------------------------------------------------------------
-// Both mode: full pipeline (raw bytes → lexer → fused parser with parents)
+// Both mode: full pipeline (raw bytes → lexer → fused parser → compact tree)
 //
-// Frame payload: n raw bytes.  Response record: u8 valid; if valid:
-// u64 num_nodes; per node: u8 is_terminal, index_t parent,
-// production_t id (terminal ids fit in production_t; see d_node_ids in
-// parser.cu), index_t start, index_t end (0, 0 for nonterminal nodes).
+// Frame payload: n raw bytes.  Response record (SoA sections): u8 valid;
+// if valid: u64 num_tokens; num_tokens × terminal_t token ids;
+// num_tokens × index_t starts; num_tokens × index_t ends; u64 num_nodes;
+// num_nodes × production_t production ids; num_nodes × index_t parents;
+// num_tokens × index_t token parents.
 // Same format as the generated C backend's combined mode.
 // ---------------------------------------------------------------------------
 
 #if defined(HAS_LEXER) && defined(HAS_PARSER)
 
-// Run the full pipeline on one test; fills `nodes` and returns validity.
+struct BothResult {
+    std::vector<terminal_t> toks;
+    std::vector<index_t>    starts, ends;
+    BothTree                tree;
+};
+
+// Run the full pipeline on one test; fills `res` and returns validity.
 template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
-static bool both_one(const uint8_t* bytes, uint64_t n, BothNodes& nodes) {
+static bool both_one(const uint8_t* bytes, uint64_t n, BothResult& res) {
     bool valid = true;
     uint32_t num_lex = 0;
     uint8_t*    d_string    = nullptr;
@@ -743,6 +750,15 @@ static bool both_one(const uint8_t* bytes, uint64_t n, BothNodes& nodes) {
         ctx.cleanUp();
     }
 
+    if (valid && num_lex > 0) {
+        res.toks.resize(num_lex);
+        res.starts.resize(num_lex);
+        res.ends.resize(num_lex);
+        gpuAssert(cudaMemcpy(res.toks.data(),   d_terminals, num_lex * sizeof(terminal_t), cudaMemcpyDeviceToHost));
+        gpuAssert(cudaMemcpy(res.starts.data(), d_starts,    num_lex * sizeof(index_t),    cudaMemcpyDeviceToHost));
+        gpuAssert(cudaMemcpy(res.ends.data(),   d_ends,      num_lex * sizeof(index_t),    cudaMemcpyDeviceToHost));
+    }
+
     if (valid) {
         index_t m = (index_t)num_lex + (index_t)2;
         if ((uint64_t)m * (uint64_t)MAX_BRACKETS_PER_POSITION > (uint64_t)INT_MAX ||
@@ -750,8 +766,7 @@ static bool both_one(const uint8_t* bytes, uint64_t n, BothNodes& nodes) {
             valid = false;
         } else {
             ParserFused p = allocParserFused(m);
-            valid = runBothFused(p, d_terminals, (index_t)num_lex,
-                                 d_starts, d_ends, nodes);
+            valid = runBothFused(p, d_terminals, (index_t)num_lex, res.tree);
             freeParserFused(p);
         }
     }
@@ -765,20 +780,20 @@ static bool both_one(const uint8_t* bytes, uint64_t n, BothNodes& nodes) {
 
 template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
 static void run_one_both_test(const uint8_t* bytes, uint64_t n, FILE* out) {
-    BothNodes nodes;
-    if (!both_one<BLOCK_SIZE, ITEMS_PER_THREAD>(bytes, n, nodes)) {
+    BothResult res;
+    if (!both_one<BLOCK_SIZE, ITEMS_PER_THREAD>(bytes, n, res)) {
         fputc(0, out);
         return;
     }
     fputc(1, out);
-    write_u64_le(out, (uint64_t)nodes.ids.size());
-    for (size_t i = 0; i < nodes.ids.size(); i++) {
-        fputc(nodes.is_term[i] ? 1 : 0, out);
-        write_val(out, nodes.parents[i]);
-        write_val(out, nodes.ids[i]);
-        write_val(out, nodes.starts[i]);
-        write_val(out, nodes.ends[i]);
-    }
+    write_u64_le(out, (uint64_t)res.toks.size());
+    fwrite(res.toks.data(),   sizeof(terminal_t), res.toks.size(),   out);
+    fwrite(res.starts.data(), sizeof(index_t),    res.starts.size(), out);
+    fwrite(res.ends.data(),   sizeof(index_t),    res.ends.size(),   out);
+    write_u64_le(out, (uint64_t)res.tree.prods.size());
+    fwrite(res.tree.prods.data(),         sizeof(production_t), res.tree.prods.size(),         out);
+    fwrite(res.tree.parents.data(),       sizeof(index_t),      res.tree.parents.size(),       out);
+    fwrite(res.tree.token_parents.data(), sizeof(index_t),      res.tree.token_parents.size(), out);
 }
 
 template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>

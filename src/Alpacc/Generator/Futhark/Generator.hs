@@ -30,10 +30,19 @@ entry parse s =
     match tokens'
     case #some t -> t
     case #none -> []
-  let cst = parser.parse tokens
-  in if opt.is_some tokens'
-     then cst
-     else #none
+  let res = parser.parse (map (.0) tokens)
+  let (tree, token_parents) =
+    match res
+    case #some r -> r
+    case #none -> ([], map (const (idx.i64 0)) tokens)
+  let result : opt ( [](parser.terminal_int, (idx.t, idx.t))
+                   , [](parser.production, idx.t)
+                   , []idx.t
+                   ) =
+    if opt.is_some tokens' && opt.is_some res
+    then #some (tokens, tree, token_parents)
+    else #none
+  in result
 
 entry parse_int s =
   let tokens' = lexer.lex_int 16777216 s
@@ -41,15 +50,23 @@ entry parse_int s =
     match tokens'
     case #some t -> t
     case #none -> []
-  let cst = parser.parse_int tokens
-  in if opt.is_some tokens'
-     then cst
-     else #none
+  let res = parser.parse_int (map (.0) tokens)
+  let (tree, token_parents) =
+    match res
+    case #some r -> r
+    case #none -> ([], map (const (idx.i64 0)) tokens)
+  let result : opt ( [](parser.terminal_int, (idx.t, idx.t))
+                   , [](parser.production_int, idx.t)
+                   , []idx.t
+                   ) =
+    if opt.is_some tokens' && opt.is_some res
+    then #some (tokens, tree, token_parents)
+    else #none
+  in result
 
 module tester = lexer_parser_test {
   type terminal_int = parser.terminal_int
   type production_int = parser.production_int
-  type node 't 'p = parser.node t p
   def parse_int = parse_int
 } #{futharkify terminal_type} #{futharkify production_type}
 

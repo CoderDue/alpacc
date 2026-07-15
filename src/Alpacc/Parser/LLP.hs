@@ -6,7 +6,8 @@ module Alpacc.Parser.LLP
     llpParserTableWithStartsHomomorphisms,
     Bracket (..),
     LlpContext (..),
-    FlatNode (..),
+    FlatTree (..),
+    PushCounts (..),
     llpParseFlatTree,
     llpParseDirectPush,
     psls,
@@ -26,8 +27,8 @@ import Data.List qualified as List
 import Data.Map (Map)
 import Data.Map qualified as Map hiding (Map)
 import Data.Maybe
-import Data.Sequence (Seq (..), (<|))
-import Data.Sequence qualified as Seq hiding (Seq (..), (<|), (><), (|>))
+import Data.Sequence (Seq (..))
+import Data.Sequence qualified as Seq hiding (Seq (..), (><), (|>))
 import Data.Set (Set)
 import Data.Set qualified as Set hiding (Set)
 import Data.String.Interpolate (i)
@@ -648,14 +649,23 @@ llpParse q k table string = do
     glueAll [] = Nothing
     glueAll (x : xs) = foldM glue x xs
 
-data FlatNode i m t
-  = FlatProduction !i !i
-  | FlatTerminal !i m !t
+-- | A parse tree in compact flat form: the tree contains only production
+-- nodes (terminal slots of the derivation are dropped), in preorder.
+-- Parents are indices into that preorder; the root's parent is 0.  Tokens
+-- attach to the tree through 'flatTokenParents', one parent index per token
+-- in token order.
+data FlatTree i = FlatTree
+  { flatProductions :: !(Seq i),
+    flatParents :: !(Seq i),
+    flatTokenParents :: !(Seq i)
+  }
   deriving (Show, Ord, Eq)
 
-instance Functor (FlatNode i m) where
-  fmap _ (FlatProduction i1 i2) = FlatProduction i1 i2
-  fmap f (FlatTerminal j m t) = FlatTerminal j m (f t)
+instance Semigroup (FlatTree i) where
+  FlatTree a b c <> FlatTree a' b' c' = FlatTree (a <> a') (b <> b') (c <> c')
+
+instance Monoid (FlatTree i) where
+  mempty = FlatTree Seq.empty Seq.empty Seq.empty
 
 data CST i m t
   = CSTProduction i [CST i m t]
@@ -712,15 +722,20 @@ llpParseTree grammar q k table str_meta = do
       where
         (n, ms'', ds'') = mkTree ms' ds'
 
-flattenTree :: (Integral i) => CST i m t -> [FlatNode i m t]
-flattenTree = toList . fst . mkFlatTree 0 0
+flattenTree :: (Integral i) => CST i m t -> FlatTree i
+flattenTree = fst . mkFlatTree 0 0
   where
-    mkFlatTree c p (CSTTerminal m t) = (Seq.singleton $ FlatTerminal p m t, succ c)
+    mkFlatTree c p (CSTTerminal _ _) =
+      (mempty {flatTokenParents = Seq.singleton p}, c)
     mkFlatTree c p (CSTProduction j subtrees) =
-      (curr <| res, c''')
+      foldl' auxiliary (curr, succ c) subtrees
       where
-        curr = FlatProduction p j
-        (res, c''') = foldl' auxiliary (Seq.empty, succ c) subtrees
+        curr =
+          FlatTree
+            { flatProductions = Seq.singleton j,
+              flatParents = Seq.singleton p,
+              flatTokenParents = Seq.empty
+            }
         auxiliary (flat, c') t = (flat <> flat', c'')
           where
             (flat', c'') = mkFlatTree c' c t
@@ -739,7 +754,7 @@ llpParseFlatTree ::
       [Int]
     ) ->
   [(t', m)] ->
-  Maybe [FlatNode Word64 m t]
+  Maybe (FlatTree Word64)
 llpParseFlatTree grammar q k table str_meta =
   flattenTree <$> llpParseTree grammar q k table str_meta
 
@@ -750,15 +765,25 @@ data PushSt tok bsym meta = PushSt
   , psAhead   :: ![(tok, meta)]
   , psBstk    :: ![bsym]
   , psPstk    :: ![(Int, Int)]
-  , psCount   :: !Word64
-  , psProdIdx :: !Int
+  , psTreeCount  :: !Word64
+  , psTokenCount :: !Word64
+  , psTreeIdx    :: !Int
   }
 
--- | Push-mode streaming parser.  Returns @(step, finalize)@:
+-- | Final counts reported by 'llpParseDirectPush'.
+data PushCounts = PushCounts
+  { pushTreeNodes :: !Word64
+  , pushTokenParents :: !Word64
+  }
+
+-- | Push-mode streaming parser.  Emits the compact flat tree (see 'FlatTree'):
+-- production nodes via @emitProduction id parent@ in preorder (compact
+-- indices) and one @emitTokenParent parent@ per token in token order.
+-- Returns @(step, finalize)@:
 --   * @step (tok, meta)@ -- call once per token in order; after a parse error
 --     further calls are no-ops.
 --   * @finalize@ -- call once after all tokens to process the end sentinel and
---     get the final node count (Nothing = parse error).
+--     get the final counts (Nothing = parse error).
 --
 -- No intermediate token list is allocated; this is meant to be driven by
 -- 'tokenizeWithBS' in a single pass.
@@ -774,12 +799,13 @@ llpParseDirectPush ::
     ( [Bracket (Symbol (AugmentedNonterminal (Symbol nt T)) (AugmentedTerminal (Unused t)))],
       [Int]
     ) ->
-  (FlatNode Word64 meta T -> IO ()) ->
+  (Word64 -> Word64 -> IO ()) ->
+  (Word64 -> IO ()) ->
   IO
     ( (AugmentedTerminal (Unused t), meta) -> IO ()
-    , IO (Maybe Word64)
+    , IO (Maybe PushCounts)
     )
-llpParseDirectPush grammar q k table emitNode = do
+llpParseDirectPush grammar q k table emitProduction emitTokenParent = do
   -- Parser state record.  'startup=True' while we accumulate the first k tokens
   -- needed to look up the RightTurnstile position in the table.
   let initSt = PushSt
@@ -788,8 +814,9 @@ llpParseDirectPush grammar q k table emitNode = do
         , psAhead     = [] :: [(AugmentedTerminal (Unused t), meta)]
         , psBstk      = [] :: [Symbol (AugmentedNonterminal (Symbol nt T)) (AugmentedTerminal (Unused t))]
         , psPstk      = [] :: [(Int, Int)]
-        , psCount     = 0  :: Word64
-        , psProdIdx   = 0  :: Int
+        , psTreeCount  = 0 :: Word64
+        , psTokenCount = 0 :: Word64
+        , psTreeIdx    = 0 :: Int
         }
   stateRef <- newIORef (Right initSt)
 
@@ -807,7 +834,7 @@ llpParseDirectPush grammar q k table emitNode = do
                     -- Have k tokens: process RightTurnstile position, then drain.
                     let fwd = map fst (take (k - 1) ahead')
                         startKey = ([] :: [AugmentedTerminal (Unused t)], RightTurnstile : fwd)
-                    r <- processStart (psBack st) ahead' (psBstk st) (psPstk st) (psCount st) (psProdIdx st) startKey
+                    r <- processStart st ahead' startKey
                     case r of
                       Nothing  -> writeIORef stateRef (Left ())
                       Just st' -> writeIORef stateRef (Right st')
@@ -832,24 +859,26 @@ llpParseDirectPush grammar q k table emitNode = do
                 -- Fewer than k tokens total: process RightTurnstile then drain all.
                 let fwd      = padFwd (psAhead st)
                     startKey = ([] :: [AugmentedTerminal (Unused t)], RightTurnstile : fwd)
-                r <- processStart (psBack st) (psAhead st) (psBstk st) (psPstk st) (psCount st) (psProdIdx st) startKey
+                r <- processStart st (psAhead st) startKey
                 case r of
                   Nothing  -> pure Nothing
                   Just st' -> finishDrain st'
               else finishDrain st
 
       -- Process the RightTurnstile position, then run drain.
-      processStart back ahead bstk pstk !c !pidx startKey =
+      processStart st ahead startKey =
         case Map.lookup startKey table of
           Nothing -> pure Nothing
           Just (brackets, prods) ->
-            case pshBrackets brackets bstk of
+            case pshBrackets brackets (psBstk st) of
               Nothing    -> pure Nothing
               Just bstk1 -> do
-                (c1, pidx1, _, pstk1) <- emtProds prods [] c pidx pstk
-                let back1 = keepQ (back ++ [(RightTurnstile, error "no meta")])
-                    st1   = PushSt False back1 ahead bstk1 pstk1 c1 pidx1
-                drain st1
+                (cp1, ct1, tidx1, _, pstk1) <-
+                  emtProds prods [] (psTreeCount st) (psTokenCount st) (psTreeIdx st) (psPstk st)
+                let back1 = keepQ (psBack st ++ [(RightTurnstile, error "no meta")])
+                drain st { psStartup = False, psBack = back1, psAhead = ahead
+                         , psBstk = bstk1, psPstk = pstk1
+                         , psTreeCount = cp1, psTokenCount = ct1, psTreeIdx = tidx1 }
 
       -- drain: consume tokens while ahead has more than k-1 entries.
       drain st
@@ -857,55 +886,60 @@ llpParseDirectPush grammar q k table emitNode = do
             [] -> pure (Just st)
             (current : rest) -> do
               let fwdToks = map fst (take (k - 1) rest)
-              r <- processOne (psBack st) current fwdToks (psBstk st) (psPstk st) (psCount st) (psProdIdx st)
+              r <- processOne current fwdToks st
               case r of
-                Nothing                              -> pure Nothing
-                Just (back', bstk', pstk', c', pi') ->
-                  drain st { psBack = back', psAhead = rest, psBstk = bstk', psPstk = pstk', psCount = c', psProdIdx = pi' }
+                Nothing  -> pure Nothing
+                Just st' -> drain st' { psAhead = rest }
         | otherwise = pure (Just st)
 
       -- finishDrain: drainAll remaining tokens then process LeftTurnstile.
       finishDrain st = do
-        r <- drainAll (psBack st) (psAhead st) (psBstk st) (psPstk st) (psCount st) (psProdIdx st)
+        r <- drainAll st
         case r of
-          Nothing                              -> pure Nothing
-          Just (back', bstk', pstk', c', pi') -> processEnd back' bstk' pstk' c' pi'
+          Nothing  -> pure Nothing
+          Just st' -> processEnd st'
 
       -- drainAll: process every remaining token, padding forward with LeftTurnstile.
-      drainAll back [] bstk pstk !c !pidx = pure $ Just (back, bstk, pstk, c, pidx)
-      drainAll back (current : rest) bstk pstk !c !pidx = do
-        let fwdToks = padFwd rest
-        r <- processOne back current fwdToks bstk pstk c pidx
-        case r of
-          Nothing                              -> pure Nothing
-          Just (back', bstk', pstk', c', pi') -> drainAll back' rest bstk' pstk' c' pi'
+      drainAll st = case psAhead st of
+        [] -> pure (Just st)
+        (current : rest) -> do
+          let fwdToks = padFwd rest
+          r <- processOne current fwdToks st
+          case r of
+            Nothing  -> pure Nothing
+            Just st' -> drainAll st' { psAhead = rest }
 
       -- processOne: table lookup + bracket check + emit productions for one token.
-      processOne back current fwdToks bstk pstk !c !pidx = do
-        let backToks   = map fst back
+      processOne current fwdToks st = do
+        let backToks   = map fst (psBack st)
             currentTok = fst current
             key        = (backToks, currentTok : fwdToks)
         case Map.lookup key table of
           Nothing -> pure Nothing
           Just (brackets, prods) ->
-            case pshBrackets brackets bstk of
+            case pshBrackets brackets (psBstk st) of
               Nothing    -> pure Nothing
               Just bstk' -> do
-                (c', pidx', _, pstk') <- emtProds prods [snd current] c pidx pstk
-                let back' = keepQ (back ++ [current])
-                pure (Just (back', bstk', pstk', c', pidx'))
+                (cp', ct', tidx', _, pstk') <-
+                  emtProds prods [snd current] (psTreeCount st) (psTokenCount st) (psTreeIdx st) (psPstk st)
+                pure $ Just st { psBack = keepQ (psBack st ++ [current])
+                               , psBstk = bstk', psPstk = pstk'
+                               , psTreeCount = cp', psTokenCount = ct', psTreeIdx = tidx' }
 
-      processEnd back bstk pstk !c !pidx = do
-        let backToks = map fst back
+      processEnd st = do
+        let backToks = map fst (psBack st)
             key      = (backToks, [LeftTurnstile])
         case Map.lookup key table of
           Nothing -> pure Nothing
           Just (brackets, prods) ->
-            case pshBrackets brackets bstk of
+            case pshBrackets brackets (psBstk st) of
               Nothing    -> pure Nothing
               Just bstk' -> do
-                (c', _, _, _) <- emtProds prods [] c pidx pstk
-                if null bstk' then pure (Just c') else pure Nothing
+                (cp', ct', _, _, _) <-
+                  emtProds prods [] (psTreeCount st) (psTokenCount st) (psTreeIdx st) (psPstk st)
+                if null bstk'
+                  then pure (Just PushCounts { pushTreeNodes = cp', pushTokenParents = ct' })
+                  else pure Nothing
 
   pure (step, finalize)
   where
@@ -930,21 +964,21 @@ llpParseDirectPush grammar q k table emitNode = do
       | otherwise = Nothing
     pshBrackets (RBracket _ : _) [] = Nothing
 
-    emtProds [] ms !c !pidx pstk = pure (c, pidx, ms, pstk)
-    emtProds (d : ds) ms !c !pidx pstk = do
+    emtProds [] ms !cp !ct !tidx pstk = pure (cp, ct, tidx, ms, pstk)
+    emtProds (d : ds) ms !cp !ct !tidx pstk = do
       let arity  = arityOf d
           parent = case pstk of { (p, _) : _ -> fromIntegral p; [] -> 0 }
           pstk'  = case pstk of
                      (_, 1) : t   -> t
                      (p', n) : t  -> (p', n - 1) : t
                      []           -> []
-          pstk2  = if arity > 0 then (pidx, arity) : pstk' else pstk'
+          pstk2  = if arity > 0 then (tidx, arity) : pstk' else pstk'
       case isTerminalProd d of
-        Just t -> case ms of
-          (m : ms') -> do
-            emitNode (FlatTerminal parent m t)
-            emtProds ds ms' (c + 1) (pidx + 1) pstk2
-          [] -> emtProds ds [] (c + 1) (pidx + 1) pstk2
+        Just _ -> case ms of
+          (_ : ms') -> do
+            emitTokenParent parent
+            emtProds ds ms' cp (ct + 1) tidx pstk2
+          [] -> emtProds ds [] cp ct tidx pstk2
         Nothing -> do
-          emitNode (FlatProduction parent (fromIntegral d))
-          emtProds ds ms (c + 1) (pidx + 1) pstk2
+          emitProduction (fromIntegral d) parent
+          emtProds ds ms (cp + 1) ct (tidx + 1) pstk2

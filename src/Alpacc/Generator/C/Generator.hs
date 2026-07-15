@@ -97,10 +97,10 @@ lexerTestCase = Text.unlines
   , "}"
   ]
 
--- Combined: payload is n raw bytes; lex then parse then emit CST nodes.
--- compute_parents() is defined in c/parser.c (uses PRODUCTION_TO_ARITY).
--- Node ids use production_t: terminal ids fit in production_t
--- (same invariant the CUDA backend's d_node_ids relies on).
+-- Combined: payload is n raw bytes; lex then parse, then emit the SoA
+-- record: tokens (ids, starts, ends) followed by the compacted
+-- productions-only tree (prods, parents) and per-token parent indices.
+-- compute_parents()/compact_tree() are defined in c/parser.c.
 bothTestCase :: Text
 bothTestCase = Text.unlines
   [ "#define INPUT_BYTES(n) (n)"
@@ -116,29 +116,29 @@ bothTestCase = Text.unlines
   , "  free(tokens);"
   , "  index_t *parents = (index_t *) malloc(num_prods * sizeof(index_t));"
   , "  compute_parents(prods, num_prods, parents);"
-  , "  fputc(1, out);"
-  , "  write_u64le(out, num_prods);"
-  , "  uint64_t lex_idx = 0;"
-  , "  index_t zero = 0;"
-  , "  for (uint64_t i = 0; i < num_prods; i++) {"
-  , "    production_t prod = prods[i];"
-  , "    if (PRODUCTION_TO_TERMINAL_IS_VALID[prod]) {"
-  , "      production_t id = (production_t) PRODUCTION_TO_TERMINAL[prod];"
-  , "      fputc(1, out);"
-  , "      fwrite(&parents[i], sizeof(index_t), 1, out);"
-  , "      fwrite(&id, sizeof(production_t), 1, out);"
-  , "      fwrite(&lexemes[lex_idx].start, sizeof(index_t), 1, out);"
-  , "      fwrite(&lexemes[lex_idx].end, sizeof(index_t), 1, out);"
-  , "      lex_idx++;"
-  , "    } else {"
-  , "      fputc(0, out);"
-  , "      fwrite(&parents[i], sizeof(index_t), 1, out);"
-  , "      fwrite(&prod, sizeof(production_t), 1, out);"
-  , "      fwrite(&zero, sizeof(index_t), 1, out);"
-  , "      fwrite(&zero, sizeof(index_t), 1, out);"
-  , "    }"
+  , "  production_t *tree_prods    = (production_t *) malloc(num_prods * sizeof(production_t));"
+  , "  index_t      *tree_parents  = (index_t *)      malloc(num_prods * sizeof(index_t));"
+  , "  index_t      *token_parents = (index_t *)      malloc(num_lexemes * sizeof(index_t));"
+  , "  if (!compact_tree(prods, num_prods, parents, num_lexemes,"
+  , "                    tree_prods, tree_parents, token_parents)) {"
+  , "    fputc(0, out);"
+  , "  } else {"
+  , "    uint64_t num_nodes = num_prods - num_lexemes;"
+  , "    fputc(1, out);"
+  , "    write_u64le(out, num_lexemes);"
+  , "    for (uint64_t i = 0; i < num_lexemes; i++)"
+  , "      fwrite(&lexemes[i].terminal, sizeof(terminal_t), 1, out);"
+  , "    for (uint64_t i = 0; i < num_lexemes; i++)"
+  , "      fwrite(&lexemes[i].start, sizeof(index_t), 1, out);"
+  , "    for (uint64_t i = 0; i < num_lexemes; i++)"
+  , "      fwrite(&lexemes[i].end, sizeof(index_t), 1, out);"
+  , "    write_u64le(out, num_nodes);"
+  , "    fwrite(tree_prods, sizeof(production_t), num_nodes, out);"
+  , "    fwrite(tree_parents, sizeof(index_t), num_nodes, out);"
+  , "    fwrite(token_parents, sizeof(index_t), num_lexemes, out);"
   , "  }"
   , "  free(prods); free(parents); free(lexemes);"
+  , "  free(tree_prods); free(tree_parents); free(token_parents);"
   , "}"
   , "static void print_layout(FILE *f) {"
   , "  fprintf(f, \"terminal_t=%zu\\n\", sizeof(terminal_t));"

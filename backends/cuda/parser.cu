@@ -20,13 +20,14 @@
 //            itself structured as grid.sync() phases.
 //   Phase F: bracket symbol check of each right bracket against its match.
 //
-// Combined (lexer+parser) mode additionally computes the CST parent vector
-// and terminal-node spans (mirrors `parents` / `parse_int` in parser.fut),
-// still inside the same cooperative kernel:
+// Combined (lexer+parser) mode additionally computes the compact parse
+// tree (mirrors `parents` / `parse_int` in parser.fut), still inside the
+// same cooperative kernel:
 //   Phase G: exclusive scan of (arity - 1) over the productions.
 //   Phase H: PSE(<=) over that scan → parent vector (parents[0] = 0).
-//   Phase I: scan of is-terminal flags → lexeme index per terminal
-//            production; node id/span assembly (terminal_offsets + scatter).
+//   Phase I: scan of is-terminal flags → compaction: terminal slots are
+//            dropped, parents remapped into the compacted numbering, and
+//            each terminal slot records its parent as token_parents[lexeme].
 //
 // Compacted layout: buffer capacity is bounded by
 // m * MAX_BRACKETS_PER_POSITION / m * MAX_PRODS_PER_POSITION (the maximal
@@ -215,17 +216,14 @@ struct FusedBufs {
     index_t*  d_prefix_min;
 
 #ifdef HAS_LEXER
-    // Combined mode (parse_int): parents + CST node assembly.
+    // Combined mode (parse_int): parents + compact-tree assembly.
     // d_scan/d_agg_d/d_match are reused for the parents scan and PSE;
-    // d_match holds the parent vector after Phase H/I.
+    // d_match holds the (old-numbering) parent vector after Phase H.
     bool           with_parents;    // runtime: skip G/H/I on token-only paths
     index_t        num_lexemes;
-    const index_t* d_lex_starts;   // [num_lexemes] lexeme spans (lexer output)
-    const index_t* d_lex_ends;
-    uint8_t*       d_node_is_term;  // [max_pr]
-    production_t*  d_node_ids;     // [max_pr] terminal or production id (both fit in production_t)
-    index_t*       d_node_starts;  // [max_pr]
-    index_t*       d_node_ends;    // [max_pr]
+    production_t*  d_tree_prods;    // [max_pr] compacted tree production ids
+    index_t*       d_tree_parents;  // [max_pr] compacted tree parent indices
+    index_t*       d_token_parents; // [max_pr] per lexeme: parent tree index
 #endif
 };
 
@@ -435,12 +433,16 @@ parserFusedKernel(FusedBufs b)
     }
     grid.sync();
 
-    // ---- Phase I: parents fixup + terminal-node assembly ----
-    // The is-term flags are computed on the fly from d_productions, so the
-    // parents fixup and the flag scan are independent: no grid.sync between.
+    // ---- Phase I: parents fixup + compact-tree assembly ----
+    // Terminal-production slots are dropped from the tree; indices are
+    // remapped by subtracting the inclusive is-term scan (t_incl).  Parents
+    // always point at production nodes, so their remap is the same
+    // subtraction.  Terminal slot k (in order) belongs to lexeme
+    // t_incl[i] - 1 and contributes token_parents[lexeme] instead.
+    // The parents fixup and the flag scan are independent: no grid.sync
+    // between them.
     for (index_t i = grank; i < num_prods; i += gsz) {
         if (i == (index_t)0 || b.d_match[i] < (index_t)0) b.d_match[i] = (index_t)0;
-        b.d_node_is_term[i] = PRODUCTION_TO_TERMINAL_IS_VALID[b.d_productions[i]] ? 1 : 0;
     }
     coopScanPass1(b.d_productions, b.d_scan, b.d_agg_d, num_prods, IsTermFlag());
     grid.sync();
@@ -451,18 +453,20 @@ parserFusedKernel(FusedBufs b)
         atomicAnd(b.d_valid, 0);
     for (index_t i = grank; i < num_prods; i += gsz) {
         production_t prod = b.d_productions[i];
+        index_t tile   = i / (index_t)FUSED_BS;
+        index_t t_incl = b.d_scan[i] + ((tile > 0) ? b.d_agg_d[tile - 1] : (index_t)0);
+        index_t p_old  = b.d_match[i];
+        index_t p_tile = p_old / (index_t)FUSED_BS;
+        index_t p_new  = p_old - (b.d_scan[p_old]
+                                  + ((p_tile > 0) ? b.d_agg_d[p_tile - 1] : (index_t)0));
         if (PRODUCTION_TO_TERMINAL_IS_VALID[prod]) {
-            index_t tile = i / (index_t)FUSED_BS;
-            index_t lex  = b.d_scan[i] + ((tile > 0) ? b.d_agg_d[tile - 1] : (index_t)0) - (index_t)1;
-            bool ok = lex < b.num_lexemes;
-            if (!ok) atomicAnd(b.d_valid, 0);
-            b.d_node_ids[i]    = (production_t)PRODUCTION_TO_TERMINAL[prod];
-            b.d_node_starts[i] = ok ? b.d_lex_starts[lex] : (index_t)0;
-            b.d_node_ends[i]   = ok ? b.d_lex_ends[lex]   : (index_t)0;
+            index_t lex = t_incl - (index_t)1;
+            if (lex < b.num_lexemes) b.d_token_parents[lex] = p_new;
+            else                     atomicAnd(b.d_valid, 0);
         } else {
-            b.d_node_ids[i]    = (production_t)prod;
-            b.d_node_starts[i] = (index_t)0;
-            b.d_node_ends[i]   = (index_t)0;
+            index_t j = i - t_incl;
+            b.d_tree_prods[j]   = prod;
+            b.d_tree_parents[j] = p_new;
         }
     }
 #endif
@@ -537,14 +541,11 @@ static ParserFused allocParserFused(index_t max_m) {
     b.d_arr = p.d_arr;
 
 #ifdef HAS_LEXER
-    gpuAssert(cudaMalloc(&b.d_node_is_term, (size_t)p.max_pr * sizeof(uint8_t)));
-    gpuAssert(cudaMalloc(&b.d_node_ids,     (size_t)p.max_pr * sizeof(production_t)));
-    gpuAssert(cudaMalloc(&b.d_node_starts,  (size_t)p.max_pr * sizeof(index_t)));
-    gpuAssert(cudaMalloc(&b.d_node_ends,    (size_t)p.max_pr * sizeof(index_t)));
+    gpuAssert(cudaMalloc(&b.d_tree_prods,    (size_t)p.max_pr * sizeof(production_t)));
+    gpuAssert(cudaMalloc(&b.d_tree_parents,  (size_t)p.max_pr * sizeof(index_t)));
+    gpuAssert(cudaMalloc(&b.d_token_parents, (size_t)p.max_pr * sizeof(index_t)));
     b.with_parents = false;
     b.num_lexemes  = 0;
-    b.d_lex_starts = nullptr;
-    b.d_lex_ends   = nullptr;
 #endif
 
     int bps = 0, sms = 0;
@@ -573,10 +574,9 @@ static void freeParserFused(ParserFused& p) {
     cudaFree(b.d_tree);
     cudaFree(b.d_prefix_min);
 #ifdef HAS_LEXER
-    cudaFree(b.d_node_is_term);
-    cudaFree(b.d_node_ids);
-    cudaFree(b.d_node_starts);
-    cudaFree(b.d_node_ends);
+    cudaFree(b.d_tree_prods);
+    cudaFree(b.d_tree_parents);
+    cudaFree(b.d_token_parents);
 #endif
     p = ParserFused{};
 }
@@ -652,18 +652,15 @@ bool runParserPipeline(const terminal_t* h_tokens, uint64_t n,
 // lexer output that already lives on the device.
 // ---------------------------------------------------------------------------
 
-struct BothNodes {
-    std::vector<uint8_t>      is_term;
-    std::vector<index_t>      parents;
-    std::vector<production_t> ids;   // terminal id for terminal nodes, else production id
-    std::vector<index_t>      starts;
-    std::vector<index_t>      ends;
+struct BothTree {
+    std::vector<production_t> prods;         // [num_tree_nodes] production ids
+    std::vector<index_t>      parents;       // [num_tree_nodes] parent tree indices
+    std::vector<index_t>      token_parents; // [num_lexemes] parent tree index per token
 };
 
 static bool runBothFused(ParserFused& p,
                          const terminal_t* d_tokens, index_t n,
-                         const index_t* d_lex_starts, const index_t* d_lex_ends,
-                         BothNodes& out)
+                         BothTree& out)
 {
     index_t m = n + (index_t)2;
     terminal_t sent = START_TERMINAL;
@@ -677,8 +674,6 @@ static bool runBothFused(ParserFused& p,
 
     p.bufs.with_parents = true;
     p.bufs.num_lexemes  = n;
-    p.bufs.d_lex_starts = d_lex_starts;
-    p.bufs.d_lex_ends   = d_lex_ends;
 
     launchParserFused(p, m);
     gpuAssert(cudaDeviceSynchronize());
@@ -689,25 +684,22 @@ static bool runBothFused(ParserFused& p,
 
     index_t totals[2];
     gpuAssert(cudaMemcpy(totals, p.bufs.d_totals, 2 * sizeof(index_t), cudaMemcpyDeviceToHost));
-    const index_t np = totals[1];
+    // Validity guarantees #terminal slots == n, so the compacted tree has
+    // np - n nodes.
+    const index_t nt = totals[1] - n;
 
-    out.is_term.resize((size_t)np);
-    out.parents.resize((size_t)np);
-    out.ids.resize((size_t)np);
-    out.starts.resize((size_t)np);
-    out.ends.resize((size_t)np);
-    if (np > (index_t)0) {
-        gpuAssert(cudaMemcpy(out.is_term.data(), p.bufs.d_node_is_term,
-                             (size_t)np * sizeof(uint8_t), cudaMemcpyDeviceToHost));
-        gpuAssert(cudaMemcpy(out.parents.data(), p.bufs.d_match,
-                             (size_t)np * sizeof(index_t), cudaMemcpyDeviceToHost));
-        gpuAssert(cudaMemcpy(out.ids.data(), p.bufs.d_node_ids,
-                             (size_t)np * sizeof(production_t), cudaMemcpyDeviceToHost));
-        gpuAssert(cudaMemcpy(out.starts.data(), p.bufs.d_node_starts,
-                             (size_t)np * sizeof(index_t), cudaMemcpyDeviceToHost));
-        gpuAssert(cudaMemcpy(out.ends.data(), p.bufs.d_node_ends,
-                             (size_t)np * sizeof(index_t), cudaMemcpyDeviceToHost));
+    out.prods.resize((size_t)nt);
+    out.parents.resize((size_t)nt);
+    out.token_parents.resize((size_t)n);
+    if (nt > (index_t)0) {
+        gpuAssert(cudaMemcpy(out.prods.data(), p.bufs.d_tree_prods,
+                             (size_t)nt * sizeof(production_t), cudaMemcpyDeviceToHost));
+        gpuAssert(cudaMemcpy(out.parents.data(), p.bufs.d_tree_parents,
+                             (size_t)nt * sizeof(index_t), cudaMemcpyDeviceToHost));
     }
+    if (n > (index_t)0)
+        gpuAssert(cudaMemcpy(out.token_parents.data(), p.bufs.d_token_parents,
+                             (size_t)n * sizeof(index_t), cudaMemcpyDeviceToHost));
     return true;
 }
 #endif // HAS_LEXER
