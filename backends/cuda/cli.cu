@@ -586,7 +586,7 @@ static int parser_server(FILE* in, FILE* out) {
 
 #endif /* HAS_PARSER && !HAS_LEXER */
 
-#ifdef HAS_PARSER
+#if defined(HAS_PARSER) && !defined(HAS_LEXER)
 // Benchmark mode: read all tests from `in`, pre-allocate GPU buffers once,
 // run warmup passes, then time `n_runs` passes with CUDA events.
 static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
@@ -700,7 +700,7 @@ static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
     return 0;
 }
 
-#endif // HAS_PARSER
+#endif /* HAS_PARSER && !HAS_LEXER */
 
 // ---------------------------------------------------------------------------
 // Both mode: full pipeline (raw bytes → lexer → fused parser → compact tree)
@@ -861,6 +861,181 @@ static int both_server_impl(FILE* in, FILE* out) {
     return 0;
 }
 
+// Benchmark for the full pipeline: each timed run is lexer kernel → D2D
+// token staging → fused parser kernel with the compact-tree phases enabled
+// (with_parents), i.e. exactly what parse_int measures in the Futhark
+// backend.  All buffers are allocated once per test, outside the timed
+// region; the "+io" variant additionally times the input H2D copy and the
+// result D2H copies (tokens, spans, tree, token parents).
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+static int both_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
+    size_t buf_len = 0;
+    uint8_t* buf = slurp(in, &buf_len);
+    if (!buf || buf_len < 16) {
+        free(buf); fprintf(stderr, "error: benchmark input too short\n"); return 1;
+    }
+    const uint8_t* p   = buf;
+    const uint8_t* end = buf + buf_len;
+    uint64_t num_tests = decode_le64(p); p += 8;
+
+    cudaEvent_t ev0, ev1;
+    gpuAssert(cudaEventCreate(&ev0));
+    gpuAssert(cudaEventCreate(&ev1));
+
+    int ret = 0;
+    for (uint64_t t = 0; t < num_tests; t++) {
+        if (p + 16 > end) { free(buf); fprintf(stderr, "error: truncated input\n"); return 1; }
+        uint64_t frame_len = decode_le64(p); p += 8;
+        uint64_t n         = decode_le64(p); p += 8;
+        if (frame_len != 8 + n || (uint64_t)(end - p) < n) {
+            free(buf); fprintf(stderr, "error: input truncated\n"); return 1;
+        }
+        const uint8_t* data = p;
+        p += n;
+        if (n == 0) { fprintf(stderr, "warning: skipping empty test\n"); continue; }
+
+        // --- Lexer buffers + discovery run (num_lexemes, lexability) ---
+        uint8_t*    d_string    = nullptr;
+        terminal_t* d_terminals = nullptr;
+        index_t*    d_starts    = nullptr;
+        index_t*    d_ends      = nullptr;
+        gpuAssert(cudaMalloc(&d_string,    n * sizeof(uint8_t)));
+        gpuAssert(cudaMalloc(&d_terminals, n * sizeof(terminal_t)));
+        gpuAssert(cudaMalloc(&d_starts,    n * sizeof(index_t)));
+        gpuAssert(cudaMalloc(&d_ends,      n * sizeof(index_t)));
+        gpuAssert(cudaMemcpy(d_string, data, n, cudaMemcpyHostToDevice));
+
+        const uint32_t nblocks = numBlocks((uint32_t)n, BLOCK_SIZE, ITEMS_PER_THREAD);
+        LexerCtx<uint32_t, index_t> ctx((uint32_t)n, BLOCK_SIZE, ITEMS_PER_THREAD);
+
+        lexer<uint32_t, index_t, BLOCK_SIZE, ITEMS_PER_THREAD>
+            <<<nblocks, BLOCK_SIZE>>>(ctx, d_string, d_terminals, d_starts, d_ends, (uint32_t)n, true);
+        gpuAssert(cudaDeviceSynchronize());
+        gpuAssert(cudaPeekAtLastError());
+        uint32_t num_lex = ctx.terminalsSize();
+        bool lex_ok = ctx.isAccept();
+
+        index_t m = (index_t)num_lex + (index_t)2;
+        if (!lex_ok ||
+            (uint64_t)m * (uint64_t)MAX_BRACKETS_PER_POSITION > (uint64_t)INT_MAX ||
+            (uint64_t)m * (uint64_t)MAX_PRODS_PER_POSITION    > (uint64_t)INT_MAX) {
+            fprintf(stderr, "error: benchmark input is not lexable (or exceeds capacity)\n");
+            ctx.cleanUp();
+            cudaFree(d_string); cudaFree(d_terminals); cudaFree(d_starts); cudaFree(d_ends);
+            ret = 1;
+            continue;
+        }
+
+        // --- Parser buffers; sentinels staged once ---
+        ParserFused pf = allocParserFused(m);
+        pf.bufs.with_parents = true;
+        pf.bufs.num_lexemes  = (index_t)num_lex;
+        terminal_t sent = START_TERMINAL;
+        gpuAssert(cudaMemcpy(pf.d_arr, &sent, sizeof(terminal_t), cudaMemcpyHostToDevice));
+        sent = END_TERMINAL;
+        gpuAssert(cudaMemcpy(pf.d_arr + (size_t)(m - 1), &sent, sizeof(terminal_t), cudaMemcpyHostToDevice));
+
+        const int one = 1;
+        auto run_pipeline = [&]() {
+            ctx.reset();
+            lexer<uint32_t, index_t, BLOCK_SIZE, ITEMS_PER_THREAD>
+                <<<nblocks, BLOCK_SIZE>>>(ctx, d_string, d_terminals, d_starts, d_ends, (uint32_t)n, true);
+            gpuAssert(cudaMemcpyAsync(pf.d_arr + 1, d_terminals,
+                                      (size_t)num_lex * sizeof(terminal_t), cudaMemcpyDeviceToDevice));
+            launchParserFused(pf, m);
+        };
+
+        for (uint32_t i = 0; i < warmup_runs; i++) {
+            gpuAssert(cudaMemcpy(pf.bufs.d_valid, &one, sizeof(int), cudaMemcpyHostToDevice));
+            run_pipeline();
+            gpuAssert(cudaDeviceSynchronize());
+        }
+
+        // Result sizes for the +io D2H copies (fixed for a fixed input).
+        index_t totals[2];
+        gpuAssert(cudaMemcpy(totals, pf.bufs.d_totals, 2 * sizeof(index_t), cudaMemcpyDeviceToHost));
+        const index_t nt = totals[1] - (index_t)num_lex;
+        std::vector<terminal_t>   h_toks(num_lex);
+        std::vector<index_t>      h_starts(num_lex), h_ends(num_lex), h_tparents(num_lex);
+        std::vector<production_t> h_prods((size_t)nt);
+        std::vector<index_t>      h_parents((size_t)nt);
+
+        // --- kernel-only timing ---
+        std::vector<float> times_ms(n_runs);
+        for (uint32_t i = 0; i < n_runs; i++) {
+            gpuAssert(cudaMemcpy(pf.bufs.d_valid, &one, sizeof(int), cudaMemcpyHostToDevice));
+            gpuAssert(cudaEventRecord(ev0));
+            run_pipeline();
+            gpuAssert(cudaEventRecord(ev1));
+            gpuAssert(cudaEventSynchronize(ev1));
+            gpuAssert(cudaEventElapsedTime(&times_ms[i], ev0, ev1));
+        }
+
+        // --- IO-bound timing (H->D + kernels + D->H) ---
+        std::vector<float> times_io_ms(n_runs);
+        for (uint32_t i = 0; i < n_runs; i++) {
+            gpuAssert(cudaMemcpy(pf.bufs.d_valid, &one, sizeof(int), cudaMemcpyHostToDevice));
+            gpuAssert(cudaEventRecord(ev0));
+            gpuAssert(cudaMemcpyAsync(d_string, data, n, cudaMemcpyHostToDevice));
+            run_pipeline();
+            gpuAssert(cudaMemcpyAsync(h_toks.data(),   d_terminals, num_lex * sizeof(terminal_t), cudaMemcpyDeviceToHost));
+            gpuAssert(cudaMemcpyAsync(h_starts.data(), d_starts,    num_lex * sizeof(index_t),    cudaMemcpyDeviceToHost));
+            gpuAssert(cudaMemcpyAsync(h_ends.data(),   d_ends,      num_lex * sizeof(index_t),    cudaMemcpyDeviceToHost));
+            if (nt > (index_t)0) {
+                gpuAssert(cudaMemcpyAsync(h_prods.data(),   pf.bufs.d_tree_prods,
+                                          (size_t)nt * sizeof(production_t), cudaMemcpyDeviceToHost));
+                gpuAssert(cudaMemcpyAsync(h_parents.data(), pf.bufs.d_tree_parents,
+                                          (size_t)nt * sizeof(index_t), cudaMemcpyDeviceToHost));
+            }
+            gpuAssert(cudaMemcpyAsync(h_tparents.data(), pf.bufs.d_token_parents,
+                                      num_lex * sizeof(index_t), cudaMemcpyDeviceToHost));
+            gpuAssert(cudaEventRecord(ev1));
+            gpuAssert(cudaEventSynchronize(ev1));
+            gpuAssert(cudaEventElapsedTime(&times_io_ms[i], ev0, ev1));
+        }
+
+        // Timed runs force d_valid = 1 before launch; check the last run
+        // really produced a valid parse so garbage inputs cannot masquerade
+        // as benchmark results.
+        int h_valid = 0;
+        gpuAssert(cudaMemcpy(&h_valid, pf.bufs.d_valid, sizeof(int), cudaMemcpyDeviceToHost));
+        if (!h_valid) {
+            fprintf(stderr, "error: benchmark input does not parse\n");
+            ret = 1;
+        }
+
+        freeParserFused(pf);
+        ctx.cleanUp();
+        cudaFree(d_string); cudaFree(d_terminals); cudaFree(d_starts); cudaFree(d_ends);
+
+        auto print_stats = [&](const char* label, std::vector<float>& tms) {
+            double mean = 0, variance = 0, gbps = 0;
+            double factor = (double)n / (1000.0 * n_runs);
+            for (uint32_t i = 0; i < n_runs; i++) {
+                double diff = fmax(1e3 * (double)tms[i], 0.5);
+                mean     += diff / n_runs;
+                variance += (diff * diff) / n_runs;
+                gbps     += factor / diff;
+            }
+            double bound = (0.95 * sqrt(variance)) / sqrt((double)n_runs);
+            fprintf(stderr, "%s:\n", label);
+            fprintf(stderr, "        %.0fμs (95%% CI: [%.1fμs, %.1fμs]); %.0fGB/s\n",
+                    mean, mean - bound, mean + bound, gbps);
+        };
+
+        char label[64];
+        snprintf(label, sizeof(label), "parse_int (cuda, %zu bytes)", (size_t)n);
+        print_stats(label, times_ms);
+        snprintf(label, sizeof(label), "parse_int (cuda+io, %zu bytes)", (size_t)n);
+        print_stats(label, times_io_ms);
+    }
+
+    gpuAssert(cudaEventDestroy(ev0));
+    gpuAssert(cudaEventDestroy(ev1));
+    free(buf);
+    return ret;
+}
+
 #endif // HAS_LEXER && HAS_PARSER
 
 // ---------------------------------------------------------------------------
@@ -914,11 +1089,11 @@ int main(int argc, char* argv[]) {
 
 #elif defined(HAS_LEXER) && defined(HAS_PARSER)
     // ---- Both mode: raw bytes → lexer → parser → CST nodes (default) ----
-    // --server loops counted raw-byte batches; --benchmark uses the
-    // token-ID protocol of parse-only mode.
+    // --server loops counted raw-byte batches; --benchmark times the real
+    // bytes → lexer → fused parser (with compact tree) pipeline.
     int ret;
     if (a.benchmark > 0)
-        ret = parser_benchmark(in, a.warmup, a.benchmark);
+        ret = DISPATCH_BS_IPT(bs, ipt, both_benchmark, in, a.warmup, a.benchmark);
     else if (a.server)
         ret = DISPATCH_BS_IPT(bs, ipt, both_server_impl, in, out);
     else
