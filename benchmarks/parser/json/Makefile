@@ -4,7 +4,7 @@ FUTHARK_BACKEND?=cuda
 INPUT_SIZE?=10485760
 DATA=data-$(INPUT_SIZE).inputs
 DATA_RAW=data-raw-$(INPUT_SIZE).json
-.PHONY: clean bench build bench-futhark bench-cuda
+.PHONY: clean reset bench build bench-futhark bench-cuda
 
 parser.cu: json.alp
 	alpacc cuda json.alp --index32 -o $@
@@ -45,6 +45,9 @@ bench: parser-cuda json.fut $(DATA)
 
 	@printf "$(H)Futhark implementation:$(E)\n"
 	futhark bench --backend $(FUTHARK_BACKEND) json.fut
+
+reset:
+	rm -rf parser-cuda parser.cu json json.c json.fut
 
 clean:
 	rm -rf data-*.inputs data-raw-*.json parser-cuda parser.cu json json.c json.fut

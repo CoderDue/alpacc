@@ -7,7 +7,7 @@ INPUT_SIZE?=104857600
 DATA=data-$(INPUT_SIZE).inputs
 DATA_RAW=data-raw-$(INPUT_SIZE).json
 
-.PHONY: clean bench build bench-rust bench-futhark bench-cuda
+.PHONY: clean reset bench build bench-rust bench-futhark bench-cuda
 
 lexer.cu: json.alp
 	alpacc cuda json.alp --lexer --index32 -o $@
@@ -56,6 +56,9 @@ bench: lexer-cuda json.fut $(DATA)
 
 	@printf "$(H)Futhark implementation:$(E)\n"
 	futhark bench --backend $(FUTHARK_BACKEND) json.fut
+
+reset:
+	rm -rf target lexer-rust json json.c json.fut lexer-cuda lexer.cu
 
 clean:
 	rm -rf data-*.inputs data-raw-*.json target lexer-rust json json.c json.fut lexer-cuda lexer.cu

@@ -6,7 +6,7 @@ FUTHARK_BACKEND?=cuda
 INPUT_SIZE?=104857600
 DATA=data-$(INPUT_SIZE).inputs
 DATA_RAW=data-raw-$(INPUT_SIZE).in
-.PHONY: clean bench build bench-rust bench-c bench-futhark bench-cuda
+.PHONY: clean reset bench build bench-rust bench-c bench-futhark bench-cuda
 
 lexer-c: lexer.c
 	$(CC) -o $@ $^ $(CFLAGS)
@@ -67,6 +67,9 @@ bench: lexer-c lexer-cuda sexp.fut $(DATA)
 
 	@printf "$(H)Futhark implementation:$(E)\n"
 	futhark bench --backend $(FUTHARK_BACKEND) sexp.fut
+
+reset:
+	rm -rf target lexer-rust lexer-c sexp sexp.c sexp.fut lexer-cuda lexer.cu
 
 clean:
 	rm -rf data-*.inputs data-raw-*.in target lexer-rust lexer-c sexp sexp.c sexp.fut lexer-cuda lexer.cu

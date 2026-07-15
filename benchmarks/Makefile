@@ -1,7 +1,7 @@
 FUTHARK_BACKEND?=cuda
 INPUT_SIZE?=10485760
 
-.PHONY: bench build clean \
+.PHONY: bench build clean reset \
         bench-lexer bench-lexer-json bench-lexer-lisp \
         bench-parser bench-parser-json bench-parser-lisp \
         bench-cuda bench-cuda-json bench-cuda-lisp \
@@ -10,7 +10,8 @@ INPUT_SIZE?=10485760
         bench-futhark-parser bench-futhark-parser-json bench-futhark-parser-lisp \
         bench-all-sizes \
         build-json build-lisp build-parser-json build-parser-lisp \
-        clean-json clean-lisp clean-parser-json clean-parser-lisp
+        clean-json clean-lisp clean-parser-json clean-parser-lisp \
+        reset-json reset-lisp reset-parser-json reset-parser-lisp
 
 bench: bench-lexer bench-parser
 
@@ -79,6 +80,20 @@ build-parser-json:
 
 build-parser-lisp:
 	$(MAKE) -C parser/lisp build FUTHARK_BACKEND=$(FUTHARK_BACKEND) INPUT_SIZE=$(INPUT_SIZE)
+
+reset: reset-json reset-lisp reset-parser-json reset-parser-lisp
+
+reset-json:
+	$(MAKE) -C lexer/json reset
+
+reset-lisp:
+	$(MAKE) -C lexer/lisp reset
+
+reset-parser-json:
+	$(MAKE) -C parser/json reset
+
+reset-parser-lisp:
+	$(MAKE) -C parser/lisp reset
 
 clean: clean-json clean-lisp clean-parser-json clean-parser-lisp
 
