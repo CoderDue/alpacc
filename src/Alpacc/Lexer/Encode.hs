@@ -59,6 +59,7 @@ stateIntType :: ParallelLexer t k -> TerminalEncoder t' -> Either Text UInt
 stateIntType (ParallelLexer {endomorphismsSize = e}) encoder =
   maybeToEither errorMessage
     . toIntType
+    . pred -- largest encoded value is 2^bits - 1
     . (2 ^)
     . sum
     $ findBitSize <$> [e, numTerminals encoder, 1]
