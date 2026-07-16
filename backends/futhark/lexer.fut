@@ -88,9 +88,6 @@ module mk_lexer (L: lexer_context)
     map2 (trans_to_state first prev_state) str (iota n)
     |> scan compose L.identity_state
 
-  def take_right a b =
-    if b == idx.highest then a else b
-
   def is_ignore t =
     match L.ignore_terminal
     case #some t' -> t L.terminal_int_module.== t'
@@ -117,15 +114,18 @@ module mk_lexer (L: lexer_context)
       map i64.bool flags
       |> scan (+) 0
     let offsets = map2 (\f o -> if f then o - 1 else -1) flags is
+    -- Token starts as a max-scan: idx.lowest = "no start seen"; injected
+    -- values are non-decreasing (boundary seed <= 0 <= produce indices), so
+    -- max is equivalent to take-rightmost-non-sentinel.
     let starts =
       tabulate n (\i ->
                     if is_produce states[i]
                     && (not <-< is_ignore <-< to_terminal) states[i]
                     then idx.i64 i
                     else if i == 0
-                    then take_right (prev_start - offset) idx.highest
-                    else idx.highest)
-      |> scan take_right idx.highest
+                    then prev_start - offset
+                    else idx.lowest)
+      |> scan idx.max idx.lowest
     let ends = map idx.i64 (iota n)
     -- Globalise spans here, before the scatter: mapping the scatter result
     -- instead would re-add this chunk's offset to tokens already emitted by
@@ -153,7 +153,7 @@ module mk_lexer (L: lexer_context)
     let last_start = last starts
     in ( result
        , last_state
-       , if last_start != idx.highest
+       , if last_start != idx.lowest
          then offset + last_start
          else prev_start
        , idx.i64 (idx.to_i64 prev_size + size)

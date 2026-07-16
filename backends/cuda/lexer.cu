@@ -26,19 +26,6 @@ bool is_produce_cpu(state_t state) {
   return (state & PRODUCE_MASK) >> PRODUCE_OFFSET;
 }
 
-template<typename T>
-struct TakeRight {
-  const T identity = std::numeric_limits<T>::max();
-
-  __device__ __forceinline__ T operator()(T a, T b) const {
-    if (b == identity) {
-      return a;
-    }
-
-    return b;
-  }
-};
-
 template<typename I, typename J>
 struct LexerCtx {
 
@@ -84,7 +71,6 @@ public:
   States<I, state_t> d_state_states;
   States<I, I> d_index_states;
   States<I, I> d_take_right_states;
-  TakeRight<I> take_right = TakeRight<I>();
 
   LexerCtx(const I chunk_size,
            const I block_size,
@@ -311,16 +297,17 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
         is_next_produce &= is_not_ignore;
       }
 
-      indices[lid] = is_produce(state) ? gid : ctx.take_right.identity;
+      // token starts scan as max: 0 = "no start seen", produce at gid encodes gid + 1
+      indices[lid] = is_produce(state) ? gid + 1 : I();
     } else {
-      indices[lid] = ctx.take_right.identity;
+      indices[lid] = I();
     }
     is_produce_state |= is_next_produce << i;
   }
 
   __syncthreads();
 
-  scan<I, I, TakeRight<I>, ITEMS_PER_THREAD, BLOCK_SIZE>(indices, ctx.d_take_right_states, ctx.take_right, ctx.take_right.identity, dyn_index);
+  scan<I, I, cub::Max, ITEMS_PER_THREAD, BLOCK_SIZE>(indices, ctx.d_take_right_states, cub::Max(), I(), dyn_index);
 
   I starts[ITEMS_PER_THREAD];
   volatile __shared__ I last_start;
@@ -353,10 +340,10 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     I gid = glb_offs + lid;
     if (gid < size && ((is_produce_state >> i) & 1)) {
       I offset = Add<I>()(prefix, indices[lid]) - 1;
-      if (offset == I() && starts[i] == ctx.take_right.identity) {
+      if (offset == I() && starts[i] == I()) {
         d_starts[offset] = ctx.getLastStart();
       } else {
-        d_starts[offset] = ctx.addOffset(starts[i]);
+        d_starts[offset] = ctx.addOffset(starts[i] - 1);
       }
       d_ends[offset] = ctx.addOffset(gid + 1);
       d_terminals[offset] = get_terminal(states[lid]);
@@ -368,8 +355,8 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     ctx.setNewSize(new_size);
     ctx.setLastState(states[ITEMS_PER_THREAD * BLOCK_SIZE - 1]);
     
-    if (last_start != ctx.take_right.identity) {
-      ctx.setLastStart(ctx.addOffset(last_start));
+    if (last_start != I()) {
+      ctx.setLastStart(ctx.addOffset(last_start - 1));
     } else {
       ctx.setLastStart(ctx.getLastStart());
     }
