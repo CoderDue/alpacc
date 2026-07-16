@@ -945,7 +945,9 @@ static int both_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
             launchParserFused(pf, m);
         };
 
-        for (uint32_t i = 0; i < warmup_runs; i++) {
+        // At least one untimed run: warmup, and d_totals must be populated
+        // before the result sizes are read below.
+        for (uint32_t i = 0; i < (warmup_runs > 0 ? warmup_runs : 1); i++) {
             gpuAssert(cudaMemcpy(pf.bufs.d_valid, &one, sizeof(int), cudaMemcpyHostToDevice));
             run_pipeline();
             gpuAssert(cudaDeviceSynchronize());

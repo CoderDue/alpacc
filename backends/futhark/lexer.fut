@@ -5,6 +5,8 @@
 
 import "lib/github.com/diku-dk/containers/core/opt"
 
+def chunk_size : i64 = #[param(chunk_size)] 16777216i64
+
 module type lexer_context = {
   type terminal
   module state_module: integral
@@ -29,8 +31,8 @@ module type lexer_context = {
 module type lexer = {
   type terminal_int
   type terminal
-  val lex_int [n] : i32 -> [n]u8 -> opt ([](terminal_int, (idx.t, idx.t)))
-  val lex [n] : i32 -> [n]u8 -> opt ([](terminal, (idx.t, idx.t)))
+  val lex_int [n] : [n]u8 -> opt ([](terminal_int, (idx.t, idx.t)))
+  val lex [n] : [n]u8 -> opt ([](terminal, (idx.t, idx.t)))
 }
 
 module mk_lexer (L: lexer_context)
@@ -70,14 +72,20 @@ module mk_lexer (L: lexer_context)
     let b' = to_index b
     in copy L.compositions[b' * L.state_size + a']
 
-  def trans_to_state (prev_state: state) (c: u8) (i: i64) : state =
+  -- `first` is true for the first chunk of the input.  For later chunks the
+  -- first byte is the one-byte overlap with the previous chunk: its
+  -- transition is already part of prev_state, so composing it again would
+  -- apply the byte twice (harmless only for idempotent transitions such as
+  -- digit runs, wrong for e.g. keywords).  The seed of the scan is then
+  -- prev_state itself.
+  def trans_to_state (first: bool) (prev_state: state) (c: u8) (i: i64) : state =
     let e = copy L.transitions_to_states[u8.to_i64 c]
     in if i == 0
-       then prev_state `compose` e
+       then if first then prev_state `compose` e else prev_state
        else e
 
-  def traverse [n] (prev_state: state) (str: [n]u8) : *[n]state =
-    map2 (trans_to_state prev_state) str (iota n)
+  def traverse [n] (first: bool) (prev_state: state) (str: [n]u8) : *[n]state =
+    map2 (trans_to_state first prev_state) str (iota n)
     |> scan compose L.identity_state
 
   def take_right a b =
@@ -99,7 +107,7 @@ module mk_lexer (L: lexer_context)
                                    , idx.t
                                    , idx.t
                                    ) =
-    let states = traverse prev_state str
+    let states = traverse (offset == idx.i64 0) prev_state str
     let flags =
       tabulate n (\i ->
                     i != n - 1
@@ -119,7 +127,12 @@ module mk_lexer (L: lexer_context)
                     else idx.highest)
       |> scan take_right idx.highest
     let ends = map idx.i64 (iota n)
-    let vs = zip (map to_terminal states) (zip starts ends)
+    -- Globalise spans here, before the scatter: mapping the scatter result
+    -- instead would re-add this chunk's offset to tokens already emitted by
+    -- earlier chunks.
+    let vs =
+      zip (map to_terminal states) (zip starts ends)
+      |> map (\(t, (s, e)) -> (t, (s + offset, idx.i64 1 + e + offset)))
     let size = last is
     let extra_size = idx.to_i64 prev_size + size + 1
     let dest =
@@ -128,9 +141,14 @@ module mk_lexer (L: lexer_context)
              replicate (2 * extra_size) (L.terminal_int_module.u8 0, (idx.i64 0, idx.i64 0))
            in scatter new_dest (indices dest) dest
       else dest
+    -- The -1 entries of `offsets` mark positions with no token; they must
+    -- stay negative (out of bounds, so ignored by scatter).  Adding
+    -- `prev_size` unconditionally would turn them into `prev_size - 1` and
+    -- clobber the previous chunk's last token.
     let result =
-      scatter dest (map (+ idx.to_i64 prev_size) offsets) vs
-      |> map (\(t, (s, e)) -> (t, (s + offset, idx.i64 1 + e + offset)))
+      scatter dest
+              (map (\o -> if o < 0 then -1 else o + idx.to_i64 prev_size) offsets)
+              vs
     let last_state = last states
     let last_start = last starts
     in ( result
@@ -142,9 +160,8 @@ module mk_lexer (L: lexer_context)
        )
 
   def lex_int_flag [n]
-                   (chunk_size: i32)
                    (str: [n]u8) : (bool, [](terminal_int, (idx.t, idx.t))) =
-    let chunk_size = idx.i32 chunk_size
+    let chunk_size = idx.i64 chunk_size
     let (result, state, start, size) =
       loop (dest, state, start, size) =
              ( [(L.terminal_int_module.u8 0, (idx.i64 0, idx.i64 0))]
@@ -172,15 +189,13 @@ module mk_lexer (L: lexer_context)
        else (false, [])
 
   def lex_int [n]
-              (chunk_size: i32)
               (str: [n]u8) : opt ([](terminal_int, (idx.t, idx.t))) =
-    let (is_valid, result) = lex_int_flag chunk_size str
+    let (is_valid, result) = lex_int_flag str
     in if is_valid then #some result else #none
 
   def lex [n]
-          (chunk_size: i32)
           (str: [n]u8) : opt ([](terminal, (idx.t, idx.t))) =
-    let (is_valid, result) = lex_int_flag chunk_size str
+    let (is_valid, result) = lex_int_flag str
     in if is_valid
        then #some (map (\(t, s) ->
                           ( copy L.terminal_int_to_name[L.terminal_int_module.to_i64 t]

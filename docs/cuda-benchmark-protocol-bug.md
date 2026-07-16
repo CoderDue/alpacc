@@ -22,7 +22,9 @@ meant:
 After the SoA compact-tree wire-format change (01d10f1) and a benchmark
 Makefile fix that made the Futhark datasets real (`dd bs=24 skip=1` to strip
 the frame header), the Futhark `parse_int` number at 10M tokens became an
-honest 10.6 ms, while the CUDA "parser benchmark" reported ~30 ms. This looked
+apparently-honest 10.6 ms (later found to be a failed lex — see
+`futhark-chunked-lexer-bug.md`), while the CUDA "parser benchmark" reported
+~30 ms. This looked
 like a CUDA regression caused by the format change.
 
 ## How it was identified
@@ -60,9 +62,14 @@ Details:
   input format.
 
 First honest numbers (json, 22.4 MB, GTX 1660 Ti): CUDA 35.0 ms kernel-only
-vs Futhark `parse_int` 10.6 ms — the CUDA fused pipeline is ~3.3× slower than
-the Futhark backend end-to-end. That gap is a real optimisation target, but it
-predates the wire-format change.
+vs Futhark `parse_int` 10.6 ms — which looked like a 3.3× gap. **Update:** the
+Futhark side of that comparison was itself bogus: the Futhark chunked lexer
+failed on inputs > 2^24 bytes (see `futhark-chunked-lexer-bug.md`), so the
+10.6 ms timed a failed lex with zero tokens and no parsing. With the Futhark
+lexer fixed, the honest numbers (json, 22.4 MB, GTX 1660 Ti) are: CUDA
+36.1 ms vs Futhark `parse_int` 75.4 ms kernel-only — the CUDA fused pipeline
+is ~2.1× *faster*, not 3.3× slower; lexer-only is CUDA 8.4 ms vs Futhark
+9.9 ms.
 
 ## Trade-offs of the fix
 
