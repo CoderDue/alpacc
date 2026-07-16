@@ -5,7 +5,8 @@
 #SBATCH --time=3:00:00
 #SBATCH --output=benchmark.log
 
-INPUT_SIZE=${INPUT_SIZE:-262144000}
+INPUT_SIZE=${INPUT_SIZE:-10485760}
+LEXER_INPUT_SIZE=${LEXER_INPUT_SIZE:-262144000}
 
 set -e
 
@@ -32,8 +33,8 @@ done
 
 # --- Benchmark -------------------------------------------------------
 
-make build         FUTHARK_BACKEND=cuda INPUT_SIZE=$INPUT_SIZE
-make bench-cuda    INPUT_SIZE=$INPUT_SIZE
-make bench-futhark FUTHARK_BACKEND=cuda INPUT_SIZE=$INPUT_SIZE
+make build         FUTHARK_BACKEND=cuda INPUT_SIZE=$INPUT_SIZE LEXER_INPUT_SIZE=$LEXER_INPUT_SIZE
+make bench-cuda    INPUT_SIZE=$INPUT_SIZE LEXER_INPUT_SIZE=$LEXER_INPUT_SIZE
+make bench-futhark FUTHARK_BACKEND=cuda INPUT_SIZE=$INPUT_SIZE LEXER_INPUT_SIZE=$LEXER_INPUT_SIZE
 
 echo "Benchmarking finished."

@@ -5,26 +5,35 @@ E=\033[0m\x1B[0m
 D=\x1B[2m
 GRAMMAR_NAME=$(notdir $(basename $(GRAMMAR)))
 FUTHARK_BACKEND?=cuda
-# INPUT_SIZE is the number of tokens in the generated input (combined-mode
-# single-long generation); the byte size of the payload is roughly 2x that.
-INPUT_SIZE?=262144000
+# INPUT_SIZE / LEXER_INPUT_SIZE are token counts; payload bytes ≈ 2x each.
+INPUT_SIZE?=10485760
+LEXER_INPUT_SIZE?=262144000
 GRAMMAR=../../grammars/sexp.alp
 DATA=data-$(INPUT_SIZE).inputs
 DATA_RAW=data-raw-$(INPUT_SIZE).in
+LEXER_DATA=data-$(LEXER_INPUT_SIZE).inputs
+LEXER_DATA_RAW=data-raw-$(LEXER_INPUT_SIZE).in
 NVCCFLAGS=-O3 -std=c++17 -arch=native
 
 .PHONY: clean reset build bench bench-lexer bench-parser \
         bench-lexer-cuda bench-lexer-futhark bench-lexer-rust bench-lexer-c \
         bench-parser-cuda bench-parser-futhark
 
-# --- Shared dataset (grammatical sexp, used by lexer and parser benchmarks) ---
+# --- Datasets ---
 
 $(DATA): $(GRAMMAR)
-	@printf "$(D)  Generating dataset...$(E)\n"
+	@printf "$(D)  Generating parser dataset...$(E)\n"
 	@alpacc test generate $(GRAMMAR) --single-long --no-outputs --length $(INPUT_SIZE) -o data-$(INPUT_SIZE)
 
 $(DATA_RAW): $(DATA)
 	@dd if=$(DATA) of=$(DATA_RAW) bs=24 skip=1 2>/dev/null
+
+$(LEXER_DATA): $(GRAMMAR)
+	@printf "$(D)  Generating lexer dataset...$(E)\n"
+	@alpacc test generate $(GRAMMAR) --single-long --no-outputs --length $(LEXER_INPUT_SIZE) -o data-$(LEXER_INPUT_SIZE)
+
+$(LEXER_DATA_RAW): $(LEXER_DATA)
+	@dd if=$(LEXER_DATA) of=$(LEXER_DATA_RAW) bs=24 skip=1 2>/dev/null
 
 # --- Lexer implementations ---
 
@@ -39,9 +48,9 @@ lexer-cuda: lexer.cu
 	@printf "$(D)  Compiling CUDA lexer...$(E)\n"
 	@nvcc $(NVCCFLAGS) -o $@ $^
 
-lex.fut: $(GRAMMAR) $(DATA_RAW)
+lex.fut: $(GRAMMAR) $(LEXER_DATA_RAW)
 	@alpacc futhark $(GRAMMAR) --lexer --index32 -o $@
-	@printf -- "\n-- ==\n-- entry: lex_int\n-- script input { \$$loadbytes \"$(DATA_RAW)\" }\n" >> $@
+	@printf -- "\n-- ==\n-- entry: lex_int\n-- script input { \$$loadbytes \"$(LEXER_DATA_RAW)\" }\n" >> $@
 	@futhark pkg sync > /dev/null 2>&1
 
 lexer-rust: lexer.rs Cargo.toml Cargo.lock
@@ -65,26 +74,26 @@ parse.fut: $(GRAMMAR) $(DATA_RAW)
 
 # --- Benchmarks ---
 
-build: lexer-c lexer-cuda parser-cuda lex.fut parse.fut $(DATA_RAW)
+build: lexer-c lexer-cuda parser-cuda lex.fut parse.fut $(DATA_RAW) $(LEXER_DATA_RAW)
 	@printf "$(H)Build complete [$(GRAMMAR_NAME)].$(E)\n"
 
-bench-lexer-c: lexer-c $(DATA_RAW)
+bench-lexer-c: lexer-c $(LEXER_DATA_RAW)
 	@printf "$(H)Benchmarking C lexer [$(GRAMMAR_NAME)]:$(E)\n"
 	@printf "Note: The result is not saved in memory.\n"
-	@./lexer-c $(DATA_RAW)
+	@./lexer-c $(LEXER_DATA_RAW)
 
-bench-lexer-cuda: lexer-cuda $(DATA)
+bench-lexer-cuda: lexer-cuda $(LEXER_DATA)
 	@printf "$(H)Benchmarking CUDA (alpacc) lexer [$(GRAMMAR_NAME)]:$(E)\n"
-	@./lexer-cuda --benchmark 10 --warmup 3 < $(DATA)
+	@./lexer-cuda --benchmark 10 --warmup 3 < $(LEXER_DATA)
 
-bench-lexer-futhark: lex.fut $(DATA_RAW)
+bench-lexer-futhark: lex.fut $(LEXER_DATA_RAW)
 	@futhark pkg sync > /dev/null 2>&1
 	@printf "$(H)Benchmarking Futhark lexer [$(GRAMMAR_NAME)]:$(E)\n"
 	@futhark bench --backend $(FUTHARK_BACKEND) lex.fut
 
-bench-lexer-rust: lexer-rust $(DATA_RAW)
+bench-lexer-rust: lexer-rust $(LEXER_DATA_RAW)
 	@printf "$(H)Benchmarking Rust lexer [$(GRAMMAR_NAME)]:$(E)\n"
-	@./lexer-rust $(DATA_RAW)
+	@./lexer-rust $(LEXER_DATA_RAW)
 
 bench-lexer:
 	@printf "$(H)Lisp Lexer Benchmark [$(GRAMMAR_NAME)]:$(E)\n"
