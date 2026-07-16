@@ -5,7 +5,7 @@
 #SBATCH --time=3:00:00
 #SBATCH --output=benchmark.log
 
-INPUT_SIZE=${INPUT_SIZE:-104857600}
+INPUT_SIZE=${INPUT_SIZE:-262144000}
 
 set -e
 

@@ -2,7 +2,7 @@ FUTHARK_BACKEND?=cuda
 # INPUT_SIZE is the number of tokens in each generated input (the payload
 # byte size is roughly 2x that). One dataset is generated per language and
 # shared by its lexer and parser benchmarks.
-INPUT_SIZE?=10485760
+INPUT_SIZE?=262144000
 
 LANGS=json lisp
 MAKEARGS=--no-print-directory FUTHARK_BACKEND=$(FUTHARK_BACKEND) INPUT_SIZE=$(INPUT_SIZE)
