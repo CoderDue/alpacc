@@ -214,6 +214,7 @@ struct FusedBufs {
     index_t*  d_block_warp_mins;
     index_t*  d_tree;
     index_t*  d_prefix_min;
+    unsigned* d_p3_next;
 
 #ifdef HAS_LEXER
     // Combined mode (parse_int): parents + compact-tree assembly.
@@ -380,7 +381,7 @@ parserFusedKernel(FusedBufs b)
             apsepDeviceSPT<index_t, (int)FUSED_BS, FUSED_IPT, true>(
                 grid, b.d_scan, b.d_match, nb, spt_blocks, M, M - 1,
                 b.d_unres, b.d_block_mins, b.d_block_warp_mins,
-                b.d_tree, b.d_prefix_min);
+                b.d_tree, b.d_prefix_min, b.d_p3_next);
         }
         grid.sync();
 
@@ -429,7 +430,7 @@ parserFusedKernel(FusedBufs b)
         apsepDeviceSPT<index_t, (int)FUSED_BS, FUSED_IPT, true>(
             grid, b.d_scan, b.d_match, np, spt_blocks, M, M - 1,
             b.d_unres, b.d_block_mins, b.d_block_warp_mins,
-            b.d_tree, b.d_prefix_min);
+            b.d_tree, b.d_prefix_min, b.d_p3_next);
     }
     grid.sync();
 
@@ -538,6 +539,7 @@ static ParserFused allocParserFused(index_t max_m) {
     gpuAssert(cudaMalloc(&b.d_block_warp_mins, (size_t)spt_blocks * (size_t)W * sizeof(index_t)));
     gpuAssert(cudaMalloc(&b.d_tree,       (size_t)(2 * M - 1) * sizeof(index_t)));
     gpuAssert(cudaMalloc(&b.d_prefix_min, (size_t)spt_blocks * sizeof(index_t)));
+    gpuAssert(cudaMalloc(&b.d_p3_next,    sizeof(unsigned)));
     b.d_arr = p.d_arr;
 
 #ifdef HAS_LEXER
@@ -573,6 +575,7 @@ static void freeParserFused(ParserFused& p) {
     cudaFree(b.d_block_warp_mins);
     cudaFree(b.d_tree);
     cudaFree(b.d_prefix_min);
+    cudaFree(b.d_p3_next);
 #ifdef HAS_LEXER
     cudaFree(b.d_tree_prods);
     cudaFree(b.d_tree_parents);

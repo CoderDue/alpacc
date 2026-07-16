@@ -15,8 +15,10 @@
 //            prefix-min + pointer-jumping chain, unresolved bitmask d_unres.
 //   Phase 2: segment min-tree over block mins, one level per grid.sync(),
 //            then per-block exclusive prefix-min by tree ascent.
-//   Phase 3: bitmask-driven warp-cooperative tree ascent+descent lookups,
-//            chunk-min + leaf ballots, dense -1-fill fast path.
+//   Phase 3: bitmask-driven tree ascent+descent lookups, chunk-min + leaf
+//            ballots, dense -1-fill fast path; 32-word groups drawn from an
+//            atomic ticket queue, pending lookups pooled per warp and run
+//            as 32 independent per-lane ascents (load balancing).
 //
 // Grid must fit on-chip for grid.sync(): launch exactly
 // cudaOccupancyMaxActiveBlocksPerMultiprocessor x num_SMs physical blocks
@@ -75,7 +77,8 @@ void apsepDeviceSPT(
         T* __restrict__         d_block_mins,
         T* __restrict__         d_block_warp_mins,
         T* __restrict__         d_tree,       // 2*M-1 nodes
-        T* __restrict__         d_prefix_min) // prefix_min[b] = min(block_min[0..b-1]), INF for b=0
+        T* __restrict__         d_prefix_min, // prefix_min[b] = min(block_min[0..b-1]), INF for b=0
+        unsigned* __restrict__  d_p3_next)    // Phase 3 work-queue ticket counter
 {
     constexpr int B         = BLOCK_SIZE * IPT;
     constexpr int NUM_WARPS = BLOCK_SIZE / 32;
@@ -276,6 +279,10 @@ void apsepDeviceSPT(
     for (int i = phys_bid * BLOCK_SIZE + threadIdx.x; i < M; i += num_phys * BLOCK_SIZE)
         d_tree[leaf_offset + i] = (i < num_blocks) ? d_block_mins[i] : INF;
 
+    // Reset the Phase 3 ticket counter; the "tree fully built" grid.sync
+    // below publishes it before any warp draws a ticket.
+    if (phys_bid == 0 && threadIdx.x == 0) *d_p3_next = 0u;
+
     // Reduce level by level
     {
         int level_size  = M / 2;
@@ -324,18 +331,32 @@ void apsepDeviceSPT(
     // bitmask read instead of a B-element scan per logical block (measured
     // ~1.2 ms of Phase 3 overhead on random/ascending at N=32M).
     // -------------------------------------------------------------------------
-    const int num_words   = (n + 31) >> 5;
-    const int warps_total = num_phys * NUM_WARPS;
-    const int mybit       = 8 * (lane & 3) + (lane >> 2);  // blocked-P1 bit permutation
+    const int num_words  = (n + 31) >> 5;
+    const int num_groups = (num_words + 31) >> 5;
+    const int mybit      = 8 * (lane & 3) + (lane >> 2);  // blocked-P1 bit permutation
 
     // Each warp takes an aligned group of 32 consecutive words (one coalesced
-    // load; a group spans exactly 2 logical blocks, so the dense first-word-
-    // of-block bits distribute evenly across warps — a bare word stride of
-    // warps_total is a multiple of W and gave 1/W of the warps ALL the
-    // lookup work).  Nonzero words are then processed one per warp.
-    for (int wbase = (phys_bid * NUM_WARPS + warp_id) * 32;
-         wbase < num_words;
-         wbase += warps_total * 32) {
+    // load), drawn from a global atomic ticket queue rather than a static
+    // grid stride: word groups that need real inter-block lookups are orders
+    // of magnitude more expensive than all-zero groups and cluster on
+    // structured input, so static ownership left most warps idling at the
+    // trailing grid.sync while a few stragglers worked (measured ~56% of the
+    // LLP parser's PSE time).  Groups are independent (each unresolved d_out
+    // byte is written exactly once; tree/chunk-min/d_in are read-only here),
+    // so out-of-order processing is safe.
+    //
+    // Within a group, elements that need a tree lookup are pooled into a
+    // per-warp worklist and resolved 32 at a time, each lane running an
+    // independent tree ascent: the ascent is the long dependent-load chain,
+    // and resolving one element per warp-iteration made the warp's time per
+    // group the *sum* of its elements' ascent latencies instead of ~max.
+    __shared__ unsigned short s_wl[NUM_WARPS][64];  // group-local ids: word*32+lane
+    for (;;) {
+        int group;
+        if (lane == 0) group = (int)atomicAdd(d_p3_next, 1u);
+        group = __shfl_sync(0xffffffff, group, 0);
+        if (group >= num_groups) break;
+        const int wbase = group * 32;
         const int wl = wbase + lane;
         const unsigned um_l = (wl < num_words) ? __ldg(&d_unres[wl]) : 0u;
 
@@ -372,76 +393,108 @@ void apsepDeviceSPT(
             continue;
         }
 
-        unsigned nz = __ballot_sync(0xffffffff, um_l != 0);
+        // Resolve a batch of k (<= 32) pooled worklist entries.  Each lane
+        // takes one entry and runs the tree ascent+descent independently
+        // (divergent but parallel — 32 dependent-load chains in flight
+        // instead of one); the cheap two-ballot finish stays cooperative.
+        auto resolveBatch = [&](int k) {
+            const int e    = (lane < k) ? (int)s_wl[warp_id][lane] : 0;
+            const int gid  = wbase * 32 + e;
+            const int blk  = min((wbase + (e >> 5)) / W, num_blocks - 1);
+            const T   qval = (lane < k) ? __ldg(&d_in[gid]) : INF;
 
-    while (nz) {
-        const int j = __ffs(nz) - 1;
-        nz &= nz - 1;
-        const unsigned um = __shfl_sync(0xffffffff, um_l, j);
-        const int w = wbase + j;
-
-        const int  block_id     = __shfl_sync(0xffffffff, bid_l, j);
-        const T    prefix_min_b = __shfl_sync(0xffffffff, pm_l, j);
-        const bool eo           = __shfl_sync(0xffffffff, (int)eo_l, j);
-        const int  base         = w * 32;
-        const bool mine         = (um >> mybit) & 1u;
-
-        if (eo) {
-            if (mine) d_out[base + lane] = (T)-1;
-            continue;
-        }
-
-        const int gid = base + lane;
-        T val = mine ? __ldg(&d_in[gid]) : INF;    // coalesced masked load
-        const bool need = mine && lt(prefix_min_b, val);
-        if (mine && !need) d_out[gid] = (T)-1;
-
-        // Warp-cooperative lookup for each remaining bit, one at a time.
-        unsigned pend = __ballot_sync(0xffffffff, need);
-        while (pend) {
-            const int bit = __ffs(pend) - 1;
-            pend &= pend - 1;
-            const T qval = __shfl_sync(0xffffffff, val, bit);
-
-            // Ascent+descent on the block-level tree, redundant on all 32
-            // lanes (identical addresses broadcast from L2).
-            int node = leaf_offset + block_id;
             int found_block = -1;
-            while (node > 0) {
-                bool is_right = (node % 2 == 0);
-                if (is_right) {
-                    int left_sib = node - 1;
-                    if (lt(__ldg(&d_tree[left_sib]), qval)) {
-                        node = left_sib;
-                        while (node < leaf_offset) {
-                            int rc = 2 * node + 2;
-                            node = lt(__ldg(&d_tree[rc]), qval) ? rc : (2 * node + 1);
+            if (lane < k) {
+                int node = leaf_offset + blk;
+                while (node > 0) {
+                    if (node % 2 == 0) {
+                        int left_sib = node - 1;
+                        if (lt(__ldg(&d_tree[left_sib]), qval)) {
+                            node = left_sib;
+                            while (node < leaf_offset) {
+                                int rc = 2 * node + 2;
+                                node = lt(__ldg(&d_tree[rc]), qval) ? rc : (2 * node + 1);
+                            }
+                            found_block = node - leaf_offset;
+                            break;
                         }
-                        found_block = node - leaf_offset;
-                        break;
                     }
+                    node = (node - 1) / 2;
                 }
-                node = (node - 1) / 2;
+                if (found_block < 0) d_out[gid] = (T)-1;
             }
 
-            int result = -1;
-            if (found_block >= 0) {
-                // lt(found_block's block_min, qval), so both ballots are nonzero.
-                const T* wm = d_block_warp_mins + (size_t)found_block * W;
+            unsigned hits = __ballot_sync(0xffffffff, found_block >= 0);
+            while (hits) {
+                const int b  = __ffs(hits) - 1;
+                hits &= hits - 1;
+                const T   q  = __shfl_sync(0xffffffff, qval, b);
+                const int fb = __shfl_sync(0xffffffff, found_block, b);
+                const int g  = __shfl_sync(0xffffffff, gid, b);
+
+                // lt(fb's block_min, q), so both ballots are nonzero.
+                const T* wm = d_block_warp_mins + (size_t)fb * W;
                 T wv = (lane < W) ? __ldg(&wm[lane]) : INF;
-                // lane < W guard: under INCL, lt(INF, INT_MAX-valued qval)
+                // lane < W guard: under INCL, lt(INF, INT_MAX-valued q)
                 // is true, so padding lanes must not enter the ballot.
-                unsigned wmask = __ballot_sync(0xffffffff, lane < W && lt(wv, qval));
+                unsigned wmask = __ballot_sync(0xffffffff, lane < W && lt(wv, q));
                 int wstar = 31 - __clz(wmask);
-                // found_block < block_id, so all B of its elements are < n:
+                // fb < the querying block, so all B of its elements are < n:
                 // reading d_in here is safe and identical to the old leaves.
-                const T* bl = d_in + (size_t)found_block * B + wstar * 32;
-                unsigned lmask = __ballot_sync(0xffffffff, lt(__ldg(&bl[lane]), qval));
-                result = found_block * B + wstar * 32 + (31 - __clz(lmask));
+                const T* bl = d_in + (size_t)fb * B + wstar * 32;
+                unsigned lmask = __ballot_sync(0xffffffff, lt(__ldg(&bl[lane]), q));
+                if (lane == 0)
+                    d_out[g] = (T)(fb * B + wstar * 32 + (31 - __clz(lmask)));
             }
-            if (lane == 0) d_out[base + bit] = (T)result;
+        };
+
+        unsigned nz = __ballot_sync(0xffffffff, um_l != 0);
+        int wl_count = 0;   // uniform across the warp
+
+        while (nz) {
+            const int j = __ffs(nz) - 1;
+            nz &= nz - 1;
+            const unsigned um = __shfl_sync(0xffffffff, um_l, j);
+            const int w = wbase + j;
+
+            const T    prefix_min_b = __shfl_sync(0xffffffff, pm_l, j);
+            const bool eo           = __shfl_sync(0xffffffff, (int)eo_l, j);
+            const int  base         = w * 32;
+            const bool mine         = (um >> mybit) & 1u;
+
+            if (eo) {
+                if (mine) d_out[base + lane] = (T)-1;
+                continue;
+            }
+
+            const int gid = base + lane;
+            T val = mine ? __ldg(&d_in[gid]) : INF;    // coalesced masked load
+            const bool need = mine && lt(prefix_min_b, val);
+            if (mine && !need) d_out[gid] = (T)-1;
+
+            // Pool the remaining bits into the worklist; flush 32 at a time.
+            const unsigned pend = __ballot_sync(0xffffffff, need);
+            const int pos = wl_count + __popc(pend & ((1u << lane) - 1));
+            if (need) s_wl[warp_id][pos] = (unsigned short)(j * 32 + lane);
+            wl_count += __popc(pend);
+
+            if (wl_count >= 32) {
+                __syncwarp();          // publish appended entries
+                resolveBatch(32);
+                const int rem = wl_count - 32;
+                const unsigned short ce =
+                    (lane < rem) ? s_wl[warp_id][32 + lane] : (unsigned short)0;
+                __syncwarp();          // batch + carry reads done before overwrite
+                if (lane < rem) s_wl[warp_id][lane] = ce;
+                wl_count = rem;
+            }
         }
-    }
+
+        // Drain (invariant: wl_count < 32 after every word)
+        if (wl_count > 0) {
+            __syncwarp();
+            resolveBatch(wl_count);
+        }
     }
     #undef lt
 }
@@ -460,11 +513,13 @@ void apsepKernelSPT(
         T* __restrict__         d_block_mins,
         T* __restrict__         d_block_warp_mins,
         T* __restrict__         d_tree,
-        T* __restrict__         d_prefix_min)
+        T* __restrict__         d_prefix_min,
+        unsigned* __restrict__  d_p3_next)
 {
     apsepDeviceSPT<T, BLOCK_SIZE, IPT, INCL>(
         cg::this_grid(), d_in, d_out, n, num_blocks, M, leaf_offset,
-        d_unres, d_block_mins, d_block_warp_mins, d_tree, d_prefix_min);
+        d_unres, d_block_mins, d_block_warp_mins, d_tree, d_prefix_min,
+        d_p3_next);
 }
 
 template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
@@ -474,6 +529,7 @@ struct SPTScratch {
     T*    d_block_warp_mins = nullptr;
     T*    d_tree            = nullptr;
     T*    d_prefix_min      = nullptr;  // prefix_min[b] = min(block_min[0..b-1])
+    unsigned* d_p3_next     = nullptr;  // Phase 3 ticket counter
     int   num_blocks        = 0;
     int   M                 = 0;
     int   leaf_offset       = 0;
@@ -505,6 +561,7 @@ SPTScratch<T, BLOCK_SIZE, IPT> allocSPTScratch(int n) {
     gpuAssert(cudaMalloc(&s.d_block_warp_mins, (size_t)s.num_blocks * W  * sizeof(T)));
     gpuAssert(cudaMalloc(&s.d_tree,            (size_t)(2 * s.M - 1)     * sizeof(T)));
     gpuAssert(cudaMalloc(&s.d_prefix_min,      (size_t)s.num_blocks      * sizeof(T)));
+    gpuAssert(cudaMalloc(&s.d_p3_next,         sizeof(unsigned)));
     return s;
 }
 
@@ -515,6 +572,7 @@ void freeSPTScratch(SPTScratch<T, BLOCK_SIZE, IPT>& s) {
     cudaFree(s.d_block_warp_mins);
     cudaFree(s.d_tree);
     cudaFree(s.d_prefix_min);
+    cudaFree(s.d_p3_next);
     s = SPTScratch<T, BLOCK_SIZE, IPT>{};
 }
 
@@ -527,7 +585,7 @@ void runSPT(const T* d_in, T* d_out, int n, SPTScratch<T, BLOCK_SIZE, IPT>& s) {
         (void*)&s.num_blocks, (void*)&s.M, (void*)&s.leaf_offset,
         (void*)&s.d_unres, (void*)&s.d_block_mins,
         (void*)&s.d_block_warp_mins, (void*)&s.d_tree,
-        (void*)&s.d_prefix_min
+        (void*)&s.d_prefix_min, (void*)&s.d_p3_next
     };
     gpuAssert(cudaLaunchCooperativeKernel(
         (void*)apsepKernelSPT<T, BLOCK_SIZE, IPT, INCL>,

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Test script for the PSE primitive (cuda/pse.cu).  Emulates the CUDA code
+# Test script for the PSE primitive (backends/cuda/pse.cu).  Emulates the CUDA code
 # generator's concatenation (common.cu + scan.cu + pse.cu), appends the test
 # main, compiles with nvcc, and runs a GPU-vs-CPU differential test of both
 # PSE semantics (strict < and <=).  Requires an NVIDIA GPU with cooperative
@@ -32,9 +32,9 @@ temp_dir=$(mktemp -d)
 trap "rm -rf \"$temp_dir\"" EXIT
 
 # Concatenate in generator order, then the test main
-cat "$REPO_ROOT/cuda/common.cu" \
-    "$REPO_ROOT/cuda/scan.cu" \
-    "$REPO_ROOT/cuda/pse.cu" \
+cat "$REPO_ROOT/backends/cuda/common.cu" \
+    "$REPO_ROOT/backends/cuda/scan.cu" \
+    "$REPO_ROOT/backends/cuda/pse.cu" \
     "$REPO_ROOT/tests/pse_test_main.cu" > "$temp_dir/pse_test.cu"
 
 if ! nvcc -std=c++17 -arch="$arch" -Xcompiler -O2 \
