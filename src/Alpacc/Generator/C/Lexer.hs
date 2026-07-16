@@ -38,6 +38,11 @@ static const state_t COMPOSE[NUM_STATES * NUM_STATES] =
 
 static const bool ACCEPT[NUM_STATES] =
   #{cudafy accept_array};
+
+#define NUM_TERMINALS #{num_terminals}
+
+static const index_t LITERAL_LENGTHS[NUM_TERMINALS] =
+  #{literal_lengths_arr};
 |]
   where
     int_parallel_lexer = lexer lex
@@ -56,3 +61,5 @@ static const bool ACCEPT[NUM_STATES] =
 
     defToken t = [i|#define IGNORE_TOKEN ((terminal_t) #{t})|]
     ignore_token = maybe "" defToken $ ignoreToken lex
+    literal_lengths_arr = cudafy $ literalLengths lex
+    num_terminals = length $ literalLengths lex

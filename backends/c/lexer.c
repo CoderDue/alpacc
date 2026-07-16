@@ -9,6 +9,10 @@
 //   terminal= (state & TERMINAL_MASK) >> TERMINAL_OFFSET
 //   produce = (state & PRODUCE_MASK)  >> PRODUCE_OFFSET
 
+static index_t __attribute__((unused)) get_span_end(terminal_t t, index_t start) {
+  return start + LITERAL_LENGTHS[(size_t)t];
+}
+
 static state_t compose(state_t a, state_t b) {
   uint64_t ai = (uint64_t)((a & ENDO_MASK) >> ENDO_OFFSET);
   uint64_t bi = (uint64_t)((b & ENDO_MASK) >> ENDO_OFFSET);
@@ -70,7 +74,8 @@ static bool lex_string(const uint8_t *str, uint64_t n,
         }
         result[count].terminal = t;
         result[count].start    = tok_start;
-        result[count].end      = i;
+        if (LITERAL_LENGTHS[(size_t)t] == 0)
+          result[count].end    = (index_t)i;
         count++;
       }
       tok_start = i;

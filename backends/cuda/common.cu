@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include <type_traits>
 #include <unistd.h>
 #define gpuAssert(x) _gpuAssert(x, __FILE__, __LINE__)
 #define numBlocks(size, block_size, items_per_thread) std::max<size_t>(1, (size + block_size * items_per_thread - 1) / (block_size * items_per_thread))
