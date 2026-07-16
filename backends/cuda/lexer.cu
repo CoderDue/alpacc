@@ -1,52 +1,3 @@
-// Calculate fixed overhead (independent of ITEMS_PER_THREAD)
-template<typename I, typename state_t, uint32_t BLOCK_SIZE>
-constexpr size_t calculate_lexer_fixed_overhead() {
-  return sizeof(I) * BLOCK_SIZE +           // indices_aux
-          sizeof(state_t) +                  // next_block_first_state
-          sizeof(I) +                        // last_start
-          sizeof(I) * WARP +                 // values
-          sizeof(Status) * WARP +            // statuses
-          sizeof(I);                         // shmem_prefix
-}
-
-// Calculate memory cost dependent on ITEMS_PER_THREAD (runtime parameter version)
-template<typename I, typename state_t, uint32_t BLOCK_SIZE>
-constexpr size_t calculate_lexer_variable_cost(uint32_t items_per_thread) {
-  size_t states_bytes = sizeof(state_t) * items_per_thread * BLOCK_SIZE;
-  size_t indices_bytes = sizeof(I) * items_per_thread * BLOCK_SIZE;
-  size_t states_aux_bytes = sizeof(state_t) * BLOCK_SIZE;
-  size_t buffer_bytes = (indices_bytes > states_aux_bytes) ? indices_bytes : states_aux_bytes;
-  
-  return states_bytes + buffer_bytes;
-}
-
-// Total shared memory usage
-template<typename I, typename state_t, uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
-constexpr size_t calculate_lexer_shared_memory_usage() {
-  return calculate_lexer_fixed_overhead<I, state_t, BLOCK_SIZE>() +
-         calculate_lexer_variable_cost<I, state_t, BLOCK_SIZE>(ITEMS_PER_THREAD);
-}
-
-// Compile-time calculation of maximum ITEMS_PER_THREAD
-template<typename I, typename state_t, uint32_t BLOCK_SIZE, uint32_t SHARED_MEMORY>
-constexpr uint32_t calculate_lexer_max_items_per_thread() {
-  constexpr size_t usable_shmem = static_cast<size_t>(SHARED_MEMORY * 0.9);
-  constexpr size_t fixed_overhead = calculate_lexer_fixed_overhead<I, state_t, BLOCK_SIZE>();
-  
-  uint32_t max_items = 1;
-  for (uint32_t items = 1; items <= 1024; items++) {
-    size_t total = fixed_overhead + calculate_lexer_variable_cost<I, state_t, BLOCK_SIZE>(items);
-    
-    if (total <= usable_shmem) {
-      max_items = items;
-    } else {
-      break;
-    }
-  }
-  
-  return max_items;
-}
-
 __device__ __host__ __forceinline__
 state_t get_index(state_t state) {
   return (state & ENDO_MASK) >> ENDO_OFFSET;
@@ -265,14 +216,8 @@ public:
 template<typename I, typename J, I BLOCK_SIZE, I ITEMS_PER_THREAD>
 __global__ void
 lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_starts, J* d_ends, const I size, const bool is_last_chunk) {
-  constexpr size_t indices_bytes = ITEMS_PER_THREAD * BLOCK_SIZE * sizeof(I);
-  constexpr size_t states_aux_bytes = BLOCK_SIZE * sizeof(state_t);
-  constexpr size_t max_bytes = (indices_bytes > states_aux_bytes) ? indices_bytes : states_aux_bytes;
   volatile __shared__ state_t states[ITEMS_PER_THREAD * BLOCK_SIZE];
-  volatile __shared__ I indices_aux[BLOCK_SIZE];
-  volatile __shared__ uint8_t shared_buffer[max_bytes];
-  volatile I* indices = (volatile I*) shared_buffer;
-  volatile state_t* states_aux = (volatile state_t*) shared_buffer;
+  volatile __shared__ I indices[ITEMS_PER_THREAD * BLOCK_SIZE];
   __shared__ state_t next_block_first_state;
   // Main slots: ceil(ITEMS_PER_THREAD / 8) uint64_t registers per thread.
   // One extra slot is added to cover the single byte past the block boundary
@@ -339,7 +284,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
 
   __syncthreads();
 
-  scan<state_t, I, LexerCtx<I, J>, ITEMS_PER_THREAD>(states, states_aux, ctx.d_state_states, ctx, IDENTITY, dyn_index);
+  scan<state_t, I, LexerCtx<I, J>, ITEMS_PER_THREAD, BLOCK_SIZE>(states, ctx.d_state_states, ctx, IDENTITY, dyn_index);
 
 #pragma unroll
   for (I i = 0; i < ITEMS_PER_THREAD; i++) {
@@ -375,7 +320,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
 
   __syncthreads();
 
-  scan<I, I, TakeRight<I>, ITEMS_PER_THREAD>(indices, indices_aux, ctx.d_take_right_states, ctx.take_right, ctx.take_right.identity, dyn_index);
+  scan<I, I, TakeRight<I>, ITEMS_PER_THREAD, BLOCK_SIZE>(indices, ctx.d_take_right_states, ctx.take_right, ctx.take_right.identity, dyn_index);
 
   I starts[ITEMS_PER_THREAD];
   volatile __shared__ I last_start;
@@ -400,7 +345,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
 
   __syncthreads();
 
-  I prefix = scan<I, I, Add<I>, ITEMS_PER_THREAD>(indices, indices_aux, ctx.d_index_states, Add<I>(), I(), dyn_index, false);
+  I prefix = scan<I, I, Add<I>, ITEMS_PER_THREAD, BLOCK_SIZE>(indices, ctx.d_index_states, Add<I>(), I(), dyn_index, false);
 
   #pragma unroll
   for (I i = 0; i < ITEMS_PER_THREAD; i++) {

@@ -1,22 +1,5 @@
 #include <cuda/atomic>
-
-template<typename T, typename I, typename OP, I ITEMS_PER_THREAD>
-__device__ inline void
-scanThread(volatile T* shmem,
-           volatile T* shmem_aux,
-           OP op) {
-  const I offset = threadIdx.x * ITEMS_PER_THREAD;
-  const I upper = offset + ITEMS_PER_THREAD;
-  T acc = shmem[offset];
-#pragma unroll
-  for (I lid = offset + 1; lid < upper; lid++) {
-    T tmp = shmem[lid];
-    acc = op(acc, tmp);
-    shmem[lid] = acc;
-  }
-  shmem_aux[threadIdx.x] = acc;
-  __syncthreads();
-}
+#include <cub/cub.cuh>
 
 template<typename T, typename I, typename OP>
 __device__ inline T
@@ -59,35 +42,6 @@ scanBlock(volatile T* shmem,
 
   shmem[threadIdx.x] = res;
   __syncthreads();
-}
-
-template<typename T, typename I, typename OP, I ITEMS_PER_THREAD>
-__device__ inline void
-addAuxBlockScan(volatile T* shmem,
-                volatile T* shmem_aux,
-                OP op) {
-  if (threadIdx.x > 0) {
-    const I offset = threadIdx.x * ITEMS_PER_THREAD;
-    const I upper = offset + ITEMS_PER_THREAD;
-    const T val = shmem_aux[threadIdx.x - 1];
-#pragma unroll
-    for (I lid = offset; lid < upper; lid++) {
-      shmem[lid] = op(val, shmem[lid]);
-    }
-  }
-  __syncthreads();
-}
-
-template<typename T, typename I, typename OP, I ITEMS_PER_THREAD>
-__device__ inline void
-scanBlock(volatile T* block,
-          volatile T* block_aux,
-          OP op) {
-  scanThread<T, I, OP, ITEMS_PER_THREAD>(block, block_aux, op);
-
-  scanBlock<T, I, OP>(block_aux, op);
-
-  addAuxBlockScan<T, I, OP, ITEMS_PER_THREAD>(block, block_aux, op);
 }
 
 __device__ inline uint32_t dynamicIndex(volatile uint32_t* dyn_idx_ptr) {
@@ -167,14 +121,16 @@ scanWarp(volatile T* values,
   }
 }
 
-template<typename T, typename I, typename OP, I ITEMS_PER_THREAD>
+// Computes this block's exclusive prefix via decoupled lookback, given the
+// block-wide aggregate (valid in all threads). Returns the prefix to all
+// threads.
+template<typename T, typename I, typename OP>
 __device__ inline T
-decoupledLookbackScan(States<I, T> states,
-                      volatile T* shmem,
-                      OP op,
-                      T ne,
-                      uint32_t dyn_idx,
-                      bool write_back = true) {
+lookbackPrefix(States<I, T> states,
+               OP op,
+               T ne,
+               uint32_t dyn_idx,
+               T aggregate) {
   volatile __shared__ T values[WARP];
   volatile __shared__ Status statuses[WARP];
   volatile __shared__ T shmem_prefix;
@@ -188,7 +144,6 @@ decoupledLookbackScan(States<I, T> states,
   }
   __syncthreads();
 
-  T aggregate = shmem[ITEMS_PER_THREAD * blockDim.x - 1];
   if (is_first) {
     states.aggregates[dyn_idx] = aggregate;
   }
@@ -249,32 +204,44 @@ decoupledLookbackScan(States<I, T> states,
     states.statuses[dyn_idx].store(Prefix, cuda::memory_order_release);
   }
 
-  prefix = shmem_prefix;
-  if (write_back) {
-    const I offset = threadIdx.x * ITEMS_PER_THREAD;
-    const I upper = offset + ITEMS_PER_THREAD;
-#pragma unroll
-    for (I lid = offset; lid < upper; lid++) {
-      shmem[lid] = op(prefix, shmem[lid]);
-    }
-  }
-  __syncthreads();
-  return prefix;
+  return shmem_prefix;
 }
 
-template<typename T, typename I, typename OP, I ITEMS_PER_THREAD>
+// Single-pass device scan over one block's tile: cub::BlockScan (register
+// scan, warp shuffles) for the block-level phase + decoupled lookback for
+// the inter-block prefix. The tile lives in shared memory in blocked layout
+// (thread t owns [t*ITEMS_PER_THREAD, (t+1)*ITEMS_PER_THREAD)); the caller
+// must __syncthreads() between writing the tile and calling this.
+template<typename T, typename I, typename OP, I ITEMS_PER_THREAD, I BLOCK_SIZE>
 __device__ inline T
-scan(volatile T* block,
-     volatile T* block_aux,
+scan(volatile T* shmem,
      States<I, T> states,
      OP op,
      T ne,
      uint32_t dyn_idx,
      bool write_back = true) {
+  using BlockScanT = cub::BlockScan<T, BLOCK_SIZE>;
+  __shared__ typename BlockScanT::TempStorage temp_storage;
 
-  scanBlock<T, I, OP, ITEMS_PER_THREAD>(block, block_aux, op);
+  T items[ITEMS_PER_THREAD];
+  const I offset = threadIdx.x * ITEMS_PER_THREAD;
+#pragma unroll
+  for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+    items[i] = shmem[offset + i];
+  }
 
-  return decoupledLookbackScan<T, I, OP, ITEMS_PER_THREAD>(states, block, op, ne, dyn_idx, write_back);
+  T aggregate;
+  BlockScanT(temp_storage).InclusiveScan(items, items, op, aggregate);
+
+  const T prefix = lookbackPrefix<T, I, OP>(states, op, ne, dyn_idx, aggregate);
+
+#pragma unroll
+  for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+    shmem[offset + i] = write_back ? op(prefix, items[i]) : items[i];
+  }
+  __syncthreads();
+
+  return prefix;
 }
 
 template<typename I>

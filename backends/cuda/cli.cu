@@ -163,15 +163,14 @@ static uint32_t auto_ipt(uint32_t shmem_budget, uint32_t bs) {
     // Try 8, 4, 2 in descending order.
     constexpr uint32_t candidates[] = {8, 4, 2};
     for (uint32_t ipt : candidates) {
-        // Approximate: fixed_overhead + state_t*ipt*bs + max(I*ipt*bs, state_t*bs)
-        // Use conservative upper bound with state_t = 4, I = 4.
-        size_t est = (size_t)4 * bs                   // indices_aux
-                   + 4                                // next_block_first_state
-                   + 4                                // last_start
-                   + 4 * WARP + WARP                  // values + statuses
-                   + 4                                // shmem_prefix
-                   + (size_t)4 * ipt * bs             // states
-                   + (size_t)4 * ipt * bs;            // indices (max of indices, states_aux)
+        // Approximate: states + indices tiles, three cub::BlockScan temp
+        // storages (one per scan instantiation), and per-scan lookback
+        // buffers. Conservative upper bounds with state_t = 4, I = 4.
+        size_t est = (size_t)4 * ipt * bs             // states
+                   + (size_t)4 * ipt * bs             // indices
+                   + 3 * (size_t)8 * bs               // cub BlockScan temp x3
+                   + 3 * ((size_t)4 * WARP + WARP + 4)// lookback values/statuses/prefix x3
+                   + 8;                               // next_block_first_state + last_start
         if (est <= (size_t)shmem_budget * 9 / 10)
             return ipt;
     }
