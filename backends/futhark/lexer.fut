@@ -26,7 +26,6 @@ module type lexer_context = {
   val accept_array : [state_size]bool
   val number_of_terminals : i64
   val terminal_int_to_name : [number_of_terminals]terminal
-  val literal_lengths : [number_of_terminals]i64
 }
 
 module type lexer = {
@@ -34,7 +33,6 @@ module type lexer = {
   type terminal
   val lex_int [n] : [n]u8 -> opt ([](terminal_int, (idx.t, idx.t)))
   val lex [n] : [n]u8 -> opt ([](terminal, (idx.t, idx.t)))
-  val get_span : terminal_int -> (idx.t, idx.t) -> (idx.t, idx.t)
 }
 
 module mk_lexer (L: lexer_context)
@@ -95,12 +93,6 @@ module mk_lexer (L: lexer_context)
     case #some t' -> t L.terminal_int_module.== t'
     case #none -> false
 
-  def get_span (t: terminal_int) (span: (idx.t, idx.t)) : (idx.t, idx.t) =
-    let (s, e) = span
-    in if e == idx.i64 (-1)
-       then (s, s + idx.i64 L.literal_lengths[L.terminal_int_module.to_i64 t])
-       else (s, e)
-
   def lex_step [m] [n]
                (offset: idx.t)
                (prev_state: state)
@@ -138,16 +130,9 @@ module mk_lexer (L: lexer_context)
     -- Globalise spans here, before the scatter: mapping the scatter result
     -- instead would re-add this chunk's offset to tokens already emitted by
     -- earlier chunks.
-    -- For literal terminals the end is the sentinel idx.lowest; callers use
-    -- get_span to reconstruct the real end from the literal_lengths table.
     let vs =
       zip (map to_terminal states) (zip starts ends)
-      |> map (\(t, (s, e)) ->
-                let ti = L.terminal_int_module.to_i64 t
-                let end = if L.literal_lengths[ti] > 0
-                          then idx.i64 (-1)
-                          else idx.i64 1 + e + offset
-                in (t, (s + offset, end)))
+      |> map (\(t, (s, e)) -> (t, (s + offset, idx.i64 1 + e + offset)))
     let size = last is
     let extra_size = idx.to_i64 prev_size + size + 1
     let dest =
@@ -194,14 +179,11 @@ module mk_lexer (L: lexer_context)
     let (result, size) =
       if is_ignore last_terminal
       then (result, size)
-      else let last_t = to_terminal state
-               ti = L.terminal_int_module.to_i64 last_t
-               tail_end = if L.literal_lengths[ti] > 0
-                          then idx.i64 (-1)
-                          else idx.i64 n
-           in ( result with [idx.to_i64 size] = (last_t, (start, tail_end))
-              , size + idx.i64 1
-              )
+      else ( result with [idx.to_i64 size] = ( to_terminal state
+                                              , (start, idx.i64 n)
+                                              )
+           , size + idx.i64 1
+           )
     in if is_accept state
        then (true, take (idx.to_i64 size) result)
        else (false, [])

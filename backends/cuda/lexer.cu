@@ -345,10 +345,8 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
       } else {
         d_starts[offset] = ctx.addOffset(starts[i] - 1);
       }
-      terminal_t term = get_terminal(states[lid]);
-      if (LITERAL_LENGTHS[(size_t)term] == 0)
-        d_ends[offset] = ctx.addOffset(gid + 1);
-      d_terminals[offset] = term;
+      d_ends[offset] = ctx.addOffset(gid + 1);
+      d_terminals[offset] = get_terminal(states[lid]);
     }
   }
 

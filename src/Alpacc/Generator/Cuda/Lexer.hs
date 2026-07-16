@@ -39,16 +39,6 @@ const state_t h_compose[NUM_STATES * NUM_STATES] =
 
 const bool h_accept[NUM_STATES] =
   #{cudafy $ accept_array};
-
-const size_t NUM_TERMINALS = #{num_terminals};
-
-__device__ const index_t LITERAL_LENGTHS[NUM_TERMINALS] =
-  #{literal_lengths_arr};
-
-template<typename J>
-__device__ J get_span_end(terminal_t t, J start) {
-  return start + (J)LITERAL_LENGTHS[(size_t)t];
-}
 |]
     <> cudaLexer
   where
@@ -69,5 +59,3 @@ __device__ J get_span_end(terminal_t t, J start) {
     defToken t = [i|#define IGNORE_TOKEN #{t}|]
     ignore_token =
       maybe "" defToken $ ignoreToken lex
-    literal_lengths_arr = cudafy $ literalLengths lex
-    num_terminals = length $ literalLengths lex

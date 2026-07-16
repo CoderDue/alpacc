@@ -58,9 +58,6 @@ module lexer = mk_lexer {
   def transitions_to_states : [256]state =
     sized 256 #{transitions}
 
-  def literal_lengths : [number_of_terminals]i64 =
-    sized number_of_terminals #{literal_lengths_arr}
-
   #{compositions_table}
 }
 |]
@@ -82,5 +79,4 @@ module lexer = mk_lexer {
     accept_array = acceptArray parallel_lexer
     state_type = stateType lex
     transitions = futharkify $ transitionToState lex
-    literal_lengths_arr = futharkify $ literalLengths lex
     compositions_table = compositionsArray state_type parallel_lexer

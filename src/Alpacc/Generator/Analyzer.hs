@@ -36,17 +36,9 @@ data Lexer
     lexer :: IntParallelLexer Word8,
     ignoreToken :: Maybe Integer,
     deadToken :: Integer,
-    transitionToState :: [Integer],
-    literalLengths :: [Integer]
+    transitionToState :: [Integer]
   }
   deriving (Show)
-
-mkLiteralLengths :: TerminalEncoder T -> [Integer]
-mkLiteralLengths encoder =
-  toLiteralLength <$> toTerminals encoder
-  where
-    toLiteralLength (Used (TLit s)) = fromIntegral (Text.length s)
-    toLiteralLength _ = 0
 
 transitionToStateArray :: IntParallelLexer Word8 -> Either Text [Integer]
 transitionToStateArray parallel_lexer =
@@ -131,8 +123,7 @@ mkLexer cfg = do
                 lexer = parallel_lexer,
                 deadToken = terminalDead encoder,
                 transitionToState = transition_to_state,
-                ignoreToken = terminalLookup ignore encoder,
-                literalLengths = mkLiteralLengths encoder
+                ignoreToken = terminalLookup ignore encoder
               },
         terminalToName = terminal_to_name,
         terminalType = terminal_type,
@@ -232,8 +223,7 @@ mkLexerParser cfg = do
                   lexer = parallel_lexer,
                   deadToken = dead_token,
                   transitionToState = transition_to_state,
-                  ignoreToken = terminalLookup ignore t_encoder,
-                  literalLengths = mkLiteralLengths t_encoder
+                  ignoreToken = terminalLookup ignore t_encoder
                 }
             )
             ( Parser
