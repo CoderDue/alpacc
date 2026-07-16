@@ -35,7 +35,7 @@ def decode_u64 (a: [8]u8) : u64 = decode_le a
 module lexer_test
   (L: {
     type terminal_int
-    val lex_int [n] : i32 -> [n]u8 -> opt ([](terminal_int, (idx.t, idx.t)))
+    val lex_int [n] : [n]u8 -> opt ([](terminal_int, (idx.t, idx.t)))
   })
   (T: integral with t = L.terminal_int) = {
   type terminal = L.terminal_int
@@ -58,7 +58,7 @@ module lexer_test
       ++ flatten (map encode_terminal ts')
     case #none -> [u8.bool false]
 
-  def test [n] (chunk_size: i32) (bytes: [n]u8) : []u8 =
+  def test [n] (bytes: [n]u8) : []u8 =
     let num = take 8 bytes
     let num_tests = decode_u64 num
     let (a, _, size) =
@@ -70,7 +70,7 @@ module lexer_test
         let inputs'' = drop 8 inputs'
         let input = take input_size inputs''
         let inputs''' = drop input_size inputs''
-        let output = L.lex_int chunk_size input |> encode_terminals
+        let output = L.lex_int input |> encode_terminals
         let new_size = size + length output
         let result =
           if length result <= new_size

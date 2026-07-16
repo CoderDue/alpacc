@@ -118,7 +118,11 @@ run_backend_futhark() {
         echo "ERROR: alpacc futhark failed"; return 1
     fi
     # futhark script -b emits a 16-byte header before the binary payload; strip it.
-    futhark script --backend="$futhark_target" -b "${stem}.fut" \
+    # Write a tuning file so chunk_size=10000 forces multi-chunk lexing on the
+    # long input, exercising the chunked code path as a regression test.
+    echo "chunk_size=10000" > "${stem}.fut.tuning"
+    futhark script --backend="$futhark_target" -b \
+        "${stem}.fut" \
         "test (\$loadbytes \"${stem}.inputs\")" \
         | tail -c +16 > "${stem}.results"
 }

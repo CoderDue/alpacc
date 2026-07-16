@@ -25,7 +25,7 @@ bothFunction terminal_type production_type =
     Text.pack
       [i|
 entry parse s =
-  let tokens' = lexer.lex_int 16777216 s
+  let tokens' = lexer.lex_int s
   let tokens =
     match tokens'
     case #some t -> t
@@ -45,7 +45,7 @@ entry parse s =
   in result
 
 entry parse_int s =
-  let tokens' = lexer.lex_int 16777216 s
+  let tokens' = lexer.lex_int s
   let tokens =
     match tokens'
     case #some t -> t
@@ -81,21 +81,21 @@ lexerFunction terminal_type =
 module tester = lexer_test lexer #{futharkify terminal_type}
 
 entry lex s =
-  match lexer.lex 16777216 s
+  match lexer.lex s
   case #some r -> let (tokens, spans) = unzip r
                   let (starts, ends) = unzip spans
                   in (tokens, starts, ends)
   case #none -> ([], [], [])
 
 entry lex_int s =
-  match lexer.lex_int 16777216 s
+  match lexer.lex_int s
   case #some r -> let (tokens, spans) = unzip r
                   let (starts, ends) = unzip spans
                   in (tokens, starts, ends)
   case #none -> ([], [], [])
 
 
-entry test [n] (s: [n]u8) : []u8 = tester.test 16777216 s
+entry test [n] (s: [n]u8) : []u8 = tester.test s
 |]
 
 parserFunction :: UInt -> UInt -> Text
