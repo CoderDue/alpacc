@@ -78,7 +78,9 @@ void apsepDeviceSPT(
         T* __restrict__         d_block_warp_mins,
         T* __restrict__         d_tree,       // 2*M-1 nodes
         T* __restrict__         d_prefix_min, // prefix_min[b] = min(block_min[0..b-1]), INF for b=0
-        unsigned* __restrict__  d_p3_next)    // Phase 3 work-queue ticket counter
+        unsigned* __restrict__  d_p3_next,    // Phase 3 work-queue ticket counter
+        unsigned* __restrict__  d_p1_next)    // Phase 1 tile ticket counter (must be 0 on entry;
+                                              // reset in-kernel after use, see Phase 2)
 {
     constexpr int B         = BLOCK_SIZE * IPT;
     constexpr int NUM_WARPS = BLOCK_SIZE / 32;
@@ -119,9 +121,19 @@ void apsepDeviceSPT(
     // jumping ANSV chain) over per-thread mins — 4x fewer shuffles than the
     // striped layout, and descending runs resolve with no shuffles at all.
     // -------------------------------------------------------------------------
-    int parity = 0;
-    for (int block_id = phys_bid; block_id < num_blocks;
-         block_id += num_phys, parity ^= 1) {
+    // Dynamic tile scheduling: blocks draw tile ids from a global ticket
+    // counter, so tile-workload variance (divergent resolution walks) does
+    // not pile up on the grid.sync after Phase 1 the way static striding
+    // lets it.  The *next* ticket is prefetched just before the existing
+    // mid-loop barrier, which then also publishes it — no extra barrier
+    // per tile, so the double-buffer skew allowance is preserved.
+    __shared__ int s_next_tile[2];
+    if (threadIdx.x == 0)
+        s_next_tile[0] = (int)atomicAdd(d_p1_next, 1u);
+    __syncthreads();
+    int parity   = 0;
+    int block_id = s_next_tile[0];
+    while (block_id < num_blocks) {
         T* const s_elems     = s_elems_buf[parity];
         T* const s_tmin      = s_tmin_buf[parity];
         T* const s_warp_min  = s_warp_min_buf[parity];
@@ -185,8 +197,12 @@ void apsepDeviceSPT(
             }
         }
 
+        if (threadIdx.x == 0)
+            s_next_tile[parity ^ 1] = (int)atomicAdd(d_p1_next, 1u);
+
         __syncthreads();  // covers cross-thread s_elems/s_tmin/s_warp_min reads
-                          // and bounds the double-buffer skew to one iteration
+                          // (and the s_next_tile prefetch above) and bounds
+                          // the double-buffer skew to one iteration
 
         // Thread-level ANSV chain over tmins (pointer jumping; each lane's
         // query is its own tmin, so the gap-bound argument of the original
@@ -287,6 +303,9 @@ void apsepDeviceSPT(
             for (int w = 1; w < NUM_WARPS; w++) bmin = min(bmin, s_warp_min[w]);
             d_block_mins[block_id] = bmin;
         }
+
+        block_id = s_next_tile[parity ^ 1];
+        parity ^= 1;
     }
 
     // -------------------------------------------------------------------------
@@ -301,9 +320,12 @@ void apsepDeviceSPT(
     for (int i = phys_bid * BLOCK_SIZE + threadIdx.x; i < M; i += num_phys * BLOCK_SIZE)
         d_tree[leaf_offset + i] = (i < num_blocks) ? d_block_mins[i] : INF;
 
-    // Reset the Phase 3 ticket counter; the "tree fully built" grid.sync
-    // below publishes it before any warp draws a ticket.
-    if (phys_bid == 0 && threadIdx.x == 0) *d_p3_next = 0u;
+    // Reset the ticket counters; the "tree fully built" grid.sync below
+    // publishes them before any warp draws a Phase 3 ticket, and long
+    // before the *next* apsepDeviceSPT call draws a Phase 1 ticket (E and
+    // H share both counters via this self-reset; the grid.sync above
+    // guarantees all Phase 1 tickets of this call are already drawn).
+    if (phys_bid == 0 && threadIdx.x == 0) { *d_p3_next = 0u; *d_p1_next = 0u; }
 
     // Reduce level by level
     {
@@ -536,12 +558,13 @@ void apsepKernelSPT(
         T* __restrict__         d_block_warp_mins,
         T* __restrict__         d_tree,
         T* __restrict__         d_prefix_min,
-        unsigned* __restrict__  d_p3_next)
+        unsigned* __restrict__  d_p3_next,
+        unsigned* __restrict__  d_p1_next)
 {
     apsepDeviceSPT<T, BLOCK_SIZE, IPT, INCL>(
         cg::this_grid(), d_in, d_out, n, num_blocks, M, leaf_offset,
         d_unres, d_block_mins, d_block_warp_mins, d_tree, d_prefix_min,
-        d_p3_next);
+        d_p3_next, d_p1_next);
 }
 
 template <typename T, int BLOCK_SIZE = 128, int IPT = 4>
@@ -552,6 +575,7 @@ struct SPTScratch {
     T*    d_tree            = nullptr;
     T*    d_prefix_min      = nullptr;  // prefix_min[b] = min(block_min[0..b-1])
     unsigned* d_p3_next     = nullptr;  // Phase 3 ticket counter
+    unsigned* d_p1_next     = nullptr;  // Phase 1 tile ticket counter
     int   num_blocks        = 0;
     int   M                 = 0;
     int   leaf_offset       = 0;
@@ -584,6 +608,10 @@ SPTScratch<T, BLOCK_SIZE, IPT> allocSPTScratch(int n) {
     gpuAssert(cudaMalloc(&s.d_tree,            (size_t)(2 * s.M - 1)     * sizeof(T)));
     gpuAssert(cudaMalloc(&s.d_prefix_min,      (size_t)s.num_blocks      * sizeof(T)));
     gpuAssert(cudaMalloc(&s.d_p3_next,         sizeof(unsigned)));
+    gpuAssert(cudaMalloc(&s.d_p1_next,         sizeof(unsigned)));
+    // Phase 1 draws tickets before any in-kernel reset can run, so the
+    // counter must start at zero; afterwards the kernel self-resets it.
+    gpuAssert(cudaMemset(s.d_p1_next, 0, sizeof(unsigned)));
     return s;
 }
 
@@ -595,6 +623,7 @@ void freeSPTScratch(SPTScratch<T, BLOCK_SIZE, IPT>& s) {
     cudaFree(s.d_tree);
     cudaFree(s.d_prefix_min);
     cudaFree(s.d_p3_next);
+    cudaFree(s.d_p1_next);
     s = SPTScratch<T, BLOCK_SIZE, IPT>{};
 }
 
@@ -607,7 +636,7 @@ void runSPT(const T* d_in, T* d_out, int n, SPTScratch<T, BLOCK_SIZE, IPT>& s) {
         (void*)&s.num_blocks, (void*)&s.M, (void*)&s.leaf_offset,
         (void*)&s.d_unres, (void*)&s.d_block_mins,
         (void*)&s.d_block_warp_mins, (void*)&s.d_tree,
-        (void*)&s.d_prefix_min, (void*)&s.d_p3_next
+        (void*)&s.d_prefix_min, (void*)&s.d_p3_next, (void*)&s.d_p1_next
     };
     gpuAssert(cudaLaunchCooperativeKernel(
         (void*)apsepKernelSPT<T, BLOCK_SIZE, IPT, INCL>,

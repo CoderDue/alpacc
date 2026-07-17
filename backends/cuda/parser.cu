@@ -200,6 +200,9 @@ struct FusedBufs {
     index_t*  d_tree;
     index_t*  d_prefix_min;
     unsigned* d_p3_next;
+    unsigned* d_p1_next;            // PSE Phase 1 tile ticket counter (lives in
+                                    // d_lb_arena; self-resets in-kernel, so E
+                                    // and H share it)
 
 #ifdef HAS_LEXER
     // Combined mode (parse_int): parents + compact-tree assembly.
@@ -352,7 +355,7 @@ parserFusedKernel(FusedBufs b)
             apsepDeviceSPT<index_t, (int)FUSED_BS, FUSED_IPT, true>(
                 grid, b.d_scan, b.d_match, nb, spt_blocks, M, M - 1,
                 b.d_unres, b.d_block_mins, b.d_block_warp_mins,
-                b.d_tree, b.d_prefix_min, b.d_p3_next);
+                b.d_tree, b.d_prefix_min, b.d_p3_next, b.d_p1_next);
         }
         grid.sync();
 
@@ -419,7 +422,7 @@ parserFusedKernel(FusedBufs b)
         apsepDeviceSPT<index_t, (int)FUSED_BS, FUSED_IPT, true>(
             grid, b.d_scan, b.d_match, np, spt_blocks, M, M - 1,
             b.d_unres, b.d_block_mins, b.d_block_warp_mins,
-            b.d_tree, b.d_prefix_min, b.d_p3_next);
+            b.d_tree, b.d_prefix_min, b.d_p3_next, b.d_p1_next);
     }
     grid.sync();
 
@@ -593,7 +596,7 @@ static ParserFused allocParserFused(index_t max_m) {
 #else
         const index_t lb_tiles_p = 0;
 #endif
-        const size_t counters_bytes = 4 * sizeof(uint32_t);
+        const size_t counters_bytes = 5 * sizeof(uint32_t);
         p.lb_arena_bytes = counters_bytes
                          + ((size_t)lb_tiles_m + (size_t)lb_tiles_d
                             + 2 * (size_t)lb_tiles_p)
@@ -601,7 +604,8 @@ static ParserFused allocParserFused(index_t max_m) {
         gpuAssert(cudaMalloc(&p.d_lb_arena, p.lb_arena_bytes));
         uint32_t*     ctr = (uint32_t*)p.d_lb_arena;
         AtomicStatus* st  = (AtomicStatus*)(p.d_lb_arena + counters_bytes);
-        b.d_dyn_ab = ctr + 3;
+        b.d_dyn_ab  = ctr + 3;
+        b.d_p1_next = ctr + 4;
         b.states_ab.num_blocks = lb_tiles_m;
         b.states_ab.statuses   = st + lb_tiles_d + 2 * lb_tiles_p;
         gpuAssert(cudaMalloc((void**)&b.states_ab.aggregates,
