@@ -230,10 +230,13 @@ struct FusedBufs {
     // d_match holds the (old-numbering) parent vector after Phase H.
     bool           with_parents;    // runtime: skip G/H/I on token-only paths
     index_t        num_lexemes;
-    // Lookback scratch for the single-pass Phase G scan (own States and
-    // ticket counter — no reuse across scans, so no in-kernel resets).
+    // Lookback scratch for the single-pass Phase G and I scans (own States
+    // and ticket counter each — no reuse across scans, so no in-kernel
+    // resets).
     States<index_t, index_t> states_g;
     uint32_t*      d_dyn_g;
+    States<index_t, index_t> states_i;
+    uint32_t*      d_dyn_i;
     production_t*  d_tree_prods;    // [max_pr] compacted tree production ids
     index_t*       d_tree_parents;  // [max_pr] compacted tree parent indices
     index_t*       d_token_parents; // [max_pr] per lexeme: parent tree index
@@ -445,7 +448,6 @@ parserFusedKernel(FusedBufs b)
     // Single ticket-loop pass (decoupled lookback): (arity - 1) deltas are
     // computed in registers from d_productions and the exclusive value
     // incl - delta is written straight to d_scan.
-    const index_t num_tiles_p = (num_prods + (index_t)FUSED_BS - (index_t)1) / (index_t)FUSED_BS;
     {
         constexpr index_t TILE = (index_t)FUSED_BS * (index_t)FUSED_IPT;
         const index_t num_tiles_g = (num_prods + TILE - (index_t)1) / TILE;
@@ -489,32 +491,53 @@ parserFusedKernel(FusedBufs b)
     }
     grid.sync();
 
-    // ---- Phase I: parents fixup + compact-tree assembly ----
+    // ---- Phase I: is-term scan + compact-tree assembly ----
     // Terminal-production slots are dropped from the tree; indices are
     // remapped by subtracting the inclusive is-term scan (t_incl).  Parents
     // always point at production nodes, so their remap is the same
     // subtraction.  Terminal slot k (in order) belongs to lexeme
     // t_incl[i] - 1 and contributes token_parents[lexeme] instead.
-    // The parents fixup and the flag scan are independent: no grid.sync
-    // between them.
-    for (index_t i = grank; i < num_prods; i += gsz) {
-        if (i == (index_t)0 || b.d_match[i] < (index_t)0) b.d_match[i] = (index_t)0;
+    // A single ticket-loop lookback pass materializes the FULL inclusive
+    // scan in d_scan — the remap below reads d_scan[p_old] at random
+    // positions — and checks safe_zip in-pass.  There is no parents-fixup
+    // pass: p_old is clamped when read instead.
+    {
+        constexpr index_t TILE = (index_t)FUSED_BS * (index_t)FUSED_IPT;
+        const index_t num_tiles_i = (num_prods + TILE - (index_t)1) / TILE;
+        uint32_t tile;
+        while ((tile = dynamicIndex(b.d_dyn_i)) < (uint32_t)num_tiles_i) {
+            const index_t offset = (index_t)tile * TILE
+                                 + (index_t)threadIdx.x * (index_t)FUSED_IPT;
+            index_t items[FUSED_IPT];
+#pragma unroll
+            for (int j = 0; j < FUSED_IPT; j++) {
+                index_t gid = offset + (index_t)j;
+                items[j] = (gid < num_prods) ? IsTermFlag()(b.d_productions[gid])
+                                             : (index_t)0;
+            }
+            index_t prefix =
+                scanReg<index_t, index_t, Add<index_t>, FUSED_IPT, (index_t)FUSED_BS>(
+                    items, b.states_i, Add<index_t>(), (index_t)0, tile);
+#pragma unroll
+            for (int j = 0; j < FUSED_IPT; j++) {
+                index_t gid = offset + (index_t)j;
+                if (gid < num_prods) {
+                    index_t incl = prefix + items[j];
+                    b.d_scan[gid] = incl;
+                    // safe_zip: #terminal productions must equal #lexemes
+                    if (gid == num_prods - (index_t)1 && incl != b.num_lexemes)
+                        atomicAnd(b.d_valid, 0);
+                }
+            }
+        }
     }
-    coopScanPass1(b.d_productions, b.d_scan, b.d_agg_d, num_prods, IsTermFlag());
     grid.sync();
-    coopScanPass2<index_t>(b.d_agg_d, num_tiles_p);
-    grid.sync();
-    // safe_zip: #terminal productions must equal #lexemes
-    if (grank == 0 && b.d_agg_d[num_tiles_p - 1] != b.num_lexemes)
-        atomicAnd(b.d_valid, 0);
     for (index_t i = grank; i < num_prods; i += gsz) {
         production_t prod = b.d_productions[i];
-        index_t tile   = i / (index_t)FUSED_BS;
-        index_t t_incl = b.d_scan[i] + ((tile > 0) ? b.d_agg_d[tile - 1] : (index_t)0);
-        index_t p_old  = b.d_match[i];
-        index_t p_tile = p_old / (index_t)FUSED_BS;
-        index_t p_new  = p_old - (b.d_scan[p_old]
-                                  + ((p_tile > 0) ? b.d_agg_d[p_tile - 1] : (index_t)0));
+        index_t t_incl = b.d_scan[i];
+        index_t p_raw  = b.d_match[i];
+        index_t p_old  = (i == (index_t)0 || p_raw < (index_t)0) ? (index_t)0 : p_raw;
+        index_t p_new  = p_old - b.d_scan[p_old];
         if (PRODUCTION_TO_TERMINAL_IS_VALID[prod]) {
             index_t lex = t_incl - (index_t)1;
             if (lex < b.num_lexemes) b.d_token_parents[lex] = p_new;
@@ -602,19 +625,20 @@ static ParserFused allocParserFused(index_t max_m) {
     b.d_arr = p.d_arr;
 
     // Single-pass lookback scan scratch (1024-element tiles; Phase D over up
-    // to max_bk brackets, Phase G over up to max_pr productions).  Arena
-    // layout: [u32 ticket counters][statuses D][statuses G].
+    // to max_bk brackets, Phases G and I over up to max_pr productions).
+    // Arena layout: [u32 ticket counters][statuses D][statuses G][statuses I].
     {
         constexpr index_t LB_TILE = (index_t)FUSED_BS * (index_t)FUSED_IPT;
         const index_t lb_tiles_d = (p.max_bk + LB_TILE - 1) / LB_TILE;
 #ifdef HAS_LEXER
-        const index_t lb_tiles_g = (p.max_pr + LB_TILE - 1) / LB_TILE;
+        const index_t lb_tiles_p = (p.max_pr + LB_TILE - 1) / LB_TILE;
 #else
-        const index_t lb_tiles_g = 0;
+        const index_t lb_tiles_p = 0;
 #endif
-        const size_t counters_bytes = 2 * sizeof(uint32_t);
+        const size_t counters_bytes = 3 * sizeof(uint32_t);
         p.lb_arena_bytes = counters_bytes
-                         + (size_t)(lb_tiles_d + lb_tiles_g) * sizeof(AtomicStatus);
+                         + ((size_t)lb_tiles_d + 2 * (size_t)lb_tiles_p)
+                           * sizeof(AtomicStatus);
         gpuAssert(cudaMalloc(&p.d_lb_arena, p.lb_arena_bytes));
         uint32_t*     ctr = (uint32_t*)p.d_lb_arena;
         AtomicStatus* st  = (AtomicStatus*)(p.d_lb_arena + counters_bytes);
@@ -627,12 +651,19 @@ static ParserFused allocParserFused(index_t max_m) {
                              (size_t)lb_tiles_d * sizeof(index_t)));
 #ifdef HAS_LEXER
         b.d_dyn_g = ctr + 1;
-        b.states_g.num_blocks = lb_tiles_g;
+        b.states_g.num_blocks = lb_tiles_p;
         b.states_g.statuses   = st + lb_tiles_d;
         gpuAssert(cudaMalloc((void**)&b.states_g.aggregates,
-                             (size_t)lb_tiles_g * sizeof(index_t)));
+                             (size_t)lb_tiles_p * sizeof(index_t)));
         gpuAssert(cudaMalloc((void**)&b.states_g.prefixes,
-                             (size_t)lb_tiles_g * sizeof(index_t)));
+                             (size_t)lb_tiles_p * sizeof(index_t)));
+        b.d_dyn_i = ctr + 2;
+        b.states_i.num_blocks = lb_tiles_p;
+        b.states_i.statuses   = st + lb_tiles_d + lb_tiles_p;
+        gpuAssert(cudaMalloc((void**)&b.states_i.aggregates,
+                             (size_t)lb_tiles_p * sizeof(index_t)));
+        gpuAssert(cudaMalloc((void**)&b.states_i.prefixes,
+                             (size_t)lb_tiles_p * sizeof(index_t)));
 #endif
     }
 
@@ -679,6 +710,8 @@ static void freeParserFused(ParserFused& p) {
     cudaFree(b.d_token_parents);
     cudaFree((void*)b.states_g.aggregates);
     cudaFree((void*)b.states_g.prefixes);
+    cudaFree((void*)b.states_i.aggregates);
+    cudaFree((void*)b.states_i.prefixes);
 #endif
     p = ParserFused{};
 }
