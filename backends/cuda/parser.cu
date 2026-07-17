@@ -387,7 +387,10 @@ parserFusedKernel(FusedBufs b)
 #ifdef HAS_LEXER
     // ---- Combined mode: parents + CST node assembly (parse_int) ----
     if (!b.with_parents) return;   // grid-uniform (kernel parameter)
-    grid.sync();   // d_scan32/d_match are reused below
+    // No grid.sync() needed here: Phase F touches only d_brackets/d_match/
+    // d_valid, Phase G writes d_scan (last read in Phase E, fenced at the
+    // post-E sync) and reads d_productions (fenced after Phase A+B+C); the
+    // sync after G orders F's d_match reads before H overwrites d_match.
 
     if (num_prods == (index_t)0) {
         // safe_zip: no productions must mean no lexemes
