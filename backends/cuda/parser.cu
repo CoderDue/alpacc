@@ -464,20 +464,49 @@ parserFusedKernel(FusedBufs b)
         }
     }
     grid.sync();
-    for (index_t i = grank; i < num_prods; i += gsz) {
-        production_t prod = b.d_productions[i];
-        index_t t_incl = b.d_scan[i];
-        index_t p_raw  = b.d_match[i];
-        index_t p_old  = (i == (index_t)0 || p_raw < (index_t)0) ? (index_t)0 : p_raw;
-        index_t p_new  = p_old - b.d_scan[p_old];
-        if (PRODUCTION_TO_TERMINAL_IS_VALID[prod]) {
-            index_t lex = t_incl - (index_t)1;
-            if (lex < b.num_lexemes) b.d_token_parents[lex] = p_new;
-            else                     atomicAnd(b.d_valid, 0);
-        } else {
-            index_t j = i - t_incl;
-            b.d_tree_prods[j]   = prod;
-            b.d_tree_parents[j] = p_new;
+    // Blocked remap: each thread owns FUSED_IPT consecutive productions and
+    // issues all loads for its batch (including the random d_scan[p_old]
+    // gathers, via __ldg) before consuming any — the loop is latency-bound,
+    // so memory-level parallelism, not bandwidth, is what this buys.
+    {
+        constexpr index_t TILE = (index_t)FUSED_BS * (index_t)FUSED_IPT;
+        const index_t num_tiles_r = (num_prods + TILE - (index_t)1) / TILE;
+        for (index_t t = (index_t)blockIdx.x; t < num_tiles_r; t += (index_t)gridDim.x) {
+            const index_t offset = t * TILE + (index_t)threadIdx.x * (index_t)FUSED_IPT;
+            production_t prod[FUSED_IPT];
+            index_t t_incl[FUSED_IPT], p_old[FUSED_IPT], p_scan[FUSED_IPT];
+#pragma unroll
+            for (int j = 0; j < FUSED_IPT; j++) {
+                index_t gid = offset + (index_t)j;
+                if (gid < num_prods) {
+                    prod[j]   = b.d_productions[gid];
+                    t_incl[j] = b.d_scan[gid];
+                    index_t p_raw = b.d_match[gid];
+                    p_old[j] = (gid == (index_t)0 || p_raw < (index_t)0)
+                             ? (index_t)0 : p_raw;
+                } else {
+                    p_old[j] = (index_t)0;
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < FUSED_IPT; j++)
+                p_scan[j] = __ldg(&b.d_scan[p_old[j]]);
+#pragma unroll
+            for (int j = 0; j < FUSED_IPT; j++) {
+                index_t gid = offset + (index_t)j;
+                if (gid < num_prods) {
+                    index_t p_new = p_old[j] - p_scan[j];
+                    if (PRODUCTION_TO_TERMINAL_IS_VALID[prod[j]]) {
+                        index_t lex = t_incl[j] - (index_t)1;
+                        if (lex < b.num_lexemes) b.d_token_parents[lex] = p_new;
+                        else                     atomicAnd(b.d_valid, 0);
+                    } else {
+                        index_t j2 = gid - t_incl[j];
+                        b.d_tree_prods[j2]   = prod[j];
+                        b.d_tree_parents[j2] = p_new;
+                    }
+                }
+            }
         }
     }
 #endif
