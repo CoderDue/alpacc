@@ -98,6 +98,7 @@ void apsepDeviceSPT(
     __shared__ T s_elems_buf[2][B];
     __shared__ T s_tmin_buf[2][BLOCK_SIZE];
     __shared__ T s_warp_min_buf[2][NUM_WARPS];
+    __shared__ T s_chunk_min_buf[2][NUM_WARPS * (32 / 8)];
 
     static_assert(IPT == 4, "blocked Phase 1 assumes IPT == 4");
     static_assert(sizeof(T) == 4 || sizeof(T) == 8, "blocked Phase 1 assumes 4- or 8-byte T");
@@ -121,9 +122,10 @@ void apsepDeviceSPT(
     int parity = 0;
     for (int block_id = phys_bid; block_id < num_blocks;
          block_id += num_phys, parity ^= 1) {
-        T* const s_elems    = s_elems_buf[parity];
-        T* const s_tmin     = s_tmin_buf[parity];
-        T* const s_warp_min = s_warp_min_buf[parity];
+        T* const s_elems     = s_elems_buf[parity];
+        T* const s_tmin      = s_tmin_buf[parity];
+        T* const s_warp_min  = s_warp_min_buf[parity];
+        T* const s_chunk_min = s_chunk_min_buf[parity];
         const int glb_offs = block_id * B;
         const int tbase    = IPT * threadIdx.x;   // block-relative
         const bool full    = (glb_offs + B <= n);
@@ -177,8 +179,10 @@ void apsepDeviceSPT(
             om = min(om, __shfl_xor_sync(0xffffffff, om, 1));
             om = min(om, __shfl_xor_sync(0xffffffff, om, 2));
             om = min(om, __shfl_xor_sync(0xffffffff, om, 4));
-            if ((lane & 7) == 0)
+            if ((lane & 7) == 0) {
                 d_block_warp_mins[(size_t)block_id * W + warp_id * (32/8) + (lane >> 3)] = om;
+                s_chunk_min[warp_id * (32/8) + (lane >> 3)] = om;
+            }
         }
 
         __syncthreads();  // covers cross-thread s_elems/s_tmin/s_warp_min reads
@@ -236,16 +240,24 @@ void apsepDeviceSPT(
                 }
             }
 
-            // Cross-warp fallback: warp min, then thread min, then exact.
+            // Cross-warp fallback: warp min, then 8-thread chunk min, then
+            // thread min, then exact.  Each level is a guaranteed-hit filter
+            // (a qualifying min implies a qualifying entry below), so the
+            // scans are warps + 4 chunks + 8 tmins instead of warps + 32.
             if (active && res[i] < 0) {
                 for (int w = warp_id - 1; w >= 0 && res[i] < 0; w--) {
                     if (lt(s_warp_min[w], val)) {
-                        for (int tt = 32 * w + 31; tt >= 32 * w; tt--) {
-                            if (lt(s_tmin[tt], val)) {
-                                const T* e = s_elems + IPT * tt;
-                                int k = lt(e[3], val) ? 3 : lt(e[2], val) ? 2
-                                      : lt(e[1], val) ? 1 : 0;
-                                res[i] = IPT * tt + k;
+                        for (int c = (32/8) - 1; c >= 0; c--) {
+                            if (lt(s_chunk_min[(32/8) * w + c], val)) {
+                                for (int tt = 32 * w + 8 * c + 7; ; tt--) {
+                                    if (lt(s_tmin[tt], val)) {
+                                        const T* e = s_elems + IPT * tt;
+                                        int k = lt(e[3], val) ? 3 : lt(e[2], val) ? 2
+                                              : lt(e[1], val) ? 1 : 0;
+                                        res[i] = IPT * tt + k;
+                                        break;
+                                    }
+                                }
                                 break;
                             }
                         }
