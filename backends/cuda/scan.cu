@@ -244,9 +244,41 @@ scan(volatile T* shmem,
   return prefix;
 }
 
+// Register-tile variant of scan: the caller supplies the tile in blocked
+// layout registers (thread t owns items [t*ITEMS_PER_THREAD, (t+1)*IPT)).
+// Items are replaced by their block-local inclusive scan (no inter-block
+// prefix applied); the returned value is the exclusive block prefix from
+// decoupled lookback, valid in all threads.
+template<typename T, typename I, typename OP, I ITEMS_PER_THREAD, I BLOCK_SIZE>
+__device__ inline T
+scanReg(T (&items)[ITEMS_PER_THREAD],
+        States<I, T> states,
+        OP op,
+        T ne,
+        uint32_t dyn_idx) {
+  using BlockScanT = cub::BlockScan<T, BLOCK_SIZE>;
+  __shared__ typename BlockScanT::TempStorage temp_storage;
+
+  T aggregate;
+  BlockScanT(temp_storage).InclusiveScan(items, items, op, aggregate);
+
+  return lookbackPrefix<T, I, OP>(states, op, ne, dyn_idx, aggregate);
+}
+
 template<typename I>
 struct Add {
   __device__ __forceinline__ I operator()(I a, I b) const {
     return a + b;
+  }
+};
+
+// Component-wise (max, +) on two u32 lanes packed in a u64: max in the high
+// word, sum in the low word.  Both component monoids have identity 0, so the
+// packed identity is 0.  The lanes are combined separately, so a low-word
+// carry can never spill into the high word.
+struct MaxAdd {
+  __device__ __forceinline__ uint64_t operator()(uint64_t a, uint64_t b) const {
+    uint64_t mx = max(a >> 32, b >> 32);
+    return (mx << 32) | (uint64_t)((uint32_t)a + (uint32_t)b);
   }
 };

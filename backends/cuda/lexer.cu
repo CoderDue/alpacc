@@ -69,8 +69,7 @@ private:
 public:
   const I CHUNK_SIZE;
   States<I, state_t> d_state_states;
-  States<I, I> d_index_states;
-  States<I, I> d_take_right_states;
+  States<I, uint64_t> d_maxadd_states;
 
   LexerCtx(const I chunk_size,
            const I block_size,
@@ -83,8 +82,7 @@ public:
     cudaMemcpy(d_compose, h_compose, sizeof(h_compose),
                  cudaMemcpyHostToDevice);
 
-    d_index_states = States<I, I>(num_blocks);
-    d_take_right_states = States<I, I>(num_blocks);
+    d_maxadd_states = States<I, uint64_t>(num_blocks);
     d_state_states = States<I, state_t>(num_blocks);
 
     gpuAssert(cudaMalloc((void**)&d_dyn_block_index, sizeof(uint32_t)));
@@ -110,9 +108,8 @@ public:
     cudaMemset((void*)d_old_last_state, IDENTITY, sizeof(state_t));
     cudaMemset((void*)d_new_last_start, 0, sizeof(J));
     cudaMemset((void*)d_old_last_start, 0, sizeof(J));
-    d_index_states.reset();
+    d_maxadd_states.reset();
     d_state_states.reset();
-    d_take_right_states.reset();
   }
 
   void cleanUp() {
@@ -124,9 +121,8 @@ public:
     if (d_new_size) cudaFree((void*)d_new_size);
     if (d_new_last_state) cudaFree((void*)d_new_last_state);
     if (d_old_last_state) cudaFree((void*)d_old_last_state);
-    d_index_states.cleanUp();
+    d_maxadd_states.cleanUp();
     d_state_states.cleanUp();
-    d_take_right_states.cleanUp();
   }
 
   __device__ __host__ __forceinline__
@@ -199,11 +195,17 @@ public:
   }
 };
 
+// __launch_bounds__ caps register allocation so at least 1024 threads' worth
+// of blocks fit per SM (clamped to the 16-blocks/SM hardware limit): without
+// it the scatter's register capture pushes past 64 regs/thread and occupancy
+// drops from ~99% to ~74%, which costs more than the coalescing wins.
 template<typename I, typename J, I BLOCK_SIZE, I ITEMS_PER_THREAD>
 __global__ void
+__launch_bounds__(BLOCK_SIZE, (1024 / BLOCK_SIZE) < 16 ? (1024 / BLOCK_SIZE) : 16)
 lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_starts, J* d_ends, const I size, const bool is_last_chunk) {
   volatile __shared__ state_t states[ITEMS_PER_THREAD * BLOCK_SIZE];
-  volatile __shared__ I indices[ITEMS_PER_THREAD * BLOCK_SIZE];
+  // Exchange buffer for the two-phase terminal scatter (dense tiles only).
+  volatile __shared__ terminal_t exch_t[ITEMS_PER_THREAD * BLOCK_SIZE];
   __shared__ state_t next_block_first_state;
   // Main slots: ceil(ITEMS_PER_THREAD / 8) uint64_t registers per thread.
   // One extra slot is added to cover the single byte past the block boundary
@@ -272,11 +274,20 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
 
   scan<state_t, I, LexerCtx<I, J>, ITEMS_PER_THREAD, BLOCK_SIZE>(states, ctx.d_state_states, ctx, IDENTITY, dyn_index);
 
+  // Fused (max, +) scan over u64 pairs held in registers, in blocked layout
+  // (thread t owns tile positions [t*IPT, (t+1)*IPT)): the token-start Max
+  // scan rides in the high word (0 = "no start seen", produce at gid encodes
+  // gid + 1) and the compaction Add scan in the low word (produce flag), so
+  // one lookback round replaces the former two.  All loops below use blocked
+  // indexing so registers, the produce bitmask, and shmem stay consistent.
+  uint64_t pair[ITEMS_PER_THREAD];
+
 #pragma unroll
   for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-    I lid = i * blockDim.x + threadIdx.x;
+    I lid = threadIdx.x * ITEMS_PER_THREAD + i;
     I gid = glb_offs + lid;
     bool is_next_produce = false;
+    uint64_t start_code = 0;
     if (gid < size) {
       state_t state = states[lid];
 #ifdef IGNORE_TOKEN
@@ -297,68 +308,91 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
         is_next_produce &= is_not_ignore;
       }
 
-      // token starts scan as max: 0 = "no start seen", produce at gid encodes gid + 1
-      indices[lid] = is_produce(state) ? gid + 1 : I();
-    } else {
-      indices[lid] = I();
+      start_code = is_produce(state) ? (uint64_t)(gid + 1) : 0;
     }
     is_produce_state |= is_next_produce << i;
+    pair[i] = (start_code << 32) | (uint64_t)(is_next_produce ? 1 : 0);
   }
 
-  __syncthreads();
-
-  scan<I, I, cub::Max, ITEMS_PER_THREAD, BLOCK_SIZE>(indices, ctx.d_take_right_states, cub::Max(), I(), dyn_index);
+  const uint64_t bprefix =
+      scanReg<uint64_t, I, MaxAdd, ITEMS_PER_THREAD, BLOCK_SIZE>(pair, ctx.d_maxadd_states, MaxAdd(), 0, dyn_index);
+  const I prefix = (I)(uint32_t)bprefix;
+  const I max_prefix = (I)(bprefix >> 32);
 
   I starts[ITEMS_PER_THREAD];
+  I local_offs[ITEMS_PER_THREAD];
   volatile __shared__ I last_start;
+  __shared__ I num_sel_sh;
 
 #pragma unroll
   for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-    I lid = i * blockDim.x + threadIdx.x;
+    I lid = threadIdx.x * ITEMS_PER_THREAD + i;
     I gid = glb_offs + lid;
-
-    if (gid < size) {
-      starts[i] = indices[lid];
-      indices[lid] = (is_produce_state >> i) & 1;
-
-      if (gid == size - 1) {
-        last_start = starts[i];
-      }
-      
-    } else {
-      indices[lid] = 0;
+    starts[i] = max(max_prefix, (I)(pair[i] >> 32));
+    local_offs[i] = ((is_produce_state >> i) & 1) ? (I)(uint32_t)pair[i] - 1 : I();
+    if (gid == size - 1) {
+      last_start = starts[i];
     }
   }
 
+  if (threadIdx.x == BLOCK_SIZE - 1) {
+    num_sel_sh = (I)(uint32_t)pair[ITEMS_PER_THREAD - 1];
+  }
   __syncthreads();
 
-  I prefix = scan<I, I, Add<I>, ITEMS_PER_THREAD, BLOCK_SIZE>(indices, ctx.d_index_states, Add<I>(), I(), dyn_index, false);
+  const I num_sel = num_sel_sh;
 
-  #pragma unroll
+  if (dyn_index == gridDim.x - 1 && threadIdx.x == blockDim.x - 1) {
+    ctx.setNewSize(Add<I>()(prefix, num_sel));
+    ctx.setLastState(states[ITEMS_PER_THREAD * BLOCK_SIZE - 1]);
+
+    if (last_start != I()) {
+      ctx.setLastStart(ctx.addOffset(last_start - 1));
+    } else {
+      ctx.setLastStart(ctx.getLastStart());
+    }
+  }
+
+  // starts/ends are written directly (4-byte scattered stores are tolerable),
+  // while the 1-byte terminals — the worst case for coalescing — go through a
+  // two-phase scatter (cub agent_select_if style) on dense tiles.
+#pragma unroll
   for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-    I lid = blockDim.x * i + threadIdx.x;
+    I lid = threadIdx.x * ITEMS_PER_THREAD + i;
     I gid = glb_offs + lid;
-    if (gid < size && ((is_produce_state >> i) & 1)) {
-      I offset = Add<I>()(prefix, indices[lid]) - 1;
+    if ((is_produce_state >> i) & 1) {
+      I offset = Add<I>()(prefix, local_offs[i]);
       if (offset == I() && starts[i] == I()) {
         d_starts[offset] = ctx.getLastStart();
       } else {
         d_starts[offset] = ctx.addOffset(starts[i] - 1);
       }
       d_ends[offset] = ctx.addOffset(gid + 1);
-      d_terminals[offset] = get_terminal(states[lid]);
     }
   }
 
-  if (dyn_index == gridDim.x - 1 && threadIdx.x == blockDim.x - 1) {
-    I new_size = Add<I>()(prefix, indices[ITEMS_PER_THREAD * BLOCK_SIZE - 1]);
-    ctx.setNewSize(new_size);
-    ctx.setLastState(states[ITEMS_PER_THREAD * BLOCK_SIZE - 1]);
-    
-    if (last_start != I()) {
-      ctx.setLastStart(ctx.addOffset(last_start - 1));
-    } else {
-      ctx.setLastStart(ctx.getLastStart());
+  if (num_sel > BLOCK_SIZE) {
+    // Dense tile: compact terminals into the shmem exchange at tile-local
+    // offsets, then emit one contiguous run as packed-u64 stores (8 terminals
+    // per store).
+#pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+      I lid = threadIdx.x * ITEMS_PER_THREAD + i;
+      if ((is_produce_state >> i) & 1) {
+        exch_t[local_offs[i]] = get_terminal(states[lid]);
+      }
+    }
+    __syncthreads();
+    shmemToGlbVec<terminal_t, uint64_t, BLOCK_SIZE, I>(prefix, num_sel, d_terminals, exch_t);
+  } else {
+    // Sparse tile: direct scatter (cub's heuristic — staging only pays off
+    // with more selections than threads).
+#pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+      I lid = threadIdx.x * ITEMS_PER_THREAD + i;
+      if ((is_produce_state >> i) & 1) {
+        d_terminals[Add<I>()(prefix, local_offs[i])] = get_terminal(states[lid]);
+      }
     }
   }
 }

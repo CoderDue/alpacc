@@ -141,6 +141,10 @@ glbToShmem(I glb_offs, I size, T ne,
     VEC reg[VPT];
     glbToReg<T, VEC, BLOCK_SIZE, ITEMS_PER_THREAD>(glb_offs, size, d_src, reg);
     regToShmem<T, VEC, BLOCK_SIZE, ITEMS_PER_THREAD>(reg, shmem);
+    // regToShmem writes in a vector-striped layout while the ne-fill below is
+    // element-striped, so the same OOB slot is touched by two different
+    // threads; without this barrier the zero-fill and the ne-fill race.
+    __syncthreads();
     // Fill out-of-bounds with ne (only the partial tail thread needs this).
 #pragma unroll
     for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
@@ -166,6 +170,36 @@ glbToShmemCpy(I glb_offs, I size, T ne,
         shmem[lid] = (gid < size) ? d_src[gid] : ne;
     }
     __syncthreads();
+}
+
+// Coalesced shared → global write of `count` contiguous T elements starting
+// at element offset `base` in d_dst.  Packs sizeof(VEC)/sizeof(T) elements
+// into one VEC register per store so sub-VEC types (e.g. uint8_t terminals)
+// issue wide stores instead of per-element ones.  `base` is not VEC-aligned
+// in general, so a scalar head runs up to the first aligned position and a
+// scalar tail covers the remainder (d_dst itself is cudaMalloc-aligned).
+// No __syncthreads: the caller must synchronise before (shmem visible) and
+// after (before reusing shmem).
+template<typename T, typename VEC, uint32_t BLOCK_SIZE, typename I>
+__device__ __forceinline__ void
+shmemToGlbVec(I base, I count, T* d_dst, const volatile T* shmem)
+{
+    constexpr I EPV = (I)(sizeof(VEC) / sizeof(T));
+    const I head = min(count, (EPV - (I)(base % EPV)) % EPV);
+    if (threadIdx.x < head)
+        d_dst[base + (I)threadIdx.x] = shmem[threadIdx.x];
+    const I n_vec = (count - head) / EPV;
+    for (I v = (I)threadIdx.x; v < n_vec; v += (I)BLOCK_SIZE) {
+        VEC tmp;
+        T* elems = reinterpret_cast<T*>(&tmp);
+#pragma unroll
+        for (I e = 0; e < EPV; e++)
+            elems[e] = shmem[head + v * EPV + e];
+        *reinterpret_cast<VEC*>(d_dst + base + head + v * EPV) = tmp;
+    }
+    const I tail_start = head + n_vec * EPV;
+    if ((I)threadIdx.x < count - tail_start)
+        d_dst[base + tail_start + (I)threadIdx.x] = shmem[tail_start + (I)threadIdx.x];
 }
 
 // Shared → global (element-wise, no packing needed).  Adds __syncthreads.
