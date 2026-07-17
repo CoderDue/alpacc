@@ -207,6 +207,14 @@ struct FusedBufs {
 
     int* d_valid;
 
+    // Decoupled-lookback scratch for the single-pass Phase D scan.  The
+    // statuses and the ticket counter live in the host-owned d_lb_arena and
+    // are reset (to Invalid == 0 / ticket 0) by one cudaMemsetAsync per
+    // launch; aggregates/prefixes need no reset (only read after a status
+    // published in the same launch).
+    States<index_t, index_t> states_d;
+    uint32_t* d_dyn_d;              // Phase D ticket counter
+
     // SPT (PSE) scratch, sized for max_bk elements (combined mode:
     // max(max_bk, max_pr) — reused by the parents PSE).
     unsigned* d_unres;
@@ -355,19 +363,43 @@ parserFusedKernel(FusedBufs b)
     grid.sync();
 
     if (num_brackets != (index_t)0) {   // grid-uniform
-        // ---- Phase D: inclusive delta scan → depths + validity ----
-        // Deltas (±1) are computed on the fly from d_brackets.
-        const index_t num_tiles_b = (num_brackets + (index_t)FUSED_BS - (index_t)1) / (index_t)FUSED_BS;
-        coopScanPass1(b.d_brackets, b.d_scan, b.d_agg_d, num_brackets, BracketDelta());
-        grid.sync();
-        coopScanPass2<index_t>(b.d_agg_d, num_tiles_b);
-        grid.sync();
-        for (index_t i = grank; i < num_brackets; i += gsz) {
-            index_t tile = i / (index_t)FUSED_BS;
-            index_t s = b.d_scan[i] + ((tile > 0) ? b.d_agg_d[tile - 1] : (index_t)0);
-            if (s < (index_t)0) atomicAnd(b.d_valid, 0);
-            if (i == num_brackets - (index_t)1 && s != (index_t)0) atomicAnd(b.d_valid, 0);
-            b.d_scan[i] = s - (bracket_is_left(b.d_brackets[i]) ? (index_t)1 : (index_t)0);  // depth
+        // ---- Phase D: single-pass inclusive delta scan (decoupled lookback)
+        //      → depths + validity ----
+        // Deltas (±1) are computed in registers from d_brackets; one pass:
+        // ticket loop over 1024-element tiles, cub::BlockScan + lookback
+        // prefix, validity checked in-pass, depth written to d_scan.
+        // Blocks fall through to the grid.sync() when tickets run out.
+        {
+            constexpr index_t TILE = (index_t)FUSED_BS * (index_t)FUSED_IPT;
+            const index_t num_tiles_b = (num_brackets + TILE - (index_t)1) / TILE;
+            uint32_t tile;
+            while ((tile = dynamicIndex(b.d_dyn_d)) < (uint32_t)num_tiles_b) {
+                const index_t offset = (index_t)tile * TILE
+                                     + (index_t)threadIdx.x * (index_t)FUSED_IPT;
+                bracket_t brs[FUSED_IPT];
+                index_t   items[FUSED_IPT];
+#pragma unroll
+                for (int j = 0; j < FUSED_IPT; j++) {
+                    index_t gid = offset + (index_t)j;
+                    bool in = gid < num_brackets;
+                    brs[j]   = in ? b.d_brackets[gid] : (bracket_t)0;
+                    items[j] = in ? BracketDelta()(brs[j]) : (index_t)0;
+                }
+                index_t prefix =
+                    scanReg<index_t, index_t, Add<index_t>, FUSED_IPT, (index_t)FUSED_BS>(
+                        items, b.states_d, Add<index_t>(), (index_t)0, tile);
+#pragma unroll
+                for (int j = 0; j < FUSED_IPT; j++) {
+                    index_t gid = offset + (index_t)j;
+                    if (gid < num_brackets) {
+                        index_t s = prefix + items[j];
+                        if (s < (index_t)0) atomicAnd(b.d_valid, 0);
+                        if (gid == num_brackets - (index_t)1 && s != (index_t)0)
+                            atomicAnd(b.d_valid, 0);
+                        b.d_scan[gid] = s - (bracket_is_left(brs[j]) ? (index_t)1 : (index_t)0);  // depth
+                    }
+                }
+            }
         }
         grid.sync();
 
@@ -498,6 +530,10 @@ struct ParserFused {
     index_t     max_m   = 0;
     index_t     max_bk  = 0;
     index_t     max_pr  = 0;
+    // Lookback arena: all scan ticket counters followed by all status
+    // arrays, contiguous so one cudaMemsetAsync per launch resets them.
+    uint8_t*    d_lb_arena = nullptr;
+    size_t      lb_arena_bytes = 0;
 };
 
 static ParserFused allocParserFused(index_t max_m) {
@@ -542,6 +578,23 @@ static ParserFused allocParserFused(index_t max_m) {
     gpuAssert(cudaMalloc(&b.d_p3_next,    sizeof(unsigned)));
     b.d_arr = p.d_arr;
 
+    // Single-pass lookback scan scratch (Phase D: 1024-element tiles over
+    // up to max_bk brackets).  Arena layout: [u32 ticket counter][statuses].
+    {
+        constexpr index_t LB_TILE = (index_t)FUSED_BS * (index_t)FUSED_IPT;
+        const index_t lb_tiles_d = (p.max_bk + LB_TILE - 1) / LB_TILE;
+        p.lb_arena_bytes = sizeof(uint32_t)
+                         + (size_t)lb_tiles_d * sizeof(AtomicStatus);
+        gpuAssert(cudaMalloc(&p.d_lb_arena, p.lb_arena_bytes));
+        b.d_dyn_d = (uint32_t*)p.d_lb_arena;
+        b.states_d.num_blocks = lb_tiles_d;
+        b.states_d.statuses   = (AtomicStatus*)(p.d_lb_arena + sizeof(uint32_t));
+        gpuAssert(cudaMalloc((void**)&b.states_d.aggregates,
+                             (size_t)lb_tiles_d * sizeof(index_t)));
+        gpuAssert(cudaMalloc((void**)&b.states_d.prefixes,
+                             (size_t)lb_tiles_d * sizeof(index_t)));
+    }
+
 #ifdef HAS_LEXER
     gpuAssert(cudaMalloc(&b.d_tree_prods,    (size_t)p.max_pr * sizeof(production_t)));
     gpuAssert(cudaMalloc(&b.d_tree_parents,  (size_t)p.max_pr * sizeof(index_t)));
@@ -576,6 +629,9 @@ static void freeParserFused(ParserFused& p) {
     cudaFree(b.d_tree);
     cudaFree(b.d_prefix_min);
     cudaFree(b.d_p3_next);
+    cudaFree(p.d_lb_arena);
+    cudaFree((void*)b.states_d.aggregates);
+    cudaFree((void*)b.states_d.prefixes);
 #ifdef HAS_LEXER
     cudaFree(b.d_tree_prods);
     cudaFree(b.d_tree_parents);
@@ -587,6 +643,9 @@ static void freeParserFused(ParserFused& p) {
 // Launch the fused kernel for m ≤ max_m positions (input already on device).
 static void launchParserFused(ParserFused& p, index_t m) {
     p.bufs.m = m;
+    // Reset lookback ticket counters and statuses (Invalid == 0) so repeated
+    // launches on the same buffers stay correct (same stream → ordered).
+    gpuAssert(cudaMemsetAsync(p.d_lb_arena, 0, p.lb_arena_bytes));
     void* args[] = { (void*)&p.bufs };
     gpuAssert(cudaLaunchCooperativeKernel(
         (void*)parserFusedKernel, p.P, FUSED_BS, args, 0, nullptr));
