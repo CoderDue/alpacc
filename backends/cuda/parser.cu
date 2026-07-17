@@ -68,14 +68,21 @@ __device__ __forceinline__ bracket_t bracket_unpack(bracket_t b) {
 // outside [0, m) read as EMPTY_TERMINAL), typically a slice of a register
 // window shared by the thread's FUSED_IPT consecutive positions.
 // FNV-1a hash, linear probe up to MAX_ITERS slots.
-// When the whole key fits in one machine word (2/4/8 bytes) the probe
-// compares it against HASH_TABLE_KEYS with a single aligned word load
-// (the table is alignas(8), so every row is KEY_BYTES-aligned).
-// Returns true iff a key with valid spans was found.
+// HASH_TABLE stores one fused HashRecord per slot (key bytes + four span_t
+// spans, alignas(16)); when the record fits in 16 bytes the whole probe
+// iteration is a single __ldg int4 load.  Empty slots carry all-ones spans
+// (SPAN_NONE, emitted by the generator); since the table has no deletions,
+// a probe chain reaching an empty slot proves the key is absent, so the
+// probe terminates there.  When the key additionally fits in one machine
+// word (2/4/8 bytes) the compare is a single word compare; the record is
+// alignas(16), so its offset-0 key is KEY_BYTES-aligned.
+// Returns true iff the key was found.
 // ---------------------------------------------------------------------------
 
 constexpr int KEY_BYTES = (Q + K) * (int)sizeof(terminal_t);
 constexpr bool PACKED_PROBE = KEY_BYTES == 2 || KEY_BYTES == 4 || KEY_BYTES == 8;
+constexpr bool VECTOR_RECORD = sizeof(HashRecord) == 16;
+constexpr span_t SPAN_NONE = (span_t)~(span_t)0;
 
 template<int BYTES> struct KeyWord { using type = uint32_t; };  // fallback, only used when !PACKED_PROBE
 template<> struct KeyWord<2> { using type = uint16_t; };
@@ -103,24 +110,33 @@ lookupSpansImpl(const terminal_t* key,
     ss = se = ps = pe = -1;
     for (int64_t it = 0; it < MAX_ITERS; it++) {
         int64_t slot = (int64_t)h;
-        if (HASH_TABLE_IS_VALID[slot]) {
-            bool match;
-            if constexpr (PACKED) {
-                match = __ldg((const key_word_t*)HASH_TABLE_KEYS[slot]) == kw;
-            } else {
-                match = true;
+        HashRecord r;
+        if constexpr (VECTOR_RECORD) {
+            union { int4 raw; HashRecord rec; } u;
+            u.raw = __ldg((const int4*)&HASH_TABLE[slot]);
+            r = u.rec;
+        } else {
+            r = HASH_TABLE[slot];
+        }
+        if (r.ss == SPAN_NONE) return false;  // empty slot: key is absent
+        bool match;
+        if constexpr (PACKED) {
+            key_word_t rw;
+            memcpy(&rw, r.key, sizeof rw);   // register move, not a load
+            match = rw == kw;
+        } else {
+            match = true;
 #pragma unroll
-                for (int64_t j = 0; j < Q + K; j++) {
-                    if (HASH_TABLE_KEYS[slot][j] != key[j]) { match = false; break; }
-                }
+            for (int64_t j = 0; j < Q + K; j++) {
+                if (r.key[j] != key[j]) { match = false; break; }
             }
-            if (match) {
-                ss = HASH_TABLE_STACKS_SPAN[slot][0];
-                se = HASH_TABLE_STACKS_SPAN[slot][1];
-                ps = HASH_TABLE_PRODUCTIONS_SPAN[slot][0];
-                pe = HASH_TABLE_PRODUCTIONS_SPAN[slot][1];
-                return ss >= 0 && se >= 0 && ps >= 0 && pe >= 0;
-            }
+        }
+        if (match) {
+            ss = (int32_t)r.ss;
+            se = (int32_t)r.se;
+            ps = (int32_t)r.ps;
+            pe = (int32_t)r.pe;
+            return true;
         }
         h = (h + 1) % (uint64_t)HASH_TABLE_SIZE;
     }

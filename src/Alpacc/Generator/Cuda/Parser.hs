@@ -7,6 +7,7 @@ import Alpacc.Encode
 import Alpacc.Generator.Analyzer
 import Alpacc.Generator.Cuda.Cudafy
 import Alpacc.HashTable
+import Alpacc.Types
 import Data.Array qualified as Array
 import Data.FileEmbed
 import Data.Maybe
@@ -51,14 +52,13 @@ __device__ const bracket_t STACKS[STACKS_SIZE] =
   #{cudafy stacks};
 __device__ const production_t PRODUCTIONS[PRODUCTIONS_SIZE] =
   #{cudafy productions};
-__device__ const bool HASH_TABLE_IS_VALID[HASH_TABLE_SIZE] =
-  #{cudafy hash_table_is_valid};
-__device__ alignas(8) const terminal_t HASH_TABLE_KEYS[HASH_TABLE_SIZE][Q + K] =
-  #{cudafy $ map (map terminalCast) hash_table_keys};
-__device__ const int32_t HASH_TABLE_STACKS_SPAN[HASH_TABLE_SIZE][2] =
-  #{cudafy hash_table_stacks_span};
-__device__ const int32_t HASH_TABLE_PRODUCTIONS_SPAN[HASH_TABLE_SIZE][2] =
-  #{cudafy hash_table_productions_span};
+using span_t = #{cudafy span_type};
+struct alignas(16) HashRecord {
+    terminal_t key[Q + K];
+    span_t ss, se, ps, pe;
+};
+__device__ const HashRecord HASH_TABLE[HASH_TABLE_SIZE] =
+  #{cudafy hash_records};
 |]
     <> cudaParser
   where
@@ -78,13 +78,27 @@ __device__ const int32_t HASH_TABLE_PRODUCTIONS_SPAN[HASH_TABLE_SIZE][2] =
     stacks_size = length $ llpStacks hash_table
     productions_size = length $ llpProductions hash_table
     oa = llpOATable hash_table
-    ( hash_table_is_valid,
-      hash_table_keys,
-      hash_table_spans
-      ) = unzip3 $ Array.elems $ oaArray oa
-    ( hash_table_stacks_span,
-      hash_table_productions_span
-      ) = unzip hash_table_spans
+    hash_table_spans =
+      [spans | (_, _, spans) <- Array.elems $ oaArray oa]
+    -- Spans are offsets into STACKS/PRODUCTIONS; the all-ones value of
+    -- span_t is reserved as the empty-slot sentinel (checked before the
+    -- key compare in lookupSpans), so the sizes must stay strictly below.
+    spans_fit_u16 = stacks_size < 65535 && productions_size < 65535
+    span_type = if spans_fit_u16 then U16 else U32
+    span_none :: Integer
+    span_none = if spans_fit_u16 then 65535 else 4294967295
+    hash_record (valid, keys, ((ss, se), (ps, pe)))
+      | valid =
+          RawString $
+            Text.pack
+              [i|{#{cudafy $ map terminalCast keys}, #{ss}, #{se}, #{ps}, #{pe}}|]
+      | otherwise =
+          RawString $
+            Text.pack
+              [i|{#{cudafy $ map (const zero_terminal) keys}, #{span_none}, #{span_none}, #{span_none}, #{span_none}}|]
+      where
+        zero_terminal = RawString "(terminal_t) 0"
+    hash_records = map hash_record $ Array.elems $ oaArray oa
     max_brackets_per_pos =
       maximum $ 0 : [se - ss | ((ss, se), _) <- hash_table_spans, ss >= 0]
     max_prods_per_pos =
