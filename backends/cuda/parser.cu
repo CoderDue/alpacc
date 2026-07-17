@@ -134,40 +134,7 @@ lookupSpans(const terminal_t* key,
     return lookupSpansImpl<PACKED_PROBE>(key, ss, se, ps, pe);
 }
 
-// ---------------------------------------------------------------------------
-// Cooperative scan building blocks (tile-hierarchical, grid.sync() driven).
-//
-// A tile is FUSED_BS consecutive elements, one tile per block iteration.
-// Pass 1: per-tile inclusive block scan of f(d_in[i]) into d_out (tile-local
-//         values only) and the tile aggregate into d_agg[tile].
-//         The functor maps the (possibly narrower) source element to the
-//         scanned value, so ±1 deltas / arities / flags never round-trip
-//         through global memory as index_t arrays.
-//         Safe with d_in == d_out (in-place).
-// Pass 2: block 0 turns d_agg into its inclusive scan, chunk by chunk with a
-//         sequential carry (num_tiles is small: n / FUSED_BS).
-// The caller grid.sync()s between and after the passes and then combines
-// tile-local values with d_agg[tile-1] element-wise.
-// ---------------------------------------------------------------------------
-
-template<typename T, typename S, typename F>
-__device__ void
-coopScanPass1(const S* __restrict__ d_in, T* d_out, T* d_agg, index_t n, F f)
-{
-    __shared__ volatile T sh[FUSED_BS];
-    const index_t num_tiles = (n + (index_t)FUSED_BS - (index_t)1) / (index_t)FUSED_BS;
-    for (index_t tile = (index_t)blockIdx.x; tile < num_tiles; tile += (index_t)gridDim.x) {
-        index_t gid = tile * (index_t)FUSED_BS + (index_t)threadIdx.x;
-        sh[threadIdx.x] = (gid < n) ? f(d_in[gid]) : (T)0;
-        __syncthreads();
-        scanBlock<T, uint32_t, Add<T>>(sh, Add<T>());
-        if (gid < n) d_out[gid] = sh[threadIdx.x];
-        if (threadIdx.x == FUSED_BS - 1) d_agg[tile] = sh[threadIdx.x];
-        __syncthreads();
-    }
-}
-
-// Pass-1 input functors (map source element → scanned index_t value).
+// Scan input functors (map source element → scanned index_t value).
 struct BracketDelta {
     __device__ __forceinline__ index_t operator()(bracket_t b) const {
         return bracket_is_left(b) ? (index_t)1 : (index_t)-1;
@@ -194,25 +161,6 @@ struct PairAdd {
     }
 };
 
-template<typename T>
-__device__ void
-coopScanPass2(T* d_agg, index_t num_tiles)
-{
-    if (blockIdx.x != 0) return;
-    __shared__ volatile T sh[FUSED_BS];
-    T carry = (T)0;
-    for (index_t base = (index_t)0; base < num_tiles; base += (index_t)FUSED_BS) {
-        index_t idx = base + (index_t)threadIdx.x;
-        sh[threadIdx.x] = (idx < num_tiles) ? d_agg[idx] : (T)0;
-        __syncthreads();
-        scanBlock<T, uint32_t, Add<T>>(sh, Add<T>());
-        if (idx < num_tiles) d_agg[idx] = carry + sh[threadIdx.x];
-        T chunk_total = sh[FUSED_BS - 1];
-        __syncthreads();
-        carry += chunk_total;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Fused kernel parameter block (passed by value through
 // cudaLaunchCooperativeKernel).  Capacities:
@@ -228,7 +176,6 @@ struct FusedBufs {
 
     bracket_t* d_brackets;          // [max_bk]
     index_t*   d_scan;              // [max(max_bk,max_pr)] deltas → inclusive scan → depths
-    index_t*   d_agg_d;             // [ceil(max(max_bk,max_pr)/FUSED_BS)] scan scratch
     index_t*   d_match;             // [max(max_bk,max_pr)] PSE result (index_t; -1 = no match)
 
     production_t* d_productions;    // [max_pr]
@@ -256,7 +203,7 @@ struct FusedBufs {
 
 #ifdef HAS_LEXER
     // Combined mode (parse_int): parents + compact-tree assembly.
-    // d_scan/d_agg_d/d_match are reused for the parents scan and PSE;
+    // d_scan/d_match are reused for the parents scan and PSE;
     // d_match holds the (old-numbering) parent vector after Phase H.
     bool           with_parents;    // runtime: skip G/H/I on token-only paths
     index_t        num_lexemes;
@@ -421,7 +368,7 @@ parserFusedKernel(FusedBufs b)
 #ifdef HAS_LEXER
     // ---- Combined mode: parents + CST node assembly (parse_int) ----
     if (!b.with_parents) return;   // grid-uniform (kernel parameter)
-    grid.sync();   // d_scan32/d_agg_d/d_match are reused below
+    grid.sync();   // d_scan32/d_match are reused below
 
     if (num_prods == (index_t)0) {
         // safe_zip: no productions must mean no lexemes
@@ -576,7 +523,7 @@ static ParserFused allocParserFused(index_t max_m) {
     p.max_bk = std::max<index_t>(max_m * (index_t)MAX_BRACKETS_PER_POSITION, 1);
     p.max_pr = std::max<index_t>(max_m * (index_t)MAX_PRODS_PER_POSITION, 1);
 
-    // Combined mode reuses d_scan32/d_agg_d/d_match and the SPT scratch for
+    // Combined mode reuses d_scan32/d_match and the SPT scratch for
     // the parents phases, which run over up to max_pr elements.
 #ifdef HAS_LEXER
     const index_t scan_n = std::max(p.max_bk, p.max_pr);
@@ -593,7 +540,6 @@ static ParserFused allocParserFused(index_t max_m) {
     gpuAssert(cudaMalloc(&b.d_totals,     2 * sizeof(index_t)));
     gpuAssert(cudaMalloc(&b.d_brackets,   (size_t)p.max_bk * sizeof(bracket_t)));
     gpuAssert(cudaMalloc(&b.d_scan,       (size_t)scan_n * sizeof(index_t)));
-    gpuAssert(cudaMalloc(&b.d_agg_d,      (size_t)tiles_sc * sizeof(index_t)));
     gpuAssert(cudaMalloc(&b.d_match,      (size_t)scan_n * sizeof(index_t)));
     gpuAssert(cudaMalloc(&b.d_productions, (size_t)p.max_pr * sizeof(production_t)));
     gpuAssert(cudaMalloc(&b.d_valid,      sizeof(int)));
@@ -681,7 +627,7 @@ static void freeParserFused(ParserFused& p) {
     cudaFree(p.d_arr);
     cudaFree(b.d_totals);
     cudaFree(b.d_brackets); cudaFree(b.d_scan);
-    cudaFree(b.d_agg_d);    cudaFree(b.d_match);
+    cudaFree(b.d_match);
     cudaFree(b.d_productions);
     cudaFree(b.d_valid);
     cudaFree(b.d_unres);
