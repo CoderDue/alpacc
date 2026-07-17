@@ -4,18 +4,14 @@
 // The whole pipeline runs in ONE cooperative kernel (parserFusedKernel),
 // launched via cudaLaunchCooperativeKernel with grid.sync() between phases:
 //
-//   Phase A+B: per-position hash-table key lookup (FNV-1a + linear probe)
-//            fused with the per-tile scans of both length arrays: lengths
-//            go straight from the lookup into shared memory, are scanned
-//            there, and only the tile-local scan values + tile aggregates
-//            reach global memory (a second pass scans the aggregates).
-//            Phase C recovers each length as the difference of adjacent
-//            tile-local scan values, so no lengths array exists at all.
-//   Phase C: segmented copies of STACKS spans (brackets) and
-//            PRODUCTIONS spans into their compacted output arrays.
-//   Phase D: cooperative inclusive scan of ±1 bracket deltas (computed
-//            on the fly from d_brackets) → depths; validity
-//            check (no negative prefix, last must be 0).
+//   Phase A+B+C: one ticket-loop pass — per-position hash-table key lookup
+//            (FNV-1a + linear probe, sliding register window over each
+//            thread's positions), (slen, plen) packed into one u64 and
+//            scanned with decoupled lookback, STACKS/PRODUCTIONS spans
+//            scattered directly from the in-register exclusive offsets.
+//   Phase D: single-pass inclusive scan of ±1 bracket deltas (computed
+//            on the fly from d_brackets, decoupled lookback) → depths;
+//            validity check (no negative prefix, last must be 0).
 //   Phase E: PSE(<=) over depths via apsepDeviceSPT (pse.cu), which is
 //            itself structured as grid.sync() phases.
 //   Phase F: bracket symbol check of each right bracket against its match.
@@ -66,26 +62,21 @@ __device__ __forceinline__ bracket_t bracket_unpack(bracket_t b) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase A helper: hash-table lookup for position i.
+// Phase A helper: hash-table lookup for one position.
 //
-// Builds the Q+K window key with sentinel-extended addressing:
-//   d_arr[0] = START_TERMINAL, d_arr[1..n] = tokens, d_arr[n+1] = END_TERMINAL.
+// The caller supplies the Q+K window key (sentinel-extended: positions
+// outside [0, m) read as EMPTY_TERMINAL), typically a slice of a register
+// window shared by the thread's FUSED_IPT consecutive positions.
 // FNV-1a hash, linear probe up to MAX_ITERS slots.
 // Returns true iff a key with valid spans was found.
 // ---------------------------------------------------------------------------
 
-__device__ bool
-lookupSpans(const terminal_t* __restrict__ d_arr, index_t m, index_t i,
+__device__ __forceinline__ bool
+lookupSpans(const terminal_t* key,
             int32_t& ss, int32_t& se, int32_t& ps, int32_t& pe)
 {
-    terminal_t key[Q + K];
-#pragma unroll
-    for (int64_t j = 0; j < Q + K; j++) {
-        int64_t idx = i + j - Q;
-        key[j] = (idx < 0 || idx >= m) ? EMPTY_TERMINAL : d_arr[idx];
-    }
-
     uint64_t h = 14695981039346656037ULL;
+#pragma unroll
     for (int64_t j = 0; j < Q + K; j++)
         h = (h ^ (uint64_t)key[j]) * 1099511628211ULL;
     h %= (uint64_t)HASH_TABLE_SIZE;
@@ -162,6 +153,16 @@ struct IsTermFlag {
     }
 };
 
+// Component-wise add of two u32 lanes packed in a u64 (bracket lengths in
+// the high word, production lengths in the low word).  The lanes are added
+// separately so a low-lane carry can never spill into the high lane; both
+// running totals stay < 2^31 (see runParserPipeline / the PSE int casts).
+struct PairAdd {
+    __device__ __forceinline__ uint64_t operator()(uint64_t a, uint64_t b) const {
+        return (((a >> 32) + (b >> 32)) << 32) | (uint64_t)((uint32_t)a + (uint32_t)b);
+    }
+};
+
 template<typename T>
 __device__ void
 coopScanPass2(T* d_agg, index_t num_tiles)
@@ -192,10 +193,6 @@ struct FusedBufs {
     const terminal_t* d_arr;        // [m] sentinel-extended tokens
     index_t           m;
 
-    int32_t* d_ss;                  // [m] packed (span_start << 4 | slen)
-    int32_t* d_ps;                  // [m] packed (span_start << 4 | plen)
-    index_t* d_agg_s;               // [ceil(m/FUSED_BS)] inter-tile bracket-length prefix sums
-    index_t* d_agg_p;               // [ceil(m/FUSED_BS)] inter-tile production-length prefix sums
     index_t* d_totals;              // [2] num_brackets, num_prods
 
     bracket_t* d_brackets;          // [max_bk]
@@ -207,11 +204,13 @@ struct FusedBufs {
 
     int* d_valid;
 
-    // Decoupled-lookback scratch for the single-pass Phase D scan.  The
-    // statuses and the ticket counter live in the host-owned d_lb_arena and
-    // are reset (to Invalid == 0 / ticket 0) by one cudaMemsetAsync per
-    // launch; aggregates/prefixes need no reset (only read after a status
-    // published in the same launch).
+    // Decoupled-lookback scratch for the single-pass Phase A+B+C and D
+    // scans.  The statuses and the ticket counters live in the host-owned
+    // d_lb_arena and are reset (to Invalid == 0 / ticket 0) by one
+    // cudaMemsetAsync per launch; aggregates/prefixes need no reset (only
+    // read after a status published in the same launch).
+    States<index_t, uint64_t> states_ab;
+    uint32_t* d_dyn_ab;             // Phase A+B+C ticket counter
     States<index_t, index_t> states_d;
     uint32_t* d_dyn_d;              // Phase D ticket counter
 
@@ -244,99 +243,6 @@ struct FusedBufs {
 };
 
 // ---------------------------------------------------------------------------
-// Fused Phase A+B+C in two grid-striding passes:
-//
-// Pass 1 (lookupScanPass1):
-//   Each tile: hash-table lookup → lengths + span starts in shared/registers
-//   → block scan of lengths in shared → write tile aggregate to d_agg_s/d_agg_p
-//   and pack (ss, slen) / (ps, plen) into d_ss / d_ps (int32: span start in
-//   upper 28 bits, length in lower 4 bits — safe since MAX_*_PER_POSITION ≤ 15).
-//   No separate d_soffsets / d_poffsets arrays written.
-//
-// [grid.sync() + coopScanPass2: d_agg_s/d_agg_p become inter-tile prefix sums]
-//
-// Pass 2 (scatterPass2):
-//   Re-scan lengths in shared (unpacked from d_ss/d_ps, no hash lookup),
-//   compute exclusive intra-tile offset from shared scan, add L2-resident
-//   inter-tile prefix, scatter directly to d_brackets / d_productions.
-// ---------------------------------------------------------------------------
-
-__device__ void
-lookupScanPass1(const FusedBufs& b)
-{
-    __shared__ volatile index_t sh_s[FUSED_BS];
-    __shared__ volatile index_t sh_p[FUSED_BS];
-    const index_t m = b.m;
-    const index_t num_tiles = (m + (index_t)FUSED_BS - (index_t)1) / (index_t)FUSED_BS;
-    for (index_t tile = (index_t)blockIdx.x; tile < num_tiles; tile += (index_t)gridDim.x) {
-        index_t gid = tile * (index_t)FUSED_BS + (index_t)threadIdx.x;
-        index_t slen = (index_t)0;
-        index_t plen = (index_t)0;
-        if (gid < m) {
-            int32_t ss, se, ps, pe;
-            bool valid = lookupSpans(b.d_arr, m, gid, ss, se, ps, pe);
-            if (!valid) atomicAnd(b.d_valid, 0);
-            slen = valid ? (index_t)(se - ss) : (index_t)0;
-            plen = valid ? (index_t)(pe - ps) : (index_t)0;
-            // Pack span start (upper bits) + length (lower 4 bits) into one int32.
-            b.d_ss[gid] = (ss << 4) | (int32_t)slen;
-            b.d_ps[gid] = (ps << 4) | (int32_t)plen;
-        }
-        sh_s[threadIdx.x] = slen;
-        sh_p[threadIdx.x] = plen;
-        __syncthreads();
-        scanBlock<index_t, uint32_t, Add<index_t>>(sh_s, Add<index_t>());
-        scanBlock<index_t, uint32_t, Add<index_t>>(sh_p, Add<index_t>());
-        if (threadIdx.x == FUSED_BS - 1) {
-            b.d_agg_s[tile] = sh_s[threadIdx.x];
-            b.d_agg_p[tile] = sh_p[threadIdx.x];
-        }
-        __syncthreads();
-    }
-}
-
-__device__ void
-scatterPass2(const FusedBufs& b)
-{
-    __shared__ volatile index_t sh_s[FUSED_BS];
-    __shared__ volatile index_t sh_p[FUSED_BS];
-    const index_t m = b.m;
-    const index_t num_tiles = (m + (index_t)FUSED_BS - (index_t)1) / (index_t)FUSED_BS;
-    for (index_t tile = (index_t)blockIdx.x; tile < num_tiles; tile += (index_t)gridDim.x) {
-        index_t gid = tile * (index_t)FUSED_BS + (index_t)threadIdx.x;
-        index_t slen = (index_t)0, plen = (index_t)0;
-        int32_t ss = 0, ps = 0;
-        if (gid < m) {
-            int32_t packed_s = b.d_ss[gid];
-            int32_t packed_p = b.d_ps[gid];
-            slen = (index_t)(packed_s & 0xf);
-            plen = (index_t)(packed_p & 0xf);
-            ss   = packed_s >> 4;
-            ps   = packed_p >> 4;
-        }
-        sh_s[threadIdx.x] = slen;
-        sh_p[threadIdx.x] = plen;
-        __syncthreads();
-        scanBlock<index_t, uint32_t, Add<index_t>>(sh_s, Add<index_t>());
-        scanBlock<index_t, uint32_t, Add<index_t>>(sh_p, Add<index_t>());
-        index_t s_excl = sh_s[threadIdx.x] - slen;
-        index_t p_excl = sh_p[threadIdx.x] - plen;
-        __syncthreads();
-        index_t s_tile_pfx = (tile > 0) ? b.d_agg_s[tile - 1] : (index_t)0;
-        index_t p_tile_pfx = (tile > 0) ? b.d_agg_p[tile - 1] : (index_t)0;
-        if (gid < m) {
-            index_t soff = s_tile_pfx + s_excl;
-            index_t poff = p_tile_pfx + p_excl;
-            for (index_t j = 0; j < slen; j++)
-                b.d_brackets[soff + j] = STACKS[ss + (int32_t)j];
-            for (index_t j = 0; j < plen; j++)
-                b.d_productions[poff + j] = PRODUCTIONS[ps + (int32_t)j];
-        }
-        __syncthreads();
-    }
-}
-
-// ---------------------------------------------------------------------------
 // The fused cooperative kernel
 // ---------------------------------------------------------------------------
 
@@ -348,26 +254,74 @@ parserFusedKernel(FusedBufs b)
     const index_t grank = (index_t)grid.thread_rank();
     const index_t gsz   = (index_t)grid.size();
 
-    // ---- Phase A+B: per-tile lookup + shared-memory scan → tile aggregates ----
-    const index_t num_tiles_m = (m + (index_t)FUSED_BS - (index_t)1) / (index_t)FUSED_BS;
-    lookupScanPass1(b);
-    grid.sync();
-    coopScanPass2<index_t>(b.d_agg_s, num_tiles_m);
-    coopScanPass2<index_t>(b.d_agg_p, num_tiles_m);
-    grid.sync();
-
-    const index_t num_brackets = b.d_agg_s[num_tiles_m - 1];
-    const index_t num_prods    = b.d_agg_p[num_tiles_m - 1];
-    if (grank == 0) {
-        b.d_totals[0] = num_brackets;
-        b.d_totals[1] = num_prods;
+    // ---- Phase A+B+C: fused lookup + packed pair scan + direct scatter ----
+    // One ticket-loop pass: each thread loads its Q+K+FUSED_IPT-1 terminal
+    // window once (sentinel-extended) and slides it across its FUSED_IPT
+    // consecutive positions; the (slen, plen) pair is packed into one u64
+    // (slen high, plen low) and scanned once with decoupled lookback; the
+    // exclusive offsets come straight out of the scan in registers and the
+    // STACKS/PRODUCTIONS spans are scattered directly.  The thread owning
+    // position m-1 writes d_totals, which the grid.sync() makes uniform.
+    {
+        constexpr index_t TILE = (index_t)FUSED_BS * (index_t)FUSED_IPT;
+        constexpr int WIN = Q + K + FUSED_IPT - 1;
+        const index_t num_tiles_ab = (m + TILE - (index_t)1) / TILE;
+        uint32_t tile;
+        while ((tile = dynamicIndex(b.d_dyn_ab)) < (uint32_t)num_tiles_ab) {
+            const index_t offset = (index_t)tile * TILE
+                                 + (index_t)threadIdx.x * (index_t)FUSED_IPT;
+            terminal_t w[WIN];
+#pragma unroll
+            for (int j = 0; j < WIN; j++) {
+                int64_t idx = (int64_t)offset + j - Q;
+                w[j] = (idx < 0 || idx >= (int64_t)m) ? EMPTY_TERMINAL : b.d_arr[idx];
+            }
+            int32_t  ss[FUSED_IPT], ps[FUSED_IPT];
+            int32_t  slen[FUSED_IPT], plen[FUSED_IPT];
+            uint64_t items[FUSED_IPT];
+#pragma unroll
+            for (int j = 0; j < FUSED_IPT; j++) {
+                ss[j] = ps[j] = 0;
+                slen[j] = plen[j] = 0;
+                index_t gid = offset + (index_t)j;
+                if (gid < m) {
+                    int32_t se, pe;
+                    bool valid = lookupSpans(w + j, ss[j], se, ps[j], pe);
+                    if (!valid) atomicAnd(b.d_valid, 0);
+                    slen[j] = valid ? se - ss[j] : 0;
+                    plen[j] = valid ? pe - ps[j] : 0;
+                }
+                items[j] = ((uint64_t)(uint32_t)slen[j] << 32)
+                         | (uint64_t)(uint32_t)plen[j];
+            }
+            uint64_t prefix =
+                scanReg<uint64_t, index_t, PairAdd, FUSED_IPT, (index_t)FUSED_BS>(
+                    items, b.states_ab, PairAdd(), (uint64_t)0, tile);
+#pragma unroll
+            for (int j = 0; j < FUSED_IPT; j++) {
+                index_t gid = offset + (index_t)j;
+                if (gid < m) {
+                    uint64_t g = PairAdd()(prefix, items[j]);
+                    index_t s_incl = (index_t)(g >> 32);
+                    index_t p_incl = (index_t)(uint32_t)g;
+                    index_t soff = s_incl - (index_t)slen[j];
+                    index_t poff = p_incl - (index_t)plen[j];
+                    for (int32_t t = 0; t < slen[j]; t++)
+                        b.d_brackets[soff + (index_t)t] = STACKS[ss[j] + t];
+                    for (int32_t t = 0; t < plen[j]; t++)
+                        b.d_productions[poff + (index_t)t] = PRODUCTIONS[ps[j] + t];
+                    if (gid == m - (index_t)1) {
+                        b.d_totals[0] = s_incl;
+                        b.d_totals[1] = p_incl;
+                    }
+                }
+            }
+        }
     }
-
-    // ---- Phase C: scatter using packed d_ss/d_ps, offsets via shared scan ----
-    // No d_soffsets/d_poffsets: lengths unpacked from d_ss/d_ps into shared,
-    // scanned there, combined with L2-resident tile prefix to get global offset.
-    scatterPass2(b);
     grid.sync();
+
+    const index_t num_brackets = b.d_totals[0];
+    const index_t num_prods    = b.d_totals[1];
 
     if (num_brackets != (index_t)0) {   // grid-uniform
         // ---- Phase D: single-pass inclusive delta scan (decoupled lookback)
@@ -605,10 +559,6 @@ static ParserFused allocParserFused(index_t max_m) {
 
     FusedBufs& b = p.bufs;
     gpuAssert(cudaMalloc(&p.d_arr,        (size_t)max_m * sizeof(terminal_t)));
-    gpuAssert(cudaMalloc(&b.d_ss,         (size_t)max_m * sizeof(int32_t)));
-    gpuAssert(cudaMalloc(&b.d_ps,         (size_t)max_m * sizeof(int32_t)));
-    gpuAssert(cudaMalloc(&b.d_agg_s,      (size_t)tiles_m * sizeof(index_t)));
-    gpuAssert(cudaMalloc(&b.d_agg_p,      (size_t)tiles_m * sizeof(index_t)));
     gpuAssert(cudaMalloc(&b.d_totals,     2 * sizeof(index_t)));
     gpuAssert(cudaMalloc(&b.d_brackets,   (size_t)p.max_bk * sizeof(bracket_t)));
     gpuAssert(cudaMalloc(&b.d_scan,       (size_t)scan_n * sizeof(index_t)));
@@ -624,24 +574,34 @@ static ParserFused allocParserFused(index_t max_m) {
     gpuAssert(cudaMalloc(&b.d_p3_next,    sizeof(unsigned)));
     b.d_arr = p.d_arr;
 
-    // Single-pass lookback scan scratch (1024-element tiles; Phase D over up
-    // to max_bk brackets, Phases G and I over up to max_pr productions).
-    // Arena layout: [u32 ticket counters][statuses D][statuses G][statuses I].
+    // Single-pass lookback scan scratch (1024-element tiles; Phase A+B+C
+    // over up to max_m positions, Phase D over up to max_bk brackets,
+    // Phases G and I over up to max_pr productions).  Arena layout:
+    // [u32 ticket counters][statuses AB][statuses D][statuses G][statuses I].
     {
         constexpr index_t LB_TILE = (index_t)FUSED_BS * (index_t)FUSED_IPT;
+        const index_t lb_tiles_m = (max_m + LB_TILE - 1) / LB_TILE;
         const index_t lb_tiles_d = (p.max_bk + LB_TILE - 1) / LB_TILE;
 #ifdef HAS_LEXER
         const index_t lb_tiles_p = (p.max_pr + LB_TILE - 1) / LB_TILE;
 #else
         const index_t lb_tiles_p = 0;
 #endif
-        const size_t counters_bytes = 3 * sizeof(uint32_t);
+        const size_t counters_bytes = 4 * sizeof(uint32_t);
         p.lb_arena_bytes = counters_bytes
-                         + ((size_t)lb_tiles_d + 2 * (size_t)lb_tiles_p)
+                         + ((size_t)lb_tiles_m + (size_t)lb_tiles_d
+                            + 2 * (size_t)lb_tiles_p)
                            * sizeof(AtomicStatus);
         gpuAssert(cudaMalloc(&p.d_lb_arena, p.lb_arena_bytes));
         uint32_t*     ctr = (uint32_t*)p.d_lb_arena;
         AtomicStatus* st  = (AtomicStatus*)(p.d_lb_arena + counters_bytes);
+        b.d_dyn_ab = ctr + 3;
+        b.states_ab.num_blocks = lb_tiles_m;
+        b.states_ab.statuses   = st + lb_tiles_d + 2 * lb_tiles_p;
+        gpuAssert(cudaMalloc((void**)&b.states_ab.aggregates,
+                             (size_t)lb_tiles_m * sizeof(uint64_t)));
+        gpuAssert(cudaMalloc((void**)&b.states_ab.prefixes,
+                             (size_t)lb_tiles_m * sizeof(uint64_t)));
         b.d_dyn_d = ctr + 0;
         b.states_d.num_blocks = lb_tiles_d;
         b.states_d.statuses   = st;
@@ -688,8 +648,6 @@ static ParserFused allocParserFused(index_t max_m) {
 static void freeParserFused(ParserFused& p) {
     FusedBufs& b = p.bufs;
     cudaFree(p.d_arr);
-    cudaFree(b.d_ss);        cudaFree(b.d_ps);
-    cudaFree(b.d_agg_s);    cudaFree(b.d_agg_p);
     cudaFree(b.d_totals);
     cudaFree(b.d_brackets); cudaFree(b.d_scan);
     cudaFree(b.d_agg_d);    cudaFree(b.d_match);
@@ -702,6 +660,8 @@ static void freeParserFused(ParserFused& p) {
     cudaFree(b.d_prefix_min);
     cudaFree(b.d_p3_next);
     cudaFree(p.d_lb_arena);
+    cudaFree((void*)b.states_ab.aggregates);
+    cudaFree((void*)b.states_ab.prefixes);
     cudaFree((void*)b.states_d.aggregates);
     cudaFree((void*)b.states_d.prefixes);
 #ifdef HAS_LEXER
