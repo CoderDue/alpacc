@@ -11,7 +11,9 @@
 ##SBATCH --account=<account>
 
 # SLURM wrapper for benchmarks/profile-gpu.sh.
-# Submit from the repo root:  sbatch benchmarks/profile-gpu.slurm
+# Submit from anywhere inside the repo, e.g.:
+#   sbatch profile-gpu.slurm            (from benchmarks/)
+#   sbatch benchmarks/profile-gpu.slurm (from the repo root)
 #
 # Requirements on the node:
 #   - nvcc + ncu (module load below; nsys optional, nvprof N/A on A100)
@@ -35,10 +37,19 @@ command -v alpacc || { echo "FATAL: alpacc not on PATH"; exit 1; }
 command -v ncu    || { echo "FATAL: ncu not on PATH";    exit 1; }
 
 # --- Run the profiling suite ---
-# Full-size defaults (parser 10 Mi tokens, lexer 250 Mi tokens). Dataset
-# generation is CPU-side and single-shot; it can take a few minutes.
-cd "$SLURM_SUBMIT_DIR"
-OUT="profile-results-a100-${SLURM_JOB_ID}"
+# Resolve the repo root via git so this works regardless of which
+# directory the job was submitted from (repo root or benchmarks/).
+cd "$SLURM_SUBMIT_DIR" || exit 1
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$REPO_ROOT" ]; then
+    echo "FATAL: $SLURM_SUBMIT_DIR is not inside a git checkout of alpacc"
+    exit 1
+fi
+cd "$REPO_ROOT" || exit 1
+
+# Default dataset size (~100 MiB payload). Generation is CPU-side and
+# single-shot; it can take a few minutes.
+OUT="$SLURM_SUBMIT_DIR/profile-results-a100-${SLURM_JOB_ID}"
 bash benchmarks/profile-gpu.sh "$OUT"
 
 echo "=== Done. Send back: ${OUT}.tar.gz ==="
