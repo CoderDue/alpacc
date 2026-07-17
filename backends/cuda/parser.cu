@@ -68,12 +68,24 @@ __device__ __forceinline__ bracket_t bracket_unpack(bracket_t b) {
 // outside [0, m) read as EMPTY_TERMINAL), typically a slice of a register
 // window shared by the thread's FUSED_IPT consecutive positions.
 // FNV-1a hash, linear probe up to MAX_ITERS slots.
+// When the whole key fits in one machine word (2/4/8 bytes) the probe
+// compares it against HASH_TABLE_KEYS with a single aligned word load
+// (the table is alignas(8), so every row is KEY_BYTES-aligned).
 // Returns true iff a key with valid spans was found.
 // ---------------------------------------------------------------------------
 
+constexpr int KEY_BYTES = (Q + K) * (int)sizeof(terminal_t);
+constexpr bool PACKED_PROBE = KEY_BYTES == 2 || KEY_BYTES == 4 || KEY_BYTES == 8;
+
+template<int BYTES> struct KeyWord { using type = uint32_t; };  // fallback, only used when !PACKED_PROBE
+template<> struct KeyWord<2> { using type = uint16_t; };
+template<> struct KeyWord<8> { using type = uint64_t; };
+using key_word_t = KeyWord<KEY_BYTES>::type;
+
+template<bool PACKED>
 __device__ __forceinline__ bool
-lookupSpans(const terminal_t* key,
-            int32_t& ss, int32_t& se, int32_t& ps, int32_t& pe)
+lookupSpansImpl(const terminal_t* key,
+                int32_t& ss, int32_t& se, int32_t& ps, int32_t& pe)
 {
     uint64_t h = 14695981039346656037ULL;
 #pragma unroll
@@ -81,14 +93,26 @@ lookupSpans(const terminal_t* key,
         h = (h ^ (uint64_t)key[j]) * 1099511628211ULL;
     h %= (uint64_t)HASH_TABLE_SIZE;
 
+    key_word_t kw = 0;
+    if constexpr (PACKED) {
+#pragma unroll
+        for (int j = 0; j < Q + K; j++)
+            kw |= (key_word_t)key[j] << (8 * (int)sizeof(terminal_t) * j);
+    }
+
     ss = se = ps = pe = -1;
     for (int64_t it = 0; it < MAX_ITERS; it++) {
         int64_t slot = (int64_t)h;
         if (HASH_TABLE_IS_VALID[slot]) {
-            bool match = true;
+            bool match;
+            if constexpr (PACKED) {
+                match = __ldg((const key_word_t*)HASH_TABLE_KEYS[slot]) == kw;
+            } else {
+                match = true;
 #pragma unroll
-            for (int64_t j = 0; j < Q + K; j++) {
-                if (HASH_TABLE_KEYS[slot][j] != key[j]) { match = false; break; }
+                for (int64_t j = 0; j < Q + K; j++) {
+                    if (HASH_TABLE_KEYS[slot][j] != key[j]) { match = false; break; }
+                }
             }
             if (match) {
                 ss = HASH_TABLE_STACKS_SPAN[slot][0];
@@ -101,6 +125,13 @@ lookupSpans(const terminal_t* key,
         h = (h + 1) % (uint64_t)HASH_TABLE_SIZE;
     }
     return false;
+}
+
+__device__ __forceinline__ bool
+lookupSpans(const terminal_t* key,
+            int32_t& ss, int32_t& se, int32_t& ps, int32_t& pe)
+{
+    return lookupSpansImpl<PACKED_PROBE>(key, ss, se, ps, pe);
 }
 
 // ---------------------------------------------------------------------------

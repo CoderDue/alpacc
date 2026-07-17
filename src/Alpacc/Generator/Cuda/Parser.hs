@@ -53,7 +53,7 @@ __device__ const production_t PRODUCTIONS[PRODUCTIONS_SIZE] =
   #{cudafy productions};
 __device__ const bool HASH_TABLE_IS_VALID[HASH_TABLE_SIZE] =
   #{cudafy hash_table_is_valid};
-__device__ const terminal_t HASH_TABLE_KEYS[HASH_TABLE_SIZE][Q + K] =
+__device__ alignas(8) const terminal_t HASH_TABLE_KEYS[HASH_TABLE_SIZE][Q + K] =
   #{cudafy $ map (map terminalCast) hash_table_keys};
 __device__ const int32_t HASH_TABLE_STACKS_SPAN[HASH_TABLE_SIZE][2] =
   #{cudafy hash_table_stacks_span};
