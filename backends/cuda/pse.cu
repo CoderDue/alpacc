@@ -90,9 +90,14 @@ void apsepDeviceSPT(
     const int lane       = threadIdx.x & 31;
     const int warp_id    = threadIdx.x >> 5;
 
-    __shared__ T s_elems[B];
-    __shared__ T s_tmin[BLOCK_SIZE];
-    __shared__ T s_warp_min[NUM_WARPS];
+    // Double-buffered per-tile shared state: the block loop alternates
+    // buffers by iteration parity, so it needs no loop-bottom barrier —
+    // fast warps may load the next tile (other parity) while stragglers
+    // still read this one.  The mid-loop __syncthreads() bounds the skew
+    // to one iteration, so two tiles never share a buffer.
+    __shared__ T s_elems_buf[2][B];
+    __shared__ T s_tmin_buf[2][BLOCK_SIZE];
+    __shared__ T s_warp_min_buf[2][NUM_WARPS];
 
     static_assert(IPT == 4, "blocked Phase 1 assumes IPT == 4");
     static_assert(sizeof(T) == 4 || sizeof(T) == 8, "blocked Phase 1 assumes 4- or 8-byte T");
@@ -113,7 +118,12 @@ void apsepDeviceSPT(
     // jumping ANSV chain) over per-thread mins — 4x fewer shuffles than the
     // striped layout, and descending runs resolve with no shuffles at all.
     // -------------------------------------------------------------------------
-    for (int block_id = phys_bid; block_id < num_blocks; block_id += num_phys) {
+    int parity = 0;
+    for (int block_id = phys_bid; block_id < num_blocks;
+         block_id += num_phys, parity ^= 1) {
+        T* const s_elems    = s_elems_buf[parity];
+        T* const s_tmin     = s_tmin_buf[parity];
+        T* const s_warp_min = s_warp_min_buf[parity];
         const int glb_offs = block_id * B;
         const int tbase    = IPT * threadIdx.x;   // block-relative
         const bool full    = (glb_offs + B <= n);
@@ -172,6 +182,7 @@ void apsepDeviceSPT(
         }
 
         __syncthreads();  // covers cross-thread s_elems/s_tmin/s_warp_min reads
+                          // and bounds the double-buffer skew to one iteration
 
         // Thread-level ANSV chain over tmins (pointer jumping; each lane's
         // query is its own tmin, so the gap-bound argument of the original
@@ -264,7 +275,6 @@ void apsepDeviceSPT(
             for (int w = 1; w < NUM_WARPS; w++) bmin = min(bmin, s_warp_min[w]);
             d_block_mins[block_id] = bmin;
         }
-        __syncthreads();  // shared reused next iteration
     }
 
     // -------------------------------------------------------------------------
