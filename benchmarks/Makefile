@@ -1,10 +1,9 @@
 FUTHARK_BACKEND?=cuda
-# Token counts; payload bytes ≈ 2x each.
-INPUT_SIZE?=10485760
-LEXER_INPUT_SIZE?=262144000
+# Token count shared by lexer and parser benchmarks; payload bytes ≈ 2x.
+INPUT_SIZE?=52428800
 
 LANGS=json lisp
-MAKEARGS=--no-print-directory FUTHARK_BACKEND=$(FUTHARK_BACKEND) INPUT_SIZE=$(INPUT_SIZE) LEXER_INPUT_SIZE=$(LEXER_INPUT_SIZE)
+MAKEARGS=--no-print-directory FUTHARK_BACKEND=$(FUTHARK_BACKEND) INPUT_SIZE=$(INPUT_SIZE)
 
 .PHONY: bench build clean reset bench-all-sizes \
         bench-json bench-lisp \
