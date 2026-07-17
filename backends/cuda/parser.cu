@@ -230,6 +230,10 @@ struct FusedBufs {
     // d_match holds the (old-numbering) parent vector after Phase H.
     bool           with_parents;    // runtime: skip G/H/I on token-only paths
     index_t        num_lexemes;
+    // Lookback scratch for the single-pass Phase G scan (own States and
+    // ticket counter — no reuse across scans, so no in-kernel resets).
+    States<index_t, index_t> states_g;
+    uint32_t*      d_dyn_g;
     production_t*  d_tree_prods;    // [max_pr] compacted tree production ids
     index_t*       d_tree_parents;  // [max_pr] compacted tree parent indices
     index_t*       d_token_parents; // [max_pr] per lexeme: parent tree index
@@ -438,17 +442,36 @@ parserFusedKernel(FusedBufs b)
     }
 
     // ---- Phase G: exclusive scan of (arity - 1) over the productions ----
-    // (arity - 1) is computed on the fly from d_productions.
+    // Single ticket-loop pass (decoupled lookback): (arity - 1) deltas are
+    // computed in registers from d_productions and the exclusive value
+    // incl - delta is written straight to d_scan.
     const index_t num_tiles_p = (num_prods + (index_t)FUSED_BS - (index_t)1) / (index_t)FUSED_BS;
-    coopScanPass1(b.d_productions, b.d_scan, b.d_agg_d, num_prods, ArityMinusOne());
-    grid.sync();
-    coopScanPass2<index_t>(b.d_agg_d, num_tiles_p);
-    grid.sync();
-    for (index_t i = grank; i < num_prods; i += gsz) {
-        index_t tile  = i / (index_t)FUSED_BS;
-        index_t incl  = b.d_scan[i] + ((tile > 0) ? b.d_agg_d[tile - 1] : (index_t)0);
-        index_t delta = (index_t)PRODUCTION_TO_ARITY[b.d_productions[i]] - (index_t)1;
-        b.d_scan[i] = incl - delta;   // exclusive scan value
+    {
+        constexpr index_t TILE = (index_t)FUSED_BS * (index_t)FUSED_IPT;
+        const index_t num_tiles_g = (num_prods + TILE - (index_t)1) / TILE;
+        uint32_t tile;
+        while ((tile = dynamicIndex(b.d_dyn_g)) < (uint32_t)num_tiles_g) {
+            const index_t offset = (index_t)tile * TILE
+                                 + (index_t)threadIdx.x * (index_t)FUSED_IPT;
+            index_t deltas[FUSED_IPT];
+            index_t items[FUSED_IPT];
+#pragma unroll
+            for (int j = 0; j < FUSED_IPT; j++) {
+                index_t gid = offset + (index_t)j;
+                deltas[j] = (gid < num_prods) ? ArityMinusOne()(b.d_productions[gid])
+                                              : (index_t)0;
+                items[j]  = deltas[j];
+            }
+            index_t prefix =
+                scanReg<index_t, index_t, Add<index_t>, FUSED_IPT, (index_t)FUSED_BS>(
+                    items, b.states_g, Add<index_t>(), (index_t)0, tile);
+#pragma unroll
+            for (int j = 0; j < FUSED_IPT; j++) {
+                index_t gid = offset + (index_t)j;
+                if (gid < num_prods)
+                    b.d_scan[gid] = prefix + items[j] - deltas[j];   // exclusive scan value
+            }
+        }
     }
     grid.sync();
 
@@ -578,21 +601,39 @@ static ParserFused allocParserFused(index_t max_m) {
     gpuAssert(cudaMalloc(&b.d_p3_next,    sizeof(unsigned)));
     b.d_arr = p.d_arr;
 
-    // Single-pass lookback scan scratch (Phase D: 1024-element tiles over
-    // up to max_bk brackets).  Arena layout: [u32 ticket counter][statuses].
+    // Single-pass lookback scan scratch (1024-element tiles; Phase D over up
+    // to max_bk brackets, Phase G over up to max_pr productions).  Arena
+    // layout: [u32 ticket counters][statuses D][statuses G].
     {
         constexpr index_t LB_TILE = (index_t)FUSED_BS * (index_t)FUSED_IPT;
         const index_t lb_tiles_d = (p.max_bk + LB_TILE - 1) / LB_TILE;
-        p.lb_arena_bytes = sizeof(uint32_t)
-                         + (size_t)lb_tiles_d * sizeof(AtomicStatus);
+#ifdef HAS_LEXER
+        const index_t lb_tiles_g = (p.max_pr + LB_TILE - 1) / LB_TILE;
+#else
+        const index_t lb_tiles_g = 0;
+#endif
+        const size_t counters_bytes = 2 * sizeof(uint32_t);
+        p.lb_arena_bytes = counters_bytes
+                         + (size_t)(lb_tiles_d + lb_tiles_g) * sizeof(AtomicStatus);
         gpuAssert(cudaMalloc(&p.d_lb_arena, p.lb_arena_bytes));
-        b.d_dyn_d = (uint32_t*)p.d_lb_arena;
+        uint32_t*     ctr = (uint32_t*)p.d_lb_arena;
+        AtomicStatus* st  = (AtomicStatus*)(p.d_lb_arena + counters_bytes);
+        b.d_dyn_d = ctr + 0;
         b.states_d.num_blocks = lb_tiles_d;
-        b.states_d.statuses   = (AtomicStatus*)(p.d_lb_arena + sizeof(uint32_t));
+        b.states_d.statuses   = st;
         gpuAssert(cudaMalloc((void**)&b.states_d.aggregates,
                              (size_t)lb_tiles_d * sizeof(index_t)));
         gpuAssert(cudaMalloc((void**)&b.states_d.prefixes,
                              (size_t)lb_tiles_d * sizeof(index_t)));
+#ifdef HAS_LEXER
+        b.d_dyn_g = ctr + 1;
+        b.states_g.num_blocks = lb_tiles_g;
+        b.states_g.statuses   = st + lb_tiles_d;
+        gpuAssert(cudaMalloc((void**)&b.states_g.aggregates,
+                             (size_t)lb_tiles_g * sizeof(index_t)));
+        gpuAssert(cudaMalloc((void**)&b.states_g.prefixes,
+                             (size_t)lb_tiles_g * sizeof(index_t)));
+#endif
     }
 
 #ifdef HAS_LEXER
@@ -636,6 +677,8 @@ static void freeParserFused(ParserFused& p) {
     cudaFree(b.d_tree_prods);
     cudaFree(b.d_tree_parents);
     cudaFree(b.d_token_parents);
+    cudaFree((void*)b.states_g.aggregates);
+    cudaFree((void*)b.states_g.prefixes);
 #endif
     p = ParserFused{};
 }
