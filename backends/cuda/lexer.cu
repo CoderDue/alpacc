@@ -215,7 +215,19 @@ template<typename I, typename J, I BLOCK_SIZE, I ITEMS_PER_THREAD>
 __global__ void
 __launch_bounds__(BLOCK_SIZE, (1024 / BLOCK_SIZE) < 16 ? (1024 / BLOCK_SIZE) : 16)
 lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_starts, J* d_ends, const I size, const bool is_last_chunk) {
-  volatile __shared__ state_t states[ITEMS_PER_THREAD * BLOCK_SIZE];
+  // Bank-conflict-free padding: we need (STRIDE * sizeof(state_t)) to be
+  // ≡ 4 (mod 8) so the stride in 4-byte banks is odd (coprime with 32).
+  // Required: STRIDE ≡ 4/sizeof(state_t) (mod 8/sizeof(state_t)), clamped to ≥ 1.
+  // Works for state_t ∈ {u8, u16, u32, u64}.
+  static_assert(sizeof(state_t) == 1 || sizeof(state_t) == 2 ||
+                sizeof(state_t) == 4 || sizeof(state_t) == 8, "unexpected state_t");
+  constexpr I SHMEM_MOD    = 8 / (I)sizeof(state_t);
+  constexpr I SHMEM_TARGET = 4 / (I)sizeof(state_t);
+  constexpr I SHMEM_REM    = (ITEMS_PER_THREAD % SHMEM_MOD);
+  constexpr I SHMEM_RAW    = (SHMEM_TARGET - SHMEM_REM + SHMEM_MOD) % SHMEM_MOD;
+  constexpr I SHMEM_PAD    = (SHMEM_RAW == 0) ? SHMEM_MOD : SHMEM_RAW;
+  constexpr I SHMEM_STRIDE = ITEMS_PER_THREAD + SHMEM_PAD;
+  volatile __shared__ state_t states[SHMEM_STRIDE * BLOCK_SIZE];
   // Exchange buffer for the two-phase terminal scatter (dense tiles only).
   volatile __shared__ terminal_t exch_t[ITEMS_PER_THREAD * BLOCK_SIZE];
   __shared__ state_t next_block_first_state;
@@ -264,14 +276,18 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
       I lid_off = (I)sizeof(uint64_t) * lid + (I)j;
       uint32_t reg_off = sizeof(uint64_t) * i + j;
       bool is_in_block = lid_off < (I)(ITEMS_PER_THREAD * BLOCK_SIZE);
+      // Blocked layout with SHMEM_STRIDE padding to break u16 bank conflicts.
+      // lid_off/IPT = thread index, lid_off%IPT = item index within thread,
+      // matching the read pattern states[t*SHMEM_STRIDE + item_i].
+      I shmem_idx = (lid_off / ITEMS_PER_THREAD) * SHMEM_STRIDE + (lid_off % ITEMS_PER_THREAD);
       if (gid < size && is_in_block) {
           if (gid == 0) {
-            states[lid_off] = ctx(ctx.getLastState(), reinterpret_cast<state_t>(ctx.toState(chars_reg[reg_off])));
+            states[shmem_idx] = ctx(ctx.getLastState(), reinterpret_cast<state_t>(ctx.toState(chars_reg[reg_off])));
           } else {
-            states[lid_off] = ctx.toState(chars_reg[reg_off]);
+            states[shmem_idx] = ctx.toState(chars_reg[reg_off]);
           }
       } else if (is_in_block) {
-          states[lid_off] = IDENTITY;
+          states[shmem_idx] = IDENTITY;
       } else if (lid_off == (I)(ITEMS_PER_THREAD * BLOCK_SIZE) && gid < size) {
           // First byte of the next block, needed for the boundary produce
           // test.  Guarded by gid < size (not is_last_chunk): interior block
@@ -289,7 +305,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   // produce-flag loop below can read states[lid] / states[lid+1].
   {
     state_t st[ITEMS_PER_THREAD];
-    const I off = threadIdx.x * ITEMS_PER_THREAD;
+    const I off = threadIdx.x * (SHMEM_STRIDE);
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
       st[i] = states[off + i];
@@ -315,8 +331,13 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     I gid = glb_offs + lid;
     bool is_next_produce = false;
     uint64_t start_code = 0;
+    // Padded shmem indices for this item and the next global item.
+    I shmem_cur  = (I)threadIdx.x * (SHMEM_STRIDE) + i;
+    I shmem_next = (i < ITEMS_PER_THREAD - 1)
+                   ? shmem_cur + 1
+                   : ((I)threadIdx.x + 1) * (SHMEM_STRIDE);
     if (gid < size) {
-      state_t state = states[lid];
+      state_t state = states[shmem_cur];
 #ifdef IGNORE_TOKEN
       bool is_not_ignore = get_terminal(state) != IGNORE_TOKEN;
 #else
@@ -325,7 +346,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
       if (lid == ITEMS_PER_THREAD * BLOCK_SIZE - 1) {
         is_next_produce = is_produce(ctx(state, next_block_first_state));
       } else {
-        is_next_produce = is_produce(states[lid + 1]);
+        is_next_produce = is_produce(states[shmem_next]);
       }
 
       if (is_last_chunk) {
@@ -371,7 +392,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
 
   if (dyn_index == gridDim.x - 1 && threadIdx.x == blockDim.x - 1) {
     ctx.setNewSize(Add<I>()(prefix, num_sel));
-    ctx.setLastState(states[ITEMS_PER_THREAD * BLOCK_SIZE - 1]);
+    ctx.setLastState(states[(BLOCK_SIZE - 1) * SHMEM_STRIDE + (ITEMS_PER_THREAD - 1)]);
 
     if (last_start != I()) {
       ctx.setLastStart(ctx.addOffset(last_start - 1));
@@ -404,9 +425,9 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     // per store).
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-      I lid = threadIdx.x * ITEMS_PER_THREAD + i;
       if ((is_produce_state >> i) & 1) {
-        exch_t[local_offs[i]] = get_terminal(states[lid]);
+        I shmem_cur = (I)threadIdx.x * (SHMEM_STRIDE) + i;
+        exch_t[local_offs[i]] = get_terminal(states[shmem_cur]);
       }
     }
     __syncthreads();
@@ -416,9 +437,9 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     // with more selections than threads).
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-      I lid = threadIdx.x * ITEMS_PER_THREAD + i;
       if ((is_produce_state >> i) & 1) {
-        d_terminals[Add<I>()(prefix, local_offs[i])] = get_terminal(states[lid]);
+        I shmem_cur = (I)threadIdx.x * (SHMEM_STRIDE) + i;
+        d_terminals[Add<I>()(prefix, local_offs[i])] = get_terminal(states[shmem_cur]);
       }
     }
   }
