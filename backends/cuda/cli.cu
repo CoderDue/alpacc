@@ -422,12 +422,15 @@ static int lexer_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
         const uint32_t nblocks = numBlocks((uint32_t)n, BLOCK_SIZE, ITEMS_PER_THREAD);
         LexerCtx<uint32_t, index_t> ctx((uint32_t)n, BLOCK_SIZE, ITEMS_PER_THREAD);
 
-        for (uint32_t i = 0; i < warmup_runs; i++) {
+        uint32_t num_warmup = warmup_runs > 0 ? warmup_runs : 1;
+        for (uint32_t i = 0; i < num_warmup; i++) {
             ctx.reset();
             lexer<uint32_t, index_t, BLOCK_SIZE, ITEMS_PER_THREAD>
                 <<<nblocks, BLOCK_SIZE>>>(ctx, d_str, d_tok, d_s, d_e, (uint32_t)n, false);
             gpuAssert(cudaDeviceSynchronize());
         }
+        // Token count is stable for a fixed input; read after warmup.
+        uint32_t num_tok = ctx.terminalsSize();
 
         // --- kernel-only timing ---
         std::vector<float> times_ms(n_runs);
@@ -458,9 +461,25 @@ static int lexer_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
         ctx.cleanUp();
         cudaFree(d_str); cudaFree(d_tok); cudaFree(d_s); cudaFree(d_e);
 
-        auto print_stats = [&](const char* label, std::vector<float>& tms) {
+        // Total estimated DRAM traffic per kernel run:
+        //   reads:  n bytes (d_string)
+        //   writes: num_tok × (terminal_t + 2×index_t) bytes (d_terminals, d_starts, d_ends)
+        //   scan lookback (d_state_states + d_maxadd_states): 2 × num_tiles ×
+        //     (sizeof(state_t) + sizeof(uint64_t) + 1) bytes — negligible vs payload
+        // The shmem states[] array (n × sizeof(state_t) total) is shared memory,
+        // not DRAM, and is not counted here.
+        uint32_t num_tiles = numBlocks((uint32_t)n, BLOCK_SIZE, ITEMS_PER_THREAD);
+        size_t scan_bytes = 2 * (size_t)num_tiles *
+            (sizeof(state_t) + sizeof(state_t) +  // aggregates + prefixes (state scan)
+             sizeof(uint64_t) + sizeof(uint64_t) + // aggregates + prefixes (maxadd scan)
+             2);                                    // statuses (1 byte each, two scans)
+        size_t dram_bytes = n
+            + (size_t)num_tok * (sizeof(terminal_t) + 2 * sizeof(index_t))
+            + scan_bytes;
+
+        auto print_stats = [&](const char* label, std::vector<float>& tms, size_t traffic) {
             double mean = 0, variance = 0, gbps = 0;
-            double factor = (double)n / (1000.0 * n_runs);
+            double factor = (double)traffic / (1000.0 * n_runs);
             for (uint32_t i = 0; i < n_runs; i++) {
                 double diff = fmax(1e3 * (double)tms[i], 0.5);
                 mean     += diff / n_runs;
@@ -469,15 +488,17 @@ static int lexer_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
             }
             double bound = (0.95 * sqrt(variance)) / sqrt((double)n_runs);
             fprintf(stderr, "%s:\n", label);
-            fprintf(stderr, "        %.0fμs (95%% CI: [%.1fμs, %.1fμs]); %.0fGB/s\n",
-                    mean, mean - bound, mean + bound, gbps);
+            fprintf(stderr, "        %.0fμs (95%% CI: [%.1fμs, %.1fμs]); %.0fGB/s (%.0fGB/s input-only)\n",
+                    mean, mean - bound, mean + bound,
+                    gbps,
+                    gbps * (double)n / (double)traffic);
         };
 
         char label[64];
-        snprintf(label, sizeof(label), "lex_int (cuda, %zu bytes)", (size_t)n);
-        print_stats(label, times_ms);
-        snprintf(label, sizeof(label), "lex_int (cuda+io, %zu bytes)", (size_t)n);
-        print_stats(label, times_io_ms);
+        snprintf(label, sizeof(label), "lex_int (cuda, %zu bytes, %u tokens)", (size_t)n, num_tok);
+        print_stats(label, times_ms, dram_bytes);
+        snprintf(label, sizeof(label), "lex_int (cuda+io, %zu bytes, %u tokens)", (size_t)n, num_tok);
+        print_stats(label, times_io_ms, dram_bytes);
     }
 
     gpuAssert(cudaEventDestroy(ev0));
