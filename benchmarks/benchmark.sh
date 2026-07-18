@@ -9,11 +9,14 @@ INPUT_SIZE=${INPUT_SIZE:-52428800}
 
 set -e
 
-# Change to the directory containing this script so `make` finds the Makefile
-# regardless of where the script (or sbatch job) was launched from.
-# Use BASH_SOURCE with a readlink/cd fallback (realpath may not exist on all nodes).
-_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$_SCRIPT_DIR"
+# Change to the benchmarks/ directory so `make` finds the Makefile.
+# When run via sbatch, SLURM_SUBMIT_DIR is the directory sbatch was called from.
+# When run directly as a shell script, fall back to the script's own directory.
+if [ -n "${SLURM_SUBMIT_DIR:-}" ]; then
+    cd "$SLURM_SUBMIT_DIR"
+else
+    cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
 
 # --- Environment setup -----------------------------------------------
 # On a cluster with environment modules, load the right toolchain.
