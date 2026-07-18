@@ -127,17 +127,29 @@ public:
 
   __device__ __host__ __forceinline__
   state_t operator()(const state_t &a, const state_t &b) const {
+#ifdef __CUDA_ARCH__
+    return __ldg(&d_compose[get_index(b) * NUM_STATES + get_index(a)]);
+#else
     return d_compose[get_index(b) * NUM_STATES + get_index(a)];
+#endif
   }
 
   __device__ __host__ __forceinline__
   state_t operator()(const volatile state_t &a, const volatile state_t &b) const {
+#ifdef __CUDA_ARCH__
+    return __ldg(&d_compose[get_index(b) * NUM_STATES + get_index(a)]);
+#else
     return d_compose[get_index(b) * NUM_STATES + get_index(a)];
+#endif
   }
 
   __device__ __host__ __forceinline__
   state_t toState(const uint8_t &a) const {
+#ifdef __CUDA_ARCH__
+    return __ldg(&d_to_state[a]);
+#else
     return d_to_state[a];
+#endif
   }
 
   __device__ __host__ __forceinline__
@@ -272,7 +284,22 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
 
   __syncthreads();
 
-  scan<state_t, I, LexerCtx<I, J>, ITEMS_PER_THREAD, BLOCK_SIZE>(states, ctx.d_state_states, ctx, IDENTITY, dyn_index);
+  // State scan: read from shmem into registers, run scanReg (no TempStorage
+  // in shmem for state_t), then write inclusive results back so the
+  // produce-flag loop below can read states[lid] / states[lid+1].
+  {
+    state_t st[ITEMS_PER_THREAD];
+    const I off = threadIdx.x * ITEMS_PER_THREAD;
+#pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++)
+      st[i] = states[off + i];
+    const state_t pfx = scanReg<state_t, I, LexerCtx<I, J>, ITEMS_PER_THREAD, BLOCK_SIZE>(
+        st, ctx.d_state_states, ctx, IDENTITY, dyn_index);
+#pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++)
+      states[off + i] = ctx(pfx, st[i]);
+    __syncthreads();
+  }
 
   // Fused (max, +) scan over u64 pairs held in registers, in blocked layout
   // (thread t owns tile positions [t*IPT, (t+1)*IPT)): the token-start Max
