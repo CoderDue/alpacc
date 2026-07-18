@@ -38,7 +38,7 @@ command -v ncu    || { echo "FATAL: ncu not on PATH";    exit 1; }
 
 # --- Run the profiling suite ---
 # Resolve the repo root regardless of submission directory or direct invocation.
-SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$(dirname "$(realpath "${BASH_SOURCE[0]}")")}"
+SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 cd "$SUBMIT_DIR" || exit 1
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 if [ -z "$REPO_ROOT" ]; then

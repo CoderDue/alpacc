@@ -11,7 +11,9 @@ set -e
 
 # Change to the directory containing this script so `make` finds the Makefile
 # regardless of where the script (or sbatch job) was launched from.
-cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+# Use BASH_SOURCE with a readlink/cd fallback (realpath may not exist on all nodes).
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$_SCRIPT_DIR"
 
 # --- Environment setup -----------------------------------------------
 # On a cluster with environment modules, load the right toolchain.
