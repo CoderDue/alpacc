@@ -37,12 +37,20 @@ bench-parser-lisp:
 	@$(MAKE) -C lisp bench-parser $(MAKEARGS)
 
 bench-cuda:
+	@printf '\n\033[1m=== JSON ===\033[0m\n'
+	@$(MAKE) -C json build-cuda $(MAKEARGS)
 	@$(MAKE) -C json bench-lexer-cuda bench-parser-cuda $(MAKEARGS)
+	@printf '\n\033[1m=== Lisp ===\033[0m\n'
+	@$(MAKE) -C lisp build-cuda $(MAKEARGS)
 	@$(MAKE) -C lisp bench-lexer-cuda bench-parser-cuda $(MAKEARGS)
+	@printf '\n\033[1m=== Done ===\033[0m\n'
 
 bench-futhark:
+	@printf '\n\033[1m=== JSON ===\033[0m\n'
 	@$(MAKE) -C json bench-lexer-futhark bench-parser-futhark $(MAKEARGS)
+	@printf '\n\033[1m=== Lisp ===\033[0m\n'
 	@$(MAKE) -C lisp bench-lexer-futhark bench-parser-futhark $(MAKEARGS)
+	@printf '\n\033[1m=== Done ===\033[0m\n'
 
 bench-all-sizes:
 	@$(MAKE) bench INPUT_SIZE=10485760 $(MAKEARGS)

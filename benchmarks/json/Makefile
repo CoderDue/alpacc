@@ -14,6 +14,7 @@ NVCCFLAGS=-O3 -std=c++17 -arch=native
 .PHONY: clean reset build bench bench-lexer bench-parser \
         bench-lexer-cuda bench-lexer-futhark bench-lexer-rust \
         bench-parser-cuda bench-parser-futhark \
+        build-cuda \
         lexer.cu parser.cu
 
 # --- Datasets ---
@@ -71,7 +72,14 @@ parser.fut: $(GRAMMAR) $(DATA_RAW)
 build: $(DATA) $(DATA_RAW) lexer-cuda parser-cuda lexer.fut parser.fut
 	@printf "$(H)Build complete [$(GRAMMAR_NAME)].$(E)\n"
 
-bench-lexer-cuda: lexer-cuda $(DATA)
+build-cuda: lexer.cu parser.cu
+	@printf "$(D)  Compiling JSON CUDA lexer...$(E)\n"
+	@nvcc $(NVCCFLAGS) -o lexer-cuda lexer.cu
+	@printf "$(D)  Compiling JSON CUDA parser...$(E)\n"
+	@nvcc $(NVCCFLAGS) -o parser-cuda parser.cu
+	@printf "$(H)Build complete [$(GRAMMAR_NAME)].$(E)\n"
+
+bench-lexer-cuda: $(DATA)
 	@printf "$(H)Benchmarking CUDA lexer [$(GRAMMAR_NAME)]:$(E)\n"
 	@./lexer-cuda --benchmark 10 --warmup 3 < $(DATA)
 
@@ -88,7 +96,7 @@ bench-lexer:
 	@printf "$(H)JSON Lexer Benchmark [$(GRAMMAR_NAME)]:$(E)\n"
 	@$(MAKE) --no-print-directory bench-lexer-cuda bench-lexer-futhark
 
-bench-parser-cuda: parser-cuda $(DATA)
+bench-parser-cuda: $(DATA)
 	@printf "$(H)Benchmarking CUDA parser [$(GRAMMAR_NAME)]:$(E)\n"
 	@./parser-cuda --benchmark 10 --warmup 3 < $(DATA)
 
