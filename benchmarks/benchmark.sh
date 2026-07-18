@@ -9,6 +9,10 @@ INPUT_SIZE=${INPUT_SIZE:-52428800}
 
 set -e
 
+# Change to the directory containing this script so `make` finds the Makefile
+# regardless of where the script (or sbatch job) was launched from.
+cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+
 # --- Environment setup -----------------------------------------------
 # On a cluster with environment modules, load the right toolchain.
 # On a local machine without `module`, just use whatever's on PATH

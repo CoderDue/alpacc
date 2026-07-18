@@ -37,19 +37,19 @@ command -v alpacc || { echo "FATAL: alpacc not on PATH"; exit 1; }
 command -v ncu    || { echo "FATAL: ncu not on PATH";    exit 1; }
 
 # --- Run the profiling suite ---
-# Resolve the repo root via git so this works regardless of which
-# directory the job was submitted from (repo root or benchmarks/).
-cd "$SLURM_SUBMIT_DIR" || exit 1
+# Resolve the repo root regardless of submission directory or direct invocation.
+SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$(dirname "$(realpath "${BASH_SOURCE[0]}")")}"
+cd "$SUBMIT_DIR" || exit 1
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 if [ -z "$REPO_ROOT" ]; then
-    echo "FATAL: $SLURM_SUBMIT_DIR is not inside a git checkout of alpacc"
+    echo "FATAL: $SUBMIT_DIR is not inside a git checkout of alpacc"
     exit 1
 fi
 cd "$REPO_ROOT" || exit 1
 
 # Default dataset size (~100 MiB payload). Generation is CPU-side and
 # single-shot; it can take a few minutes.
-OUT="$SLURM_SUBMIT_DIR/profile-results-a100-${SLURM_JOB_ID}"
+OUT="$SUBMIT_DIR/profile-results-a100-${SLURM_JOB_ID:-local}"
 bash benchmarks/profile-gpu.sh "$OUT"
 
 echo "=== Done. Send back: ${OUT}.tar.gz ==="

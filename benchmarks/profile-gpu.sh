@@ -24,7 +24,7 @@
 # moves on), so a partial environment still yields a usable bundle.
 
 set -u
-cd "$(dirname "$0")/.."   # repo root
+cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/.."   # repo root
 REPO_ROOT=$(pwd)
 
 INPUT_SIZE=${INPUT_SIZE:-52428800}
