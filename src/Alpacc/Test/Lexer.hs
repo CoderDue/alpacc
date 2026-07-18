@@ -30,9 +30,12 @@ import Data.ByteString qualified as ByteString
 import Data.ByteString.Internal
 import Data.ByteString.Lazy qualified as LBS
 import Data.Either.Extra
-import Data.Array (bounds, listArray, (!))
+import Data.Array.IArray (Array, accumArray, bounds, listArray, (!))
+import Data.Array.ST (newArray, readArray, runSTUArray, writeArray)
+import Data.Array.Unboxed (UArray)
 import Data.List (zip4)
 import Data.Map qualified as Map
+import Data.Maybe (listToMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -164,61 +167,195 @@ getOutputs tw lw = do
   i <- getWord64le
   Outputs <$> replicateM (fromIntegral i) (getOutput tw lw)
 
--- | Generate a single long input by simulating the DFA. Starting from
--- the initial state, randomly choose valid transitions until we reach
--- the desired length and are in an accepting state. If we can't reach
--- an accepting state at the exact length, we try to find the nearest
--- accepting state and pad or trim accordingly.
---
--- When a token budget is given, after that many bytes within a token
--- the walk is restricted to producing transitions only, forcing a
--- boundary and keeping individual tokens short.
+-- | Precomputed dense-indexed DFA structures for the token-targeted walk.
+-- States are renumbered to dense Ints so the walk loop uses O(1) array
+-- indexing.
+data WalkEnv = WalkEnv
+  { weInitial :: Int,
+    weNumStates :: Int,
+    weProducing :: Array Int [(Word8, Int)],
+    weNonProducing :: Array Int [(Word8, Int)],
+    weRevNonProducing :: Array Int [Int],
+    weAccepting :: [Int]
+  }
+
+mkWalkEnv :: (Ord s, Ord t) => DFALexer Word8 s t -> WalkEnv
+mkWalkEnv dfa_lexer =
+  WalkEnv
+    { weInitial = ix (initial dfa),
+      weNumStates = n,
+      weProducing = accumArray (flip (:)) [] (0, n - 1) producing,
+      weNonProducing = accumArray (flip (:)) [] (0, n - 1) non_producing,
+      weRevNonProducing = accumArray (flip (:)) [] (0, n - 1) rev_non_producing,
+      weAccepting = [ix s | s <- Set.toList (accepting dfa)]
+    }
+  where
+    dfa = fsa dfa_lexer
+    trs = Map.toList $ transitions' dfa
+    prod = producesToken dfa_lexer
+    st_idx = Map.fromList $ zip (Set.toList (states dfa)) [0 ..]
+    n = Map.size st_idx
+    ix s = st_idx Map.! s
+    producing =
+      [(ix s, (sym, ix s')) | ((s, sym), s') <- trs, (s, sym) `Set.member` prod]
+    non_producing =
+      [(ix s, (sym, ix s')) | ((s, sym), s') <- trs, not ((s, sym) `Set.member` prod)]
+    rev_non_producing =
+      [(ix s', ix s) | ((s, sym), s') <- trs, not ((s, sym) `Set.member` prod)]
+
+-- | Distance-to-target and live-transition arrays for a walk that must reach
+-- one of the target accepting states along non-producing transitions.
+data TokenTarget = TokenTarget
+  { ttDist :: UArray Int Int,
+    ttAllowed :: Array Int (Array Int (Word8, Int)),
+    ttEntry :: Array Int (Array Int (Word8, Int)),
+    ttStep :: Array Int (Maybe (Word8, Int))
+  }
+
+-- | Multi-source BFS from the target states along reversed non-producing
+-- transitions.
+bfsDist :: Int -> Array Int [Int] -> [Int] -> UArray Int Int
+bfsDist n rev targets = runSTUArray $ do
+  dist <- newArray (0, n - 1) (-1)
+  mapM_ (\s -> writeArray dist s 0) targets
+  let expand d acc s =
+        foldM
+          ( \acc' p -> do
+              dp <- readArray dist p
+              if dp < 0
+                then writeArray dist p (d + 1) >> pure (p : acc')
+                else pure acc'
+          )
+          acc
+          (rev ! s)
+      go _ [] = pure ()
+      go d frontier = go (d + 1) =<< foldM (expand d) [] frontier
+  go (0 :: Int) targets
+  pure dist
+
+mkTokenTarget :: WalkEnv -> [Int] -> TokenTarget
+mkTokenTarget env targets =
+  TokenTarget
+    { ttDist = dist,
+      ttAllowed = filterLive (weNonProducing env),
+      ttEntry = filterLive (weProducing env),
+      ttStep = step
+    }
+  where
+    n = weNumStates env
+    dist = bfsDist n (weRevNonProducing env) targets
+    filterLive edges =
+      listArray
+        (0, n - 1)
+        [ let xs = [t | t@(_, s') <- edges ! s, dist ! s' >= 0]
+           in listArray (0, length xs - 1) xs
+        | s <- [0 .. n - 1]
+        ]
+    step =
+      listArray
+        (0, n - 1)
+        [ listToMaybe
+            [t | t@(_, s') <- weNonProducing env ! s, dist ! s' == dist ! s - 1]
+        | s <- [0 .. n - 1]
+        ]
+
+data WalkMode = WalkRandom | WalkShortest
+
+data TokenWalk g = TokenWalk
+  { twBytes :: [Word8],
+    twEnd :: !Int,
+    twGen :: !g
+  }
+
+-- | Walk one token, starting just after the entry byte.  The walk only
+-- takes allowed (live) transitions, so it can always still reach a target
+-- accepting state.  At target states it stops with probability increasing
+-- in the number of steps taken; once the per-token byte budget is reached
+-- it follows a shortest path to the nearest target state, so token lengths
+-- stay bounded by budget + max shortest-path distance in the DFA.
+walkToken :: (RandomGen g) => TokenTarget -> Int -> WalkMode -> Int -> g -> TokenWalk g
+walkToken tt budget mode s0 g0 =
+  case mode of
+    WalkRandom -> go g0 s0 1 []
+    WalkShortest ->
+      let (bs, s_end) = converge s0 []
+       in TokenWalk {twBytes = bs, twEnd = s_end, twGen = g0}
+  where
+    dist s = ttDist tt ! s
+    converge s acc
+      | dist s <= 0 = (reverse acc, s)
+      | otherwise =
+          case ttStep tt ! s of
+            Just (b, s') -> converge s' (b : acc)
+            Nothing -> (reverse acc, s)
+    stop g s acc = TokenWalk {twBytes = reverse acc, twEnd = s, twGen = g}
+    go g s m acc
+      | m >= budget =
+          let (bs, s_end) = converge s acc
+           in TokenWalk {twBytes = bs, twEnd = s_end, twGen = g}
+      | dist s == 0 =
+          let (r, g') = randomR (0, budget - 1) g
+           in if r < m then stop g' s acc else step g' s m acc
+      | otherwise = step g s m acc
+    step g s m acc =
+      let arr = ttAllowed tt ! s
+          k = snd (bounds arr) + 1
+       in if k == 0
+            then stop g s acc
+            else
+              let (i, g') = randomR (0, k - 1) g
+                  (b, s') = arr ! i
+               in go g' s' (m + 1) (b : acc)
+
+-- | Generate a single long input by simulating the DFA.  The walk targets
+-- the union of accepting states, entering each new token via a producing
+-- transition and, within a token, restricting to transitions that keep a
+-- target accepting state reachable.  Token boundaries are correct by
+-- construction and token length is bounded: past the (optional) per-token
+-- budget the walk converges to the nearest accepting state along the
+-- shortest path.
 generateSingleLongInputFromDFA :: (Ord s, Ord t) => Maybe Int -> Int -> Set.Set Word8 -> DFALexer Word8 s t -> [Word8]
 generateSingleLongInputFromDFA mBudget len alpha dfa_lexer =
-  let gen = mkStdGen randomSeed
-      dfa  = fsa dfa_lexer
-      initial_state = initial dfa
-      trans = transitions' dfa
-      accept = accepting dfa
-      prod  = producesToken dfa_lexer
+  let env = mkWalkEnv dfa_lexer
+      tt = mkTokenTarget env (weAccepting env)
+      budget = case mBudget of
+        Just b | b > 0 -> b
+        _ -> max 1 len
+      gen = mkStdGen randomSeed
       alphaList = Set.toList alpha
-      alphaArr  = listArray (0, length alphaList - 1) alphaList
+      alphaArr :: Array Int Word8
+      alphaArr = listArray (0, length alphaList - 1) alphaList
 
-      -- All valid transitions from a state.
-      allSymsFor s  = [sym | sym <- alphaList, Map.member (s, sym) trans]
-      -- Only producing transitions from a state (force a token boundary).
-      prodSymsFor s = [sym | sym <- alphaList, Map.member (s, sym) trans
-                                             , (s, sym) `Set.member` prod]
+      -- Pick an entry byte and initial state for the next token.
+      pickEntry g start =
+        let cands = case start of
+              Nothing -> ttAllowed tt ! weInitial env
+              Just s -> ttEntry tt ! s
+            k = snd (bounds cands) + 1
+         in if k == 0
+              then Nothing
+              else
+                let (i, g') = randomR (0, k - 1) g
+                 in Just (cands ! i, g')
 
-      -- Walk the DFA randomly. tokLen tracks bytes since last boundary.
-      simulateDFA _ 0 state _ acc
-        | state `Set.member` accept = Just (reverse acc)
-        | otherwise = Nothing
-      simulateDFA g n state tokLen acc =
-        let overBudget = maybe False (tokLen >=) mBudget
-            candidates = if overBudget then prodSymsFor state else []
-            syms = case candidates of
-                     [] -> allSymsFor state
-                     _  -> candidates
-            nValid = length syms
-        in if nValid == 0
-             then Nothing
-             else
-               let (idx, g') = randomR (0, nValid - 1) g
-                   nextSymbol = syms !! idx
-                   nextState  = trans Map.! (state, nextSymbol)
-                   isBoundary = (state, nextSymbol) `Set.member` prod
-                   tokLen'    = if isBoundary then 0 else tokLen + 1
-               in simulateDFA g' (n - 1) nextState tokLen' (nextSymbol : acc)
+      -- Emit tokens until we hit the target length.
+      loop g written start acc
+        | written >= len = reverse acc
+        | otherwise =
+            case pickEntry g start of
+              Nothing -> reverse acc
+              Just ((b0, s1), g') ->
+                let walk = walkToken tt budget WalkRandom s1 g'
+                    bytes = b0 : twBytes walk
+                    written' = written + length bytes
+                 in loop (twGen walk) written' (Just (twEnd walk)) (foldl (flip (:)) acc bytes)
 
-      result = simulateDFA gen len initial_state 0 []
+      result = loop gen 0 Nothing []
       fallback =
         let numChoices = length alphaList
             randomIndices = take len $ randomRs (0, numChoices - 1) gen
          in map (alphaArr !) randomIndices
-   in case result of
-        Just xs -> xs
-        Nothing -> fallback
+   in if null result then fallback else take len result
 
 lexerTests :: TestMode -> CFG -> Int -> Bool -> Either Text (LBS.ByteString, LBS.ByteString)
 lexerTests mode cfg k noOutputs = do

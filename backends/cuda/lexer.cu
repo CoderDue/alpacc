@@ -194,15 +194,20 @@ public:
 
   __device__ __forceinline__
   void signalLengthOverflow() const {
-    atomicOr((uint32_t*)d_len_overflow, 1u);
+    if (*d_len_overflow == 0u)
+      atomicOr((uint32_t*)d_len_overflow, 1u);
+  }
+
+  bool isOverflow() const {
+    uint32_t overflow = 0;
+    gpuAssert(cudaMemcpy(&overflow, (const void*) d_len_overflow, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    return overflow != 0;
   }
 
   bool isAccept() const {
     state_t h_last_state;
     gpuAssert(cudaMemcpy(&h_last_state, (const void*) d_new_last_state, sizeof(state_t), cudaMemcpyDeviceToHost));
-    uint32_t overflow = 0;
-    gpuAssert(cudaMemcpy(&overflow, (const void*) d_len_overflow, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    return overflow == 0 && h_accept[get_index_cpu(h_last_state)];
+    return h_accept[get_index_cpu(h_last_state)];
   }
 
   I terminalsSize() const {
@@ -470,15 +475,25 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     shmemToGlbVec<J, uint64_t, BLOCK_SIZE, I>(prefix, num_sel, d_starts, exch_j);
     __syncthreads();
 
+    // Read starts from exch_j (which shmemToGlbVec left intact) and compute
+    // lengths into per-thread registers *before* any thread writes exch_l:
+    // exch_l aliases exch_j via the union, so an interleaved write would
+    // corrupt another thread's read from exch_j.
+    length_t tok_lens[ITEMS_PER_THREAD];
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
       if ((is_produce_state >> i) & 1) {
-        I gid     = glb_offs + (I)threadIdx.x * ITEMS_PER_THREAD + (I)i;
-        // exch_j still holds tok_start from the starts pass (shmemToGlbVec
-        // only reads, so the values are intact).
+        I gid = glb_offs + (I)threadIdx.x * ITEMS_PER_THREAD + (I)i;
         J tok_len = ctx.addOffset(gid + 1) - (J)exch_j[local_offs[i]];
         if ((length_t)(tok_len) != tok_len) ctx.signalLengthOverflow();
-        exch_l[local_offs[i]] = (length_t)tok_len;
+        tok_lens[i] = (length_t)tok_len;
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+      if ((is_produce_state >> i) & 1) {
+        exch_l[local_offs[i]] = tok_lens[i];
       }
     }
     __syncthreads();

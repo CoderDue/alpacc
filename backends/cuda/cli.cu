@@ -263,7 +263,7 @@ static bool lex_one(const uint8_t* bytes, uint64_t n,
         <<<nblocks, BLOCK_SIZE>>>(ctx, d_str, d_tok, d_s, d_l, (uint32_t)n, true);
     gpuAssert(cudaDeviceSynchronize());
     gpuAssert(cudaPeekAtLastError());
-    const bool     valid   = ctx.isAccept();
+    const bool     valid   = !ctx.isOverflow() && ctx.isAccept();
     const uint32_t num_lex = ctx.terminalsSize();
     ctx.cleanUp();
 
@@ -765,7 +765,7 @@ static bool both_one(const uint8_t* bytes, uint64_t n, BothResult& res) {
         gpuAssert(cudaDeviceSynchronize());
         gpuAssert(cudaPeekAtLastError());
         num_lex = ctx.terminalsSize();
-        valid   = ctx.isAccept();
+        valid   = !ctx.isOverflow() && ctx.isAccept();
         ctx.cleanUp();
     }
 
@@ -931,14 +931,21 @@ static int both_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
             <<<nblocks, BLOCK_SIZE>>>(ctx, d_string, d_terminals, d_starts, d_lengths, (uint32_t)n, true);
         gpuAssert(cudaDeviceSynchronize());
         gpuAssert(cudaPeekAtLastError());
-        uint32_t num_lex = ctx.terminalsSize();
-        bool lex_ok = ctx.isAccept();
+        uint32_t num_lex   = ctx.terminalsSize();
+        bool     overflow  = ctx.isOverflow();
+        bool     dfa_ok    = ctx.isAccept();
 
         index_t m = (index_t)num_lex + (index_t)2;
-        if (!lex_ok ||
-            (uint64_t)m * (uint64_t)MAX_BRACKETS_PER_POSITION > (uint64_t)INT_MAX ||
-            (uint64_t)m * (uint64_t)MAX_PRODS_PER_POSITION    > (uint64_t)INT_MAX) {
-            fprintf(stderr, "error: benchmark input is not lexable (or exceeds capacity)\n");
+        bool capacity_ok =
+            (uint64_t)m * (uint64_t)MAX_BRACKETS_PER_POSITION <= (uint64_t)INT_MAX &&
+            (uint64_t)m * (uint64_t)MAX_PRODS_PER_POSITION    <= (uint64_t)INT_MAX;
+        if (overflow || !dfa_ok || !capacity_ok) {
+            if (overflow)
+                fprintf(stderr, "error: benchmark input is not lexable (token length overflow)\n");
+            else if (!dfa_ok)
+                fprintf(stderr, "error: benchmark input is not lexable (DFA not in accept state)\n");
+            else
+                fprintf(stderr, "error: benchmark input exceeds parser capacity\n");
             ctx.cleanUp();
             cudaFree(d_string); cudaFree(d_terminals); cudaFree(d_starts); cudaFree(d_lengths);
             ret = 1;
