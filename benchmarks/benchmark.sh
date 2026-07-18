@@ -41,8 +41,8 @@ done
 
 # --- Benchmark -------------------------------------------------------
 
-make build         FUTHARK_BACKEND=cuda INPUT_SIZE=$INPUT_SIZE
-make bench-cuda    INPUT_SIZE=$INPUT_SIZE
-make bench-futhark FUTHARK_BACKEND=cuda INPUT_SIZE=$INPUT_SIZE
+make --no-print-directory build         FUTHARK_BACKEND=cuda INPUT_SIZE=$INPUT_SIZE
+make --no-print-directory bench-cuda    INPUT_SIZE=$INPUT_SIZE
+make --no-print-directory bench-futhark FUTHARK_BACKEND=cuda INPUT_SIZE=$INPUT_SIZE
 
 echo "Benchmarking finished."
