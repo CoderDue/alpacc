@@ -33,7 +33,7 @@ lexer-cuda: lexer.cu
 	@printf "$(D)  Compiling CUDA lexer...$(E)\n"
 	@nvcc $(NVCCFLAGS) -o $@ $^
 
-lex.fut: $(GRAMMAR) $(DATA_RAW)
+lexer.fut: $(GRAMMAR) $(DATA_RAW)
 	@alpacc futhark $(GRAMMAR) --lexer --index32 -o $@
 	@printf -- "\n-- ==\n-- entry: lex_int\n-- script input { \$$loadbytes \"$(DATA_RAW)\" }\n" >> $@
 	@futhark pkg sync > /dev/null 2>&1
@@ -52,24 +52,24 @@ parser-cuda: parser.cu
 	@printf "$(D)  Compiling CUDA parser...$(E)\n"
 	@nvcc $(NVCCFLAGS) -o $@ $^
 
-parse.fut: $(GRAMMAR) $(DATA_RAW)
+parser.fut: $(GRAMMAR) $(DATA_RAW)
 	@alpacc futhark $(GRAMMAR) --index32 -o $@
 	@printf -- "\n-- ==\n-- entry: parse_int\n-- script input { \$$loadbytes \"$(DATA_RAW)\" }\n" >> $@
 	@futhark pkg sync > /dev/null 2>&1
 
 # --- Benchmarks ---
 
-build: lexer-cuda parser-cuda lex.fut parse.fut $(DATA_RAW)
+build: lexer-cuda parser-cuda lexer.fut parser.fut $(DATA_RAW)
 	@printf "$(H)Build complete [$(GRAMMAR_NAME)].$(E)\n"
 
 bench-lexer-cuda: lexer-cuda $(DATA)
 	@printf "$(H)Benchmarking CUDA (alpacc) lexer [$(GRAMMAR_NAME)]:$(E)\n"
 	@./lexer-cuda --benchmark 10 --warmup 3 < $(DATA)
 
-bench-lexer-futhark: lex.fut $(DATA_RAW)
+bench-lexer-futhark: lexer.fut $(DATA_RAW)
 	@futhark pkg sync > /dev/null 2>&1
 	@printf "$(H)Benchmarking Futhark lexer [$(GRAMMAR_NAME)]:$(E)\n"
-	@futhark bench --backend $(FUTHARK_BACKEND) lex.fut
+	@futhark bench --backend $(FUTHARK_BACKEND) lexer.fut
 
 bench-lexer-rust: lexer-rust $(DATA_RAW)
 	@printf "$(H)Benchmarking Rust lexer [$(GRAMMAR_NAME)]:$(E)\n"
@@ -83,10 +83,10 @@ bench-parser-cuda: parser-cuda $(DATA)
 	@printf "$(H)Benchmarking CUDA (alpacc) parser [$(GRAMMAR_NAME)]:$(E)\n"
 	@./parser-cuda --benchmark 10 --warmup 3 < $(DATA)
 
-bench-parser-futhark: parse.fut $(DATA_RAW)
+bench-parser-futhark: parser.fut $(DATA_RAW)
 	@futhark pkg sync > /dev/null 2>&1
 	@printf "$(H)Benchmarking Futhark parser [$(GRAMMAR_NAME)]:$(E)\n"
-	@futhark bench --backend $(FUTHARK_BACKEND) parse.fut
+	@futhark bench --backend $(FUTHARK_BACKEND) parser.fut
 
 bench-parser:
 	@printf "$(H)JSON Parser Benchmark [$(GRAMMAR_NAME)]:$(E)\n"
@@ -95,8 +95,8 @@ bench-parser:
 bench: bench-lexer bench-parser
 
 reset:
-	@rm -rf target lexer-rust lexer-cuda lexer.cu lex.fut lex lex.c \
-	       parser-cuda parser.cu parse.fut parse parse.c
+	@rm -rf target lexer-rust lexer-cuda lexer.cu lexer.fut lexer lexer.c \
+	       parser-cuda parser.cu parser.fut parser parser.c
 
 clean: reset
 	@rm -rf data-*.inputs data-raw-*.json lib
