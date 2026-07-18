@@ -228,8 +228,16 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   constexpr I SHMEM_PAD    = (SHMEM_RAW == 0) ? SHMEM_MOD : SHMEM_RAW;
   constexpr I SHMEM_STRIDE = ITEMS_PER_THREAD + SHMEM_PAD;
   volatile __shared__ state_t states[SHMEM_STRIDE * BLOCK_SIZE];
-  // Exchange buffer for the two-phase terminal scatter (dense tiles only).
-  volatile __shared__ terminal_t exch_t[ITEMS_PER_THREAD * BLOCK_SIZE];
+  // Exchange buffer for the two-phase scatter on dense tiles.
+  // exch_t (terminals) and exch_j (starts/ends) are never live simultaneously,
+  // so they share one shmem region via a union (proper alignment for each type).
+  constexpr I EXCH_ELEMS = ITEMS_PER_THREAD * BLOCK_SIZE;
+  union {
+    terminal_t as_t[EXCH_ELEMS];
+    J          as_j[EXCH_ELEMS];
+  } __shared__ exch;
+  volatile terminal_t* exch_t = exch.as_t;
+  volatile J*          exch_j = exch.as_j;
   __shared__ state_t next_block_first_state;
   // Main slots: ceil(ITEMS_PER_THREAD / 8) uint64_t registers per thread.
   // One extra slot is added to cover the single byte past the block boundary
@@ -401,28 +409,11 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     }
   }
 
-  // starts/ends are written directly (4-byte scattered stores are tolerable),
-  // while the 1-byte terminals — the worst case for coalescing — go through a
-  // two-phase scatter (cub agent_select_if style) on dense tiles.
-#pragma unroll
-  for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-    I lid = threadIdx.x * ITEMS_PER_THREAD + i;
-    I gid = glb_offs + lid;
-    if ((is_produce_state >> i) & 1) {
-      I offset = Add<I>()(prefix, local_offs[i]);
-      if (offset == I() && starts[i] == I()) {
-        d_starts[offset] = ctx.getLastStart();
-      } else {
-        d_starts[offset] = ctx.addOffset(starts[i] - 1);
-      }
-      d_ends[offset] = ctx.addOffset(gid + 1);
-    }
-  }
-
   if (num_sel > BLOCK_SIZE) {
-    // Dense tile: compact terminals into the shmem exchange at tile-local
-    // offsets, then emit one contiguous run as packed-u64 stores (8 terminals
-    // per store).
+    // Dense tile: two-phase scatter for terminals, starts, and ends.
+    // Each array is compacted into the shmem exchange at tile-local offsets,
+    // then written out as coalesced wide stores; exch_j is reused for starts
+    // then ends with a __syncthreads() between passes.
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
       if ((is_produce_state >> i) & 1) {
@@ -432,14 +423,50 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     }
     __syncthreads();
     shmemToGlbVec<terminal_t, uint64_t, BLOCK_SIZE, I>(prefix, num_sel, d_terminals, exch_t);
-  } else {
-    // Sparse tile: direct scatter (cub's heuristic — staging only pays off
-    // with more selections than threads).
+    __syncthreads();
+
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+      I lid = threadIdx.x * ITEMS_PER_THREAD + i;
+      if ((is_produce_state >> i) & 1) {
+        I offset = local_offs[i];
+        if (Add<I>()(prefix, offset) == I() && starts[i] == I()) {
+          exch_j[offset] = ctx.getLastStart();
+        } else {
+          exch_j[offset] = ctx.addOffset(starts[i] - 1);
+        }
+      }
+    }
+    __syncthreads();
+    shmemToGlbVec<J, uint64_t, BLOCK_SIZE, I>(prefix, num_sel, d_starts, exch_j);
+    __syncthreads();
+
+#pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+      I lid = threadIdx.x * ITEMS_PER_THREAD + i;
+      I gid = glb_offs + lid;
+      if ((is_produce_state >> i) & 1) {
+        exch_j[local_offs[i]] = ctx.addOffset(gid + 1);
+      }
+    }
+    __syncthreads();
+    shmemToGlbVec<J, uint64_t, BLOCK_SIZE, I>(prefix, num_sel, d_ends, exch_j);
+  } else {
+    // Sparse tile: direct scatter.
+#pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+      I lid = threadIdx.x * ITEMS_PER_THREAD + i;
+      I gid = glb_offs + lid;
       if ((is_produce_state >> i) & 1) {
         I shmem_cur = (I)threadIdx.x * (SHMEM_STRIDE) + i;
-        d_terminals[Add<I>()(prefix, local_offs[i])] = get_terminal(states[shmem_cur]);
+        I offset = Add<I>()(prefix, local_offs[i]);
+        d_terminals[offset] = get_terminal(states[shmem_cur]);
+        if (offset == I() && starts[i] == I()) {
+          d_starts[offset] = ctx.getLastStart();
+        } else {
+          d_starts[offset] = ctx.addOffset(starts[i] - 1);
+        }
+        d_ends[offset] = ctx.addOffset(gid + 1);
       }
     }
   }
