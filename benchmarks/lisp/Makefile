@@ -1,5 +1,5 @@
 CC?=cc
-CFLAGS=-O3 -Werror -Wall -Wextra -Wunused -Wno-unused-parameter -Wno-error=enum-conversion
+CFLAGS=-O3 -Werror -Wall -Wextra -Wunused
 H=\x1B[32m\033[1m
 E=\033[0m\x1B[0m
 D=\x1B[2m
@@ -75,7 +75,7 @@ parser.fut: $(GRAMMAR) $(DATA_RAW)
 
 # --- Benchmarks ---
 
-build: $(DATA) $(DATA_RAW) lexer-c lexer-cuda parser-cuda lexer.fut parser.fut
+build: $(DATA) $(DATA_RAW) lexer-cuda parser-cuda lexer.fut parser.fut
 	@printf "$(H)Build complete [$(GRAMMAR_NAME)].$(E)\n"
 
 bench-lexer-c: lexer-c $(DATA_RAW)
