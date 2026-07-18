@@ -145,7 +145,7 @@ module mk_lexer (L: lexer_context)
     let dest =
       if m <= extra_size
       then let new_dest =
-             replicate (2 * extra_size) (L.terminal_int_module.u8 0, (idx.i64 0, idx.i64 0))
+             replicate (2 * extra_size) (L.terminal_int_module.u8 0, (idx.i64 0, len.i64 0))
            in scatter new_dest (indices dest) dest
       else dest
     -- The -1 entries of `offsets` mark positions with no token; they must

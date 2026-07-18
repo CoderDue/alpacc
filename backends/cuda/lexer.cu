@@ -473,13 +473,11 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
       if ((is_produce_state >> i) & 1) {
-        I gid = glb_offs + (I)threadIdx.x * ITEMS_PER_THREAD + (I)i;
-        J tok_start = (Add<I>()(prefix, local_offs[i]) == I() && starts[i] == I())
-                        ? ctx.getLastStart()
-                        : ctx.addOffset(starts[i] - 1);
-        J tok_end   = ctx.addOffset(gid + 1);
-        J tok_len   = tok_end - tok_start;
-        if (tok_len > (J)(length_t)(-1)) ctx.signalLengthOverflow();
+        I gid     = glb_offs + (I)threadIdx.x * ITEMS_PER_THREAD + (I)i;
+        // exch_j still holds tok_start from the starts pass (shmemToGlbVec
+        // only reads, so the values are intact).
+        J tok_len = ctx.addOffset(gid + 1) - (J)exch_j[local_offs[i]];
+        if ((length_t)(tok_len) != tok_len) ctx.signalLengthOverflow();
         exch_l[local_offs[i]] = (length_t)tok_len;
       }
     }
@@ -503,7 +501,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
         }
         tok_end = ctx.addOffset(gid + 1);
         tok_len = tok_end - tok_start;
-        if (tok_len > (J)(length_t)(-1)) ctx.signalLengthOverflow();
+        if ((length_t)(tok_len) != tok_len) ctx.signalLengthOverflow();
         d_starts[offset]  = tok_start;
         d_lengths[offset] = (length_t)tok_len;
       }

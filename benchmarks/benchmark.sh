@@ -3,7 +3,7 @@
 #SBATCH --gres=gpu:a100
 #SBATCH --mem=32G
 #SBATCH --time=3:00:00
-#SBATCH --output=benchmark.log
+#SBATCH --output=benchmark-%j.log
 
 INPUT_SIZE=${INPUT_SIZE:-52428800}
 
