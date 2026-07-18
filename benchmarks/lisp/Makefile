@@ -1,5 +1,5 @@
 CC?=cc
-CFLAGS=-O3 -Wall -Wextra -Wunused
+CFLAGS=-O3 -Werror -Wall -Wextra -Wunused -Wno-unused-parameter -Wno-error=enum-conversion
 H=\x1B[32m\033[1m
 E=\033[0m\x1B[0m
 D=\x1B[2m
