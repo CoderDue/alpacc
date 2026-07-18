@@ -37,7 +37,14 @@ value domain of the grammar:
 - `terminal_t` — token/terminal ids.
 - `production_t` — production ids; only defined in builds that contain a
   parser.
-- `index_t` — input positions / lexeme spans; `int64_t` in both backends.
+- `index_t` — input positions (token starts); signed `int64_t` by default,
+  or `int32_t` when the grammar uses `--index32`.
+- `length_t` — token lengths (end − start). Unsigned. Defaults to the
+  unsigned counterpart of `index_t` (`uint64_t` or `uint32_t`). Can be
+  narrowed via `length = 8 | 16 | 32 | 64` in the grammar's `params {}`
+  block to save memory when tokens are guaranteed short (e.g. `length = 8`
+  for grammars where no token exceeds 255 bytes). Lexing fails if a token's
+  length does not fit in `length_t`.
 
 All backends derive these types from the same analysis, so a given
 grammar gets identical type sizes everywhere.
@@ -50,12 +57,12 @@ $ ./prog --layout
 terminal_t=1
 production_t=1
 index_t=8
+length_t=8
 ```
 
 `--layout` prints `key=value` lines (sizes in bytes) and exits. Lexer-only
-builds omit the `production_t` key (the type does not exist in them); all
-other builds print all three keys. Clients should treat unknown keys as
-harmless and absent keys as "not used".
+and combined builds print `length_t`; parser-only builds omit it. Clients
+should treat unknown keys as harmless and absent keys as "not used".
 
 ## Request frame (all modes)
 
@@ -87,8 +94,8 @@ If `valid == 0`, nothing else follows for this record. If `valid == 1`:
 u64          num_lexemes
 per lexeme:
   terminal_t token id
-  index_t    start (inclusive byte offset)
-  index_t    end   (exclusive byte offset)
+  index_t    start  (inclusive byte offset)
+  length_t   length (token length in bytes; end = start + length)
 ```
 
 **Parser-only** — the leftmost derivation:
@@ -109,8 +116,8 @@ structure-of-arrays:
 ```
 u64          num_tokens
 terminal_t   × num_tokens   token ids
-index_t      × num_tokens   starts (inclusive byte offsets)
-index_t      × num_tokens   ends   (exclusive byte offsets)
+index_t      × num_tokens   starts  (inclusive byte offsets)
+length_t     × num_tokens   lengths (token lengths; end = start + length)
 u64          num_nodes
 production_t × num_nodes    production ids (preorder)
 index_t      × num_nodes    parents (index of parent node)

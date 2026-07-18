@@ -7,6 +7,7 @@ import Alpacc.Generator.Analyzer
 import Alpacc.Generator.C.Lexer qualified as Lexer
 import Alpacc.Generator.C.Parser qualified as Parser
 import Alpacc.Generator.Cuda.Cudafy
+import Alpacc.Types
 import Data.FileEmbed
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -32,16 +33,24 @@ includes =
       "#include <time.h>"
     ]
 
-indexTypedef :: Bool -> Text
-indexTypedef index32 =
+indexTypedef :: Bool -> Maybe UInt -> Text
+indexTypedef index32 mLenType =
   Text.unlines $
     (if index32 then ["#define INDEX32"] else [])
       ++ [ "#ifdef INDEX32",
            "typedef int32_t index_t;",
            "#else",
            "typedef int64_t index_t;",
-           "#endif"
+           "#endif",
+           "typedef " <> lenT <> " length_t;"
          ]
+  where
+    lenT = case mLenType of
+      Nothing  -> if index32 then "uint32_t" else "uint64_t"
+      Just U8  -> "uint8_t"
+      Just U16 -> "uint16_t"
+      Just U32 -> "uint32_t"
+      Just U64 -> "uint64_t"
 
 -- Forward declarations for the I/O helpers defined in cli.c.
 -- These let the generated test-case code call them without needing
@@ -86,7 +95,7 @@ lexerTestCase = Text.unlines
   , "    for (uint64_t i = 0; i < num_lexemes; i++) {"
   , "      fwrite(&lexemes[i].terminal, sizeof(terminal_t), 1, out);"
   , "      fwrite(&lexemes[i].start, sizeof(index_t), 1, out);"
-  , "      fwrite(&lexemes[i].end, sizeof(index_t), 1, out);"
+  , "      fwrite(&lexemes[i].length, sizeof(length_t), 1, out);"
   , "    }"
   , "    free(lexemes);"
   , "  } else { fputc(0, out); }"
@@ -94,6 +103,7 @@ lexerTestCase = Text.unlines
   , "static void print_layout(FILE *f) {"
   , "  fprintf(f, \"terminal_t=%zu\\n\", sizeof(terminal_t));"
   , "  fprintf(f, \"index_t=%zu\\n\", sizeof(index_t));"
+  , "  fprintf(f, \"length_t=%zu\\n\", sizeof(length_t));"
   , "}"
   ]
 
@@ -131,7 +141,7 @@ bothTestCase = Text.unlines
   , "    for (uint64_t i = 0; i < num_lexemes; i++)"
   , "      fwrite(&lexemes[i].start, sizeof(index_t), 1, out);"
   , "    for (uint64_t i = 0; i < num_lexemes; i++)"
-  , "      fwrite(&lexemes[i].end, sizeof(index_t), 1, out);"
+  , "      fwrite(&lexemes[i].length, sizeof(length_t), 1, out);"
   , "    write_u64le(out, num_nodes);"
   , "    fwrite(tree_prods, sizeof(production_t), num_nodes, out);"
   , "    fwrite(tree_parents, sizeof(index_t), num_nodes, out);"
@@ -144,18 +154,19 @@ bothTestCase = Text.unlines
   , "  fprintf(f, \"terminal_t=%zu\\n\", sizeof(terminal_t));"
   , "  fprintf(f, \"production_t=%zu\\n\", sizeof(production_t));"
   , "  fprintf(f, \"index_t=%zu\\n\", sizeof(index_t));"
+  , "  fprintf(f, \"length_t=%zu\\n\", sizeof(length_t));"
   , "}"
   ]
 
-auxiliary :: Bool -> Analyzer [Text] -> Text
-auxiliary index32 analyzer =
+auxiliary :: Bool -> Maybe UInt -> Analyzer [Text] -> Text
+auxiliary index32 mLenType analyzer =
   case analyzerKind analyzer of
     Lex lexer ->
       Text.unlines
         [ Text.unlines (("// " <>) <$> meta analyzer),
           includes,
           "typedef " <> cudafy (terminalType analyzer) <> " terminal_t;",
-          indexTypedef index32,
+          indexTypedef index32 mLenType,
           ioForwardDecls,
           Lexer.generateLexer lexer,
           cLexer,
@@ -167,7 +178,7 @@ auxiliary index32 analyzer =
         [ Text.unlines (("// " <>) <$> meta analyzer),
           includes,
           "typedef " <> cudafy (terminalType analyzer) <> " terminal_t;",
-          indexTypedef index32,
+          indexTypedef index32 mLenType,
           ioForwardDecls,
           Parser.generateParser parser,
           cParser,
@@ -179,7 +190,7 @@ auxiliary index32 analyzer =
         [ Text.unlines (("// " <>) <$> meta analyzer),
           includes,
           "typedef " <> cudafy (terminalType analyzer) <> " terminal_t;",
-          indexTypedef index32,
+          indexTypedef index32 mLenType,
           ioForwardDecls,
           Lexer.generateLexer lexer,
           cLexer,
@@ -189,8 +200,8 @@ auxiliary index32 analyzer =
           cCli
         ]
 
-generator :: Bool -> Generator [Text]
-generator index32 =
+generator :: Bool -> Maybe UInt -> Generator [Text]
+generator index32 mLenType =
   Generator
-    { generate = auxiliary index32
+    { generate = auxiliary index32 mLenType
     }

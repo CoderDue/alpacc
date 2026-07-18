@@ -9,6 +9,7 @@ module Alpacc.Test.Lexer
     getUInt,
     uintBytes,
     decodeWith,
+    cfgLengthType,
   )
 where
 
@@ -35,7 +36,7 @@ import Data.Map qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Word (Word64)
+import Data.Word (Word8, Word64)
 import System.IO (Handle, SeekMode (..), hFlush, hSeek, hSetFileSize, hTell)
 import System.Random
 
@@ -92,9 +93,18 @@ decodeWith err g =
     . runGetOrFail g
     . LBS.fromStrict
 
-putOutput :: UInt -> Output -> Put
-putOutput _ (Output Nothing) = putWord8 0
-putOutput tw (Output (Just ts)) = do
+-- | Derive the length-field type from a CFG's params (defaults to U64).
+cfgLengthType :: CFG -> UInt
+cfgLengthType cfg = case paramsLength (cfgParams cfg) of
+  Just 8  -> U8
+  Just 16 -> U16
+  Just 32 -> U32
+  Just 64 -> U64
+  _       -> U64
+
+putOutput :: UInt -> UInt -> Output -> Put
+putOutput _ _ (Output Nothing) = putWord8 0
+putOutput tw lw (Output (Just ts)) = do
   putWord8 1
   putWord64le (fromIntegral $ length ts)
   mapM_ putToken ts
@@ -102,10 +112,10 @@ putOutput tw (Output (Just ts)) = do
     putToken (Lexeme t (i, j)) = do
       putUInt tw t
       putWord64le i
-      putWord64le j
+      putUInt lw (j - i)
 
-getOutput :: UInt -> Get Output
-getOutput tw = do
+getOutput :: UInt -> UInt -> Get Output
+getOutput tw lw = do
   is_valid <- getWord8
   if is_valid == 1
     then do
@@ -116,8 +126,8 @@ getOutput tw = do
     getLexeme = do
       t <- getUInt tw
       i <- getWord64le
-      j <- getWord64le
-      pure $ Lexeme t (i, j)
+      len <- getUInt lw
+      pure $ Lexeme t (i, i + len)
 
 putInput :: Input -> Put
 putInput (Input str) = do
@@ -144,55 +154,64 @@ getInputs = do
   i <- getWord64le
   Inputs <$> replicateM (fromIntegral i) getInput
 
-putOutputs :: UInt -> Outputs -> Put
-putOutputs tw (Outputs results) = do
+putOutputs :: UInt -> UInt -> Outputs -> Put
+putOutputs tw lw (Outputs results) = do
   putWord64le (fromIntegral $ length results)
-  mapM_ (putOutput tw) results
+  mapM_ (putOutput tw lw) results
 
-getOutputs :: UInt -> Get Outputs
-getOutputs tw = do
+getOutputs :: UInt -> UInt -> Get Outputs
+getOutputs tw lw = do
   i <- getWord64le
-  Outputs <$> replicateM (fromIntegral i) (getOutput tw)
+  Outputs <$> replicateM (fromIntegral i) (getOutput tw lw)
 
 -- | Generate a single long input by simulating the DFA. Starting from
 -- the initial state, randomly choose valid transitions until we reach
 -- the desired length and are in an accepting state. If we can't reach
 -- an accepting state at the exact length, we try to find the nearest
 -- accepting state and pad or trim accordingly.
-generateSingleLongInputFromDFA :: (Ord s, Ord t) => Int -> Set.Set t -> DFA t s -> [t]
-generateSingleLongInputFromDFA len alpha dfa =
+--
+-- When a token budget is given, after that many bytes within a token
+-- the walk is restricted to producing transitions only, forcing a
+-- boundary and keeping individual tokens short.
+generateSingleLongInputFromDFA :: (Ord s, Ord t) => Maybe Int -> Int -> Set.Set Word8 -> DFALexer Word8 s t -> [Word8]
+generateSingleLongInputFromDFA mBudget len alpha dfa_lexer =
   let gen = mkStdGen randomSeed
+      dfa  = fsa dfa_lexer
       initial_state = initial dfa
       trans = transitions' dfa
       accept = accepting dfa
+      prod  = producesToken dfa_lexer
       alphaList = Set.toList alpha
-      alphaArr = listArray (0, length alphaList - 1) alphaList
+      alphaArr  = listArray (0, length alphaList - 1) alphaList
 
-      -- Precompute per-state valid-symbol arrays so we do O(1) work per step.
-      validSymsFor s =
-        let vs = [sym | sym <- alphaList, Map.member (s, sym) trans]
-        in listArray (0, length vs - 1) vs
-      validSymsMap = Map.fromList [(s, validSymsFor s) | s <- Map.keys trans']
-        where trans' = Map.mapKeys fst trans
+      -- All valid transitions from a state.
+      allSymsFor s  = [sym | sym <- alphaList, Map.member (s, sym) trans]
+      -- Only producing transitions from a state (force a token boundary).
+      prodSymsFor s = [sym | sym <- alphaList, Map.member (s, sym) trans
+                                             , (s, sym) `Set.member` prod]
 
-      -- Walk the DFA randomly, accumulating symbols in reverse.
-      simulateDFA _ 0 state acc
+      -- Walk the DFA randomly. tokLen tracks bytes since last boundary.
+      simulateDFA _ 0 state _ acc
         | state `Set.member` accept = Just (reverse acc)
         | otherwise = Nothing
-      simulateDFA g n state acc =
-        case Map.lookup state validSymsMap of
-          Nothing -> Nothing
-          Just arr ->
-            let nValid = snd (bounds arr) + 1
-            in if nValid == 0
-                 then Nothing
-                 else
-                   let (idx, g') = randomR (0, nValid - 1) g
-                       nextSymbol = arr ! idx
-                       nextState = trans Map.! (state, nextSymbol)
-                   in simulateDFA g' (n - 1) nextState (nextSymbol : acc)
+      simulateDFA g n state tokLen acc =
+        let overBudget = maybe False (tokLen >=) mBudget
+            candidates = if overBudget then prodSymsFor state else []
+            syms = case candidates of
+                     [] -> allSymsFor state
+                     _  -> candidates
+            nValid = length syms
+        in if nValid == 0
+             then Nothing
+             else
+               let (idx, g') = randomR (0, nValid - 1) g
+                   nextSymbol = syms !! idx
+                   nextState  = trans Map.! (state, nextSymbol)
+                   isBoundary = (state, nextSymbol) `Set.member` prod
+                   tokLen'    = if isBoundary then 0 else tokLen + 1
+               in simulateDFA g' (n - 1) nextState tokLen' (nextSymbol : acc)
 
-      result = simulateDFA gen len initial_state []
+      result = simulateDFA gen len initial_state 0 []
       fallback =
         let numChoices = length alphaList
             randomIndices = take len $ randomRs (0, numChoices - 1) gen
@@ -206,6 +225,7 @@ lexerTests mode cfg k noOutputs = do
   spec <- cfgToDFALexerSpec cfg
   let ts = Map.keys $ regexMap spec
       encoder = encodeTerminals (T "ignore") $ parsingTerminals ts
+      lw = cfgLengthType cfg
   tw <- terminalIntType encoder
   dfa <-
     maybeToEither "Error: Could not encode tokens." $
@@ -219,11 +239,11 @@ lexerTests mode cfg k noOutputs = do
           let comb = listProducts k $ Set.toList alpha
            in (toInputs comb, if noOutputs then emptyOutputs else toOutputs dfa ignore comb)
         SingleLong ->
-          let singleInput = generateSingleLongInputFromDFA k alpha (fsa dfa)
+          let singleInput = generateSingleLongInputFromDFA (Just 16) k alpha dfa
            in (toInputs [singleInput], if noOutputs then emptyOutputs else toOutputs dfa ignore [singleInput])
   pure
     ( runPut $ putInputs inputs,
-      runPut $ putOutputs tw outputs
+      runPut $ putOutputs tw lw outputs
     )
   where
     toOutputs dfa ignore = Outputs . fmap (Output . tokenize dfa ignore)
@@ -252,9 +272,10 @@ lexerTestsSingleLong cfg k h mOutH = do
                  lexerDFA (0 :: Integer) $ mapSymbols unBytes spec of
             Nothing -> pure (Left "Error: Could not encode tokens.")
             Just dfa -> do
-              let ignore = fromIntegral <$> terminalLookup (T "ignore") encoder
+              let lw     = cfgLengthType cfg
+                  ignore = fromIntegral <$> terminalLookup (T "ignore") encoder
                   alpha  = alphabet $ fsa dfa
-                  singleInput = generateSingleLongInputFromDFA k alpha (fsa dfa)
+                  singleInput = generateSingleLongInputFromDFA (Just 16) k alpha dfa
               -- num_tests, then frame_len/n placeholders patched below.
               LBS.hPut h (runPut $ putWord64le 1 >> putWord64le 0 >> putWord64le 0)
               LBS.hPut h (LBS.pack singleInput)
@@ -276,7 +297,7 @@ lexerTestsSingleLong cfg k h mOutH = do
                         LBS.hPut outH $ runPut $ do
                           putUInt tw t
                           putWord64le i
-                          putWord64le j
+                          putUInt lw (j - i)
                         modifyIORef' tokCountRef (+ 1)
                   mResult <- tokenizeWithBS dfa ignore payload putLexeme
                   case mResult of
@@ -297,9 +318,9 @@ lexerTestsSingleLong cfg k h mOutH = do
 lexerBytes :: CFG -> Int -> Either Text ByteString
 lexerBytes cfg k = do
   spec <- cfgToDFALexerSpec cfg
-  let alpha = alphabet $ fsa $ lexerDFA (0 :: Integer) $ mapSymbols unBytes spec
-  pure $ ByteString.pack $ generateSingleLongInputFromDFA k alpha
-         (fsa $ lexerDFA (0 :: Integer) $ mapSymbols unBytes spec)
+  let dfa = lexerDFA (0 :: Integer) $ mapSymbols unBytes spec
+      alpha = alphabet $ fsa dfa
+  pure $ ByteString.pack $ generateSingleLongInputFromDFA (Just 16) k alpha dfa
 
 lexerTestsCompare :: CFG -> ByteString -> ByteString -> ByteString -> Either Text ()
 lexerTestsCompare cfg input expected result = do
@@ -307,14 +328,15 @@ lexerTestsCompare cfg input expected result = do
 
   let ts = Map.keys $ regexMap spec
       encoder = encodeTerminals (T "ignore") $ parsingTerminals ts
+      lw = cfgLengthType cfg
   tw <- terminalIntType encoder
   encodings <-
     maybeToEither "Error: Could not encode tokens." $
       mapM (fmap fromIntegral . (`terminalLookup` encoder)) ts
   let int_to_token = Map.fromList $ zip encodings ts
   Inputs inp <- decodeWith "Error: Could not parse input file." getInputs input
-  Outputs ex <- decodeWith "Error: Could not parse expected output file." (getOutputs tw) expected
-  Outputs res <- decodeWith "Error: Could not parse result output file." (getOutputs tw) result
+  Outputs ex <- decodeWith "Error: Could not parse expected output file." (getOutputs tw lw) expected
+  Outputs res <- decodeWith "Error: Could not parse result output file." (getOutputs tw lw) result
   failwith (length inp == length ex) "Error: Input and expected output file do not have the same number of tests."
   failwith (length inp == length res) "Error: Input and result output file do not have the same number of tests."
 

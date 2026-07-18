@@ -1,6 +1,7 @@
 module Main where
 
 import Alpacc.CFG
+import Alpacc.Types
 import Alpacc.Generator.Analyzer
   ( Generator (..),
     mkLexer,
@@ -350,19 +351,26 @@ readContents input =
     StdInput -> TextIO.getContents
     FileInput path -> TextIO.readFile path
 
-backendGenerator :: Backend -> Bool -> Generator [Text]
-backendGenerator CUDA = Cuda.generator
-backendGenerator Futhark = Futhark.generator
-backendGenerator C = C.generator
+bitsToUInt :: Int -> Maybe UInt
+bitsToUInt 8  = Just U8
+bitsToUInt 16 = Just U16
+bitsToUInt 32 = Just U32
+bitsToUInt 64 = Just U64
+bitsToUInt _  = Nothing
 
-generateProgram :: Backend -> Bool -> Gen -> CFG -> Either Text Text
-generateProgram backend index32 gen cfg =
+backendGenerator :: Backend -> Bool -> Maybe UInt -> Generator [Text]
+backendGenerator CUDA    = Cuda.generator
+backendGenerator Futhark = Futhark.generator
+backendGenerator C       = C.generator
+
+generateProgram :: Backend -> Bool -> Maybe UInt -> Gen -> CFG -> Either Text Text
+generateProgram backend index32 mLenType gen cfg =
   case gen of
     GenBoth -> generate generator <$> mkLexerParser cfg
     GenLexer -> generate generator <$> mkLexer cfg
     GenParser -> generate generator <$> mkParser cfg
   where
-    generator = backendGenerator backend index32
+    generator = backendGenerator backend index32 mLenType
 
 pathOfInput :: FilePath -> Input -> FilePath
 pathOfInput p StdInput = p
@@ -387,7 +395,8 @@ mainGenerator :: GeneratorParameters -> IO ()
 mainGenerator params = do
   let program_path = outputPath backend output input
   cfg <- readCfg input
-  let either_program = generateProgram backend index32 gen cfg
+  let mLenType = paramsLength (cfgParams cfg) >>= bitsToUInt
+  let either_program = generateProgram backend index32 mLenType gen cfg
 
   case either_program of
     Left e -> do

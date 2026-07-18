@@ -3,9 +3,10 @@
 params {
   lookback = 1.
   lookahead = 3.
+  length = 16.
 }
 
-string = /"([\x00-\x21\x23-\x5B\x5D-\xFF]|\\")*"/.
+string = /"([a-zA-Z0-9]|\s)*"/.
 number = /-?[0-9]+(.[0-9]+)?/.
 ignore = /(\s|\n|\t|\r)+/.
 

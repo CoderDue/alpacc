@@ -30,11 +30,12 @@ static bool state_accept(state_t s) {
 typedef struct {
   terminal_t terminal;
   index_t    start;
-  index_t    end;
+  length_t   length;
 } lexeme_t;
 
 // Lex `n` bytes from `str`.  On success returns a malloc'd array of lexemes
-// in *out, sets *num_out, returns true.  Returns false if lexing fails.
+// in *out, sets *num_out, returns true.  Returns false if lexing fails or a
+// token length overflows length_t.
 static bool lex_string(const uint8_t *str, uint64_t n,
                        lexeme_t **out, uint64_t *num_out) {
   if (n == 0) {
@@ -64,13 +65,18 @@ static bool lex_string(const uint8_t *str, uint64_t n,
 #else
       if (true) {
 #endif
+        uint64_t tok_len = i - tok_start;
+        if (tok_len > (uint64_t)(length_t)(-1)) {
+          free(result);
+          return false;
+        }
         if (count == cap) {
           cap *= 2;
           result = (lexeme_t *) realloc(result, cap * sizeof(lexeme_t));
         }
         result[count].terminal = t;
         result[count].start    = tok_start;
-        result[count].end      = i;
+        result[count].length   = (length_t) tok_len;
         count++;
       }
       tok_start = i;

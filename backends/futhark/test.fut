@@ -12,7 +12,8 @@
 --   output: u64 num_tests, then per test a response record:
 --           u8 valid; if valid: u64 count, then native-width fields.
 -- All integers are little-endian; token/production ids use the
--- grammar's native widths, spans and parents are 8 bytes.
+-- grammar's native widths, starts and parents are 8 bytes (idx.t),
+-- lengths use the grammar's len.t width.
 
 import "lib/github.com/diku-dk/containers/core/opt"
 
@@ -35,22 +36,23 @@ def decode_u64 (a: [8]u8) : u64 = decode_le a
 module lexer_test
   (L: {
     type terminal_int
-    val lex_int [n] : [n]u8 -> opt ([](terminal_int, (idx.t, idx.t)))
+    val lex_int [n] : [n]u8 -> opt ([](terminal_int, (idx.t, len.t)))
   })
   (T: integral with t = L.terminal_int) = {
   type terminal = L.terminal_int
 
   def terminal_bytes : i64 = i64.i32 T.num_bits / 8
-  def lexeme_bytes : i64 = terminal_bytes + 16
+  def length_bytes   : i64 = i64.i32 len.num_bits / 8
+  def lexeme_bytes   : i64 = terminal_bytes + 8 + length_bytes
 
   #[inline]
-  def encode_terminal ((t, (i, j)): (terminal, (idx.t, idx.t))) : [lexeme_bytes]u8 =
+  def encode_terminal ((t, (i, j)): (terminal, (idx.t, len.t))) : [lexeme_bytes]u8 =
     sized lexeme_bytes (encode_le terminal_bytes (u64.i64 (T.to_i64 t))
                         ++ encode_u64 (u64.i64 (idx.to_i64 i))
-                        ++ encode_u64 (u64.i64 (idx.to_i64 j)))
+                        ++ encode_le length_bytes (u64.i64 (len.to_i64 j)))
 
   #[inline]
-  def encode_terminals [n] (ts: opt ([n](terminal, (idx.t, idx.t)))) : []u8 =
+  def encode_terminals [n] (ts: opt ([n](terminal, (idx.t, len.t)))) : []u8 =
     match ts
     case #some ts' ->
       [u8.bool true]
@@ -136,7 +138,7 @@ module lexer_parser_test
   (P: {
     type terminal_int
     type production_int
-    val parse_int [n] : [n]u8 -> opt ( [](terminal_int, (idx.t, idx.t))
+    val parse_int [n] : [n]u8 -> opt ( [](terminal_int, (idx.t, len.t))
                                      , [](production_int, idx.t)
                                      , []idx.t
                                      )
@@ -146,30 +148,31 @@ module lexer_parser_test
   type terminal = P.terminal_int
   type production = P.production_int
 
-  def terminal_bytes : i64 = i64.i32 T.num_bits / 8
-  def production_bytes : i64 = i64.i32 Q.num_bits / 8
+  def terminal_bytes  : i64 = i64.i32 T.num_bits / 8
+  def production_bytes: i64 = i64.i32 Q.num_bits / 8
+  def length_bytes    : i64 = i64.i32 len.num_bits / 8
 
   #[inline]
   def encode_idx (i: idx.t) : [8]u8 =
     encode_u64 (u64.i64 (idx.to_i64 i))
 
   -- SoA response record: u8 valid; u64 num_tokens; token ids, starts,
-  -- ends; u64 num_nodes; production ids, parents; token parents.
+  -- lengths; u64 num_nodes; production ids, parents; token parents.
   #[inline]
-  def encode_result (r: opt ( [](terminal, (idx.t, idx.t))
+  def encode_result (r: opt ( [](terminal, (idx.t, len.t))
                             , [](production, idx.t)
                             , []idx.t
                             )) : []u8 =
     match r
     case #some (tokens, tree, token_parents) ->
       let (ts, spans) = unzip tokens
-      let (starts, ends) = unzip spans
+      let (starts, lengths) = unzip spans
       let (prods, parents) = unzip tree
       in [u8.bool true]
          ++ encode_u64 (u64.i64 (length tokens))
          ++ flatten (map (encode_le terminal_bytes <-< u64.i64 <-< T.to_i64) ts)
          ++ flatten (map encode_idx starts)
-         ++ flatten (map encode_idx ends)
+         ++ flatten (map (encode_le length_bytes <-< u64.i64 <-< len.to_i64) lengths)
          ++ encode_u64 (u64.i64 (length tree))
          ++ flatten (map (encode_le production_bytes <-< u64.i64 <-< Q.to_i64) prods)
          ++ flatten (map encode_idx parents)

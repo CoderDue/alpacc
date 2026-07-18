@@ -14,7 +14,7 @@ import Alpacc.Parser.LLP
 import Alpacc.Lexer.DFA
 import Alpacc.Lexer.FSA
 import Alpacc.Lexer.RegularExpression
-import Alpacc.Test.Lexer (TestMode (..), decodeWith, getUInt, putUInt, randomSeed)
+import Alpacc.Test.Lexer (TestMode (..), cfgLengthType, decodeWith, getUInt, putUInt, randomSeed)
 import Alpacc.Types
 import Alpacc.Util
 import Codec.Binary.UTF8.String (encodeChar)
@@ -75,24 +75,24 @@ newtype Input = Input ByteString deriving (Show)
 newtype Inputs = Inputs [Input] deriving (Show)
 
 -- | Wire order of a combined response record (SoA sections):
--- u64 num_tokens; token ids (terminal_t); starts (index_t); ends (index_t);
+-- u64 num_tokens; token ids (terminal_t); starts (index_t); lengths (length_t);
 -- u64 num_nodes; production ids (production_t); parents (index_t);
 -- token parents (index_t, one per token).
-putOutput :: UInt -> UInt -> Output -> Put
-putOutput _ _ (Output Nothing) = putWord8 0
-putOutput tw pw (Output (Just (CombinedResult toks tree))) = do
+putOutput :: UInt -> UInt -> UInt -> Output -> Put
+putOutput _ _ _ (Output Nothing) = putWord8 0
+putOutput tw pw lw (Output (Just (CombinedResult toks tree))) = do
   putWord8 1
   putWord64le (fromIntegral $ length toks)
   mapM_ (putUInt tw . token) toks
   mapM_ (putWord64le . fst . span) toks
-  mapM_ (putWord64le . snd . span) toks
+  mapM_ (\lx -> putUInt lw (snd (span lx) - fst (span lx))) toks
   putWord64le (fromIntegral $ Seq.length $ flatProductions tree)
   mapM_ (putUInt pw) (flatProductions tree)
   mapM_ putWord64le (flatParents tree)
   mapM_ putWord64le (flatTokenParents tree)
 
-getOutput :: UInt -> UInt -> Get Output
-getOutput tw pw = do
+getOutput :: UInt -> UInt -> UInt -> Get Output
+getOutput tw pw lw = do
   is_valid <- getWord8
   if is_valid == 1
     then do
@@ -100,13 +100,13 @@ getOutput tw pw = do
       let nt = fromIntegral num_tokens
       ids <- replicateM nt (getUInt tw)
       starts <- replicateM nt getWord64le
-      ends <- replicateM nt getWord64le
+      lens <- replicateM nt (getUInt lw)
       num_nodes <- getWord64le
       let nn = fromIntegral num_nodes
       prods <- replicateM nn (getUInt pw)
       parents <- replicateM nn getWord64le
       token_parents <- replicateM nt getWord64le
-      let toks = zipWith3 (\t i j -> Lexeme t (i, j)) ids starts ends
+      let toks = zipWith3 (\t i l -> Lexeme t (i, i + l)) ids starts lens
           tree =
             FlatTree
               { flatProductions = Seq.fromList prods,
@@ -141,15 +141,15 @@ getInputs = do
   i <- getWord64le
   Inputs <$> replicateM (fromIntegral i) getInput
 
-putOutputs :: UInt -> UInt -> Outputs -> Put
-putOutputs tw pw (Outputs results) = do
+putOutputs :: UInt -> UInt -> UInt -> Outputs -> Put
+putOutputs tw pw lw (Outputs results) = do
   putWord64le (fromIntegral $ length results)
-  mapM_ (putOutput tw pw) results
+  mapM_ (putOutput tw pw lw) results
 
-getOutputs :: UInt -> UInt -> Get Outputs
-getOutputs tw pw = do
+getOutputs :: UInt -> UInt -> UInt -> Get Outputs
+getOutputs tw pw lw = do
   i <- getWord64le
-  Outputs <$> replicateM (fromIntegral i) (getOutput tw pw)
+  Outputs <$> replicateM (fromIntegral i) (getOutput tw pw lw)
 
 parse :: CFG -> Int -> Int -> Text -> Either Text (Maybe CombinedResult)
 parse cfg q k str = do
@@ -485,6 +485,7 @@ lexerParserTests :: TestMode -> CFG -> Int -> Bool -> Either Text (LBS.ByteStrin
 lexerParserTests mode cfg n noOutputs = do
   let q = paramsLookback $ cfgParams cfg
       k = paramsLookahead $ cfgParams cfg
+      lw = cfgLengthType cfg
   spec <- cfgToDFALexerSpec cfg
   grammar <- cfgToGrammar cfg
   table <- llpParserTableWithStarts q k $ getGrammar grammar
@@ -501,7 +502,7 @@ lexerParserTests mode cfg n noOutputs = do
       let comb = listProducts n $ Set.toList alpha
           inp  = toInputs comb
           out  = if noOutputs then Outputs [] else toOutputs q k encoder dfa maybe_ignore (getGrammar grammar) table comb
-      pure (runPut $ putInputs inp, runPut $ putOutputs tw pw out)
+      pure (runPut $ putInputs inp, runPut $ putOutputs tw pw lw out)
     SingleLong ->
       Left "SingleLong mode must be handled via lexerParserTestsSingleLong"
   where
@@ -522,7 +523,7 @@ lexerParserTests mode cfg n noOutputs = do
 -- end).  They live next to the .outputs file and are removed afterwards.
 data SectionFiles = SectionFiles
   { secStarts :: Handle,
-    secEnds :: Handle,
+    secLengths :: Handle,
     secProds :: Handle,
     secParents :: Handle,
     secTokenParents :: Handle
@@ -576,6 +577,7 @@ lexerParserTestsSingleLong cfg n h mOut = do
           Right pw ->
             let ignore = T "ignore"
                 encoder = fromSymbolToTerminalEncoder $ encodeSymbols ignore grammar
+                lw = cfgLengthType cfg
              in case terminalIntType encoder of
                   Left e -> pure (Left e)
                   Right tw -> do
@@ -614,7 +616,7 @@ lexerParserTestsSingleLong cfg n h mOut = do
                           let pushTok (Lexeme t m@(i, j)) = do
                                 LBS.hPut outH (runPut (putUInt tw (encTok t)))
                                 LBS.hPut (secStarts sections) (runPut (putWord64le i))
-                                LBS.hPut (secEnds sections) (runPut (putWord64le j))
+                                LBS.hPut (secLengths sections) (runPut (putUInt lw (j - i)))
                                 stepFn (AugmentedTerminal (Used t), m)
                           mLex <- tokenizeWithBS dfa maybe_ignore payload pushTok
                           mCounts <- case mLex of
@@ -627,7 +629,7 @@ lexerParserTestsSingleLong cfg n h mOut = do
                               LBS.hPut outH (runPut $ putWord64le (pushTokenParents counts))
                               hSeek outH SeekFromEnd 0
                               copySection (secStarts sections) outH
-                              copySection (secEnds sections) outH
+                              copySection (secLengths sections) outH
                               LBS.hPut outH (runPut $ putWord64le (pushTreeNodes counts))
                               copySection (secProds sections) outH
                               copySection (secParents sections) outH
@@ -645,10 +647,11 @@ lexerParserTestsCompare cfg input expected result = do
           [ (fromIntegral i :: Word64, t)
           | (i, Used t) <- zip [0 :: Integer ..] (toTerminals encoder)
           ]
+      lw = cfgLengthType cfg
   tw <- terminalIntType encoder
   Inputs inp <- decodeWith "Error: Could not parse input file." getInputs input
-  Outputs ex <- decodeWith "Error: Could not parse expected output file." (getOutputs tw pw) expected
-  Outputs res <- decodeWith "Error: Could not parse result output file." (getOutputs tw pw) result
+  Outputs ex <- decodeWith "Error: Could not parse expected output file." (getOutputs tw pw lw) expected
+  Outputs res <- decodeWith "Error: Could not parse result output file." (getOutputs tw pw lw) result
   failwith (length inp == length ex) "Error: Input and expected output file do not have the same number of tests."
   failwith (length inp == length res) "Error: Input and result output file do not have the same number of tests."
 

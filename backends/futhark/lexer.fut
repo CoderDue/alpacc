@@ -31,8 +31,8 @@ module type lexer_context = {
 module type lexer = {
   type terminal_int
   type terminal
-  val lex_int [n] : [n]u8 -> opt ([](terminal_int, (idx.t, idx.t)))
-  val lex [n] : [n]u8 -> opt ([](terminal, (idx.t, idx.t)))
+  val lex_int [n] : [n]u8 -> opt ([](terminal_int, (idx.t, len.t)))
+  val lex [n] : [n]u8 -> opt ([](terminal, (idx.t, len.t)))
 }
 
 module mk_lexer (L: lexer_context)
@@ -98,8 +98,8 @@ module mk_lexer (L: lexer_context)
                (prev_state: state)
                (prev_start: idx.t)
                (prev_size: idx.t)
-               (dest: *[m](terminal_int, (idx.t, idx.t)))
-               (str: [n]u8) : ?[k].( [k](terminal_int, (idx.t, idx.t))
+               (dest: *[m](terminal_int, (idx.t, len.t)))
+               (str: [n]u8) : ?[k].( [k](terminal_int, (idx.t, len.t))
                                    , state
                                    , idx.t
                                    , idx.t
@@ -126,13 +126,20 @@ module mk_lexer (L: lexer_context)
                     then prev_start - offset
                     else idx.lowest)
       |> scan idx.max idx.lowest
-    let ends = map idx.i64 (iota n)
     -- Globalise spans here, before the scatter: mapping the scatter result
     -- instead would re-add this chunk's offset to tokens already emitted by
     -- earlier chunks.
+    -- Length = (end_exclusive) - start = (i + 1) - starts[i]; starts[i] is
+    -- the index of the produce boundary, so this is always >= 1.
+    -- Non-boundary positions (starts[i] == idx.lowest) get length 0 as a
+    -- placeholder; they are never written by the scatter (offsets[i] == -1).
     let vs =
-      zip (map to_terminal states) (zip starts ends)
-      |> map (\(t, (s, e)) -> (t, (s + offset, idx.i64 1 + e + offset)))
+      zip (map to_terminal states) starts
+      |> map2 (\i (t, s) ->
+                 let l = if s == idx.lowest
+                         then len.i64 0
+                         else len.i64 (i + 1 - idx.to_i64 s)
+                 in (t, (s + offset, l))) (iota n)
     let size = last is
     let extra_size = idx.to_i64 prev_size + size + 1
     let dest =
@@ -160,11 +167,11 @@ module mk_lexer (L: lexer_context)
        )
 
   def lex_int_flag [n]
-                   (str: [n]u8) : (bool, [](terminal_int, (idx.t, idx.t))) =
+                   (str: [n]u8) : (bool, [](terminal_int, (idx.t, len.t))) =
     let chunk_size = idx.i64 chunk_size
     let (result, state, start, size) =
       loop (dest, state, start, size) =
-             ( [(L.terminal_int_module.u8 0, (idx.i64 0, idx.i64 0))]
+             ( [(L.terminal_int_module.u8 0, (idx.i64 0, len.i64 0))]
              , L.identity_state
              , idx.i64 0
              , idx.i64 0
@@ -180,7 +187,7 @@ module mk_lexer (L: lexer_context)
       if is_ignore last_terminal
       then (result, size)
       else ( result with [idx.to_i64 size] = ( to_terminal state
-                                              , (start, idx.i64 n)
+                                              , (start, len.i64 (n - idx.to_i64 start))
                                               )
            , size + idx.i64 1
            )
@@ -189,12 +196,12 @@ module mk_lexer (L: lexer_context)
        else (false, [])
 
   def lex_int [n]
-              (str: [n]u8) : opt ([](terminal_int, (idx.t, idx.t))) =
+              (str: [n]u8) : opt ([](terminal_int, (idx.t, len.t))) =
     let (is_valid, result) = lex_int_flag str
     in if is_valid then #some result else #none
 
   def lex [n]
-          (str: [n]u8) : opt ([](terminal, (idx.t, idx.t))) =
+          (str: [n]u8) : opt ([](terminal, (idx.t, len.t))) =
     let (is_valid, result) = lex_int_flag str
     in if is_valid
        then #some (map (\(t, s) ->

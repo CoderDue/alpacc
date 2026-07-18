@@ -19,6 +19,14 @@ futharkTest = $(embedStringFile "backends/futhark/test.fut")
 idxModule :: Bool -> Text
 idxModule index32 = "module idx = " <> if index32 then "i32" else "i64"
 
+lenModule :: Bool -> Maybe UInt -> Text
+lenModule index32 mLenType = "module len = " <> case mLenType of
+  Nothing  -> if index32 then "u32" else "u64"
+  Just U8  -> "u8"
+  Just U16 -> "u16"
+  Just U32 -> "u32"
+  Just U64 -> "u64"
+
 bothFunction :: UInt -> UInt -> Text
 bothFunction terminal_type production_type =
   Text.strip $
@@ -35,7 +43,7 @@ entry parse s =
     match res
     case #some r -> r
     case #none -> ([], map (const (idx.i64 0)) tokens)
-  let result : opt ( [](parser.terminal_int, (idx.t, idx.t))
+  let result : opt ( [](parser.terminal_int, (idx.t, len.t))
                    , [](parser.production, idx.t)
                    , []idx.t
                    ) =
@@ -55,7 +63,7 @@ entry parse_int s =
     match res
     case #some r -> r
     case #none -> ([], map (const (idx.i64 0)) tokens)
-  let result : opt ( [](parser.terminal_int, (idx.t, idx.t))
+  let result : opt ( [](parser.terminal_int, (idx.t, len.t))
                    , [](parser.production_int, idx.t)
                    , []idx.t
                    ) =
@@ -83,15 +91,15 @@ module tester = lexer_test lexer #{futharkify terminal_type}
 entry lex s =
   match lexer.lex s
   case #some r -> let (tokens, spans) = unzip r
-                  let (starts, ends) = unzip spans
-                  in (tokens, starts, ends)
+                  let (starts, lengths) = unzip spans
+                  in (tokens, starts, lengths)
   case #none -> ([], [], [])
 
 entry lex_int s =
   match lexer.lex_int s
   case #some r -> let (tokens, spans) = unzip r
-                  let (starts, ends) = unzip spans
-                  in (tokens, starts, ends)
+                  let (starts, lengths) = unzip spans
+                  in (tokens, starts, lengths)
   case #none -> ([], [], [])
 
 
@@ -134,13 +142,14 @@ terminalDefinitions names =
       terminalIntToName names
     ]
 
-auxiliary :: Bool -> Analyzer [Text] -> Text
-auxiliary index32 analyzer =
+auxiliary :: Bool -> Maybe UInt -> Analyzer [Text] -> Text
+auxiliary index32 mLenType analyzer =
   case analyzerKind analyzer of
     Lex lexer ->
       Text.unlines
         [ Text.unlines (("-- " <>) <$> meta analyzer),
           idxModule index32,
+          lenModule index32 mLenType,
           terminalDefinitions terminal_names,
           Lexer.generateLexer terminal_type lexer,
           futharkTest,
@@ -150,6 +159,7 @@ auxiliary index32 analyzer =
       Text.unlines
         [ Text.unlines (("-- " <>) <$> meta analyzer),
           idxModule index32,
+          lenModule index32 mLenType,
           terminalDefinitions terminal_names,
           Parser.generateParser terminal_type parser,
           futharkTest,
@@ -159,6 +169,7 @@ auxiliary index32 analyzer =
       Text.unlines
         [ Text.unlines (("-- " <>) <$> meta analyzer),
           idxModule index32,
+          lenModule index32 mLenType,
           terminalDefinitions terminal_names,
           Lexer.generateLexer terminal_type lexer,
           Parser.generateParser terminal_type parser,
@@ -169,8 +180,8 @@ auxiliary index32 analyzer =
     terminal_type = terminalType analyzer
     terminal_names = ("#" <>) <$> terminalToName analyzer
 
-generator :: Bool -> Generator [Text]
-generator index32 =
+generator :: Bool -> Maybe UInt -> Generator [Text]
+generator index32 mLenType =
   Generator
-    { generate = auxiliary index32
+    { generate = auxiliary index32 mLenType
     }

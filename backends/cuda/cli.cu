@@ -243,24 +243,24 @@ template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
 static bool lex_one(const uint8_t* bytes, uint64_t n,
                     std::vector<terminal_t>& toks,
                     std::vector<index_t>& starts,
-                    std::vector<index_t>& ends) {
-    toks.clear(); starts.clear(); ends.clear();
+                    std::vector<length_t>& lengths) {
+    toks.clear(); starts.clear(); lengths.clear();
     if (n == 0) return true;
 
     uint8_t*    d_str = nullptr;
     terminal_t* d_tok = nullptr;
     index_t*    d_s   = nullptr;
-    index_t*    d_e   = nullptr;
+    length_t*   d_l   = nullptr;
     gpuAssert(cudaMalloc(&d_str, n));
     gpuAssert(cudaMalloc(&d_tok, n * sizeof(terminal_t)));
     gpuAssert(cudaMalloc(&d_s,   n * sizeof(index_t)));
-    gpuAssert(cudaMalloc(&d_e,   n * sizeof(index_t)));
+    gpuAssert(cudaMalloc(&d_l,   n * sizeof(length_t)));
     gpuAssert(cudaMemcpy(d_str, bytes, n, cudaMemcpyHostToDevice));
 
     LexerCtx<uint32_t, index_t> ctx((uint32_t)n, BLOCK_SIZE, ITEMS_PER_THREAD);
     const uint32_t nblocks = numBlocks((uint32_t)n, BLOCK_SIZE, ITEMS_PER_THREAD);
     lexer<uint32_t, index_t, BLOCK_SIZE, ITEMS_PER_THREAD>
-        <<<nblocks, BLOCK_SIZE>>>(ctx, d_str, d_tok, d_s, d_e, (uint32_t)n, true);
+        <<<nblocks, BLOCK_SIZE>>>(ctx, d_str, d_tok, d_s, d_l, (uint32_t)n, true);
     gpuAssert(cudaDeviceSynchronize());
     gpuAssert(cudaPeekAtLastError());
     const bool     valid   = ctx.isAccept();
@@ -270,12 +270,12 @@ static bool lex_one(const uint8_t* bytes, uint64_t n,
     if (valid && num_lex > 0) {
         toks.resize(num_lex);
         starts.resize(num_lex);
-        ends.resize(num_lex);
-        gpuAssert(cudaMemcpy(toks.data(),   d_tok, num_lex * sizeof(terminal_t), cudaMemcpyDeviceToHost));
-        gpuAssert(cudaMemcpy(starts.data(), d_s,   num_lex * sizeof(index_t),    cudaMemcpyDeviceToHost));
-        gpuAssert(cudaMemcpy(ends.data(),   d_e,   num_lex * sizeof(index_t),    cudaMemcpyDeviceToHost));
+        lengths.resize(num_lex);
+        gpuAssert(cudaMemcpy(toks.data(),    d_tok, num_lex * sizeof(terminal_t), cudaMemcpyDeviceToHost));
+        gpuAssert(cudaMemcpy(starts.data(),  d_s,   num_lex * sizeof(index_t),    cudaMemcpyDeviceToHost));
+        gpuAssert(cudaMemcpy(lengths.data(), d_l,   num_lex * sizeof(length_t),   cudaMemcpyDeviceToHost));
     }
-    cudaFree(d_str); cudaFree(d_tok); cudaFree(d_s); cudaFree(d_e);
+    cudaFree(d_str); cudaFree(d_tok); cudaFree(d_s); cudaFree(d_l);
     return valid;
 }
 
@@ -285,8 +285,9 @@ static bool lex_one(const uint8_t* bytes, uint64_t n,
 template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
 static void run_one_lexer_test(const uint8_t* bytes, uint64_t n, FILE* out) {
     std::vector<terminal_t> toks;
-    std::vector<index_t>    starts, ends;
-    if (!lex_one<BLOCK_SIZE, ITEMS_PER_THREAD>(bytes, n, toks, starts, ends)) {
+    std::vector<index_t>    starts;
+    std::vector<length_t>   lengths;
+    if (!lex_one<BLOCK_SIZE, ITEMS_PER_THREAD>(bytes, n, toks, starts, lengths)) {
         fputc(0, out);
         return;
     }
@@ -295,7 +296,7 @@ static void run_one_lexer_test(const uint8_t* bytes, uint64_t n, FILE* out) {
     for (size_t i = 0; i < toks.size(); i++) {
         write_val(out, toks[i]);
         write_val(out, starts[i]);
-        write_val(out, ends[i]);
+        write_val(out, lengths[i]);
     }
 }
 
@@ -410,11 +411,11 @@ static int lexer_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
         uint8_t*    d_str = nullptr;
         terminal_t* d_tok = nullptr;
         index_t*    d_s   = nullptr;
-        index_t*    d_e   = nullptr;
+        length_t*   d_l   = nullptr;
         gpuAssert(cudaMalloc(&d_str, n ? n : 1));
         gpuAssert(cudaMalloc(&d_tok, n * sizeof(terminal_t)));
         gpuAssert(cudaMalloc(&d_s,   n * sizeof(index_t)));
-        gpuAssert(cudaMalloc(&d_e,   n * sizeof(index_t)));
+        gpuAssert(cudaMalloc(&d_l,   n * sizeof(length_t)));
         gpuAssert(cudaMemcpy(d_str, data, n, cudaMemcpyHostToDevice));
 
         std::vector<terminal_t> h_tok(n);
@@ -426,7 +427,7 @@ static int lexer_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
         for (uint32_t i = 0; i < num_warmup; i++) {
             ctx.reset();
             lexer<uint32_t, index_t, BLOCK_SIZE, ITEMS_PER_THREAD>
-                <<<nblocks, BLOCK_SIZE>>>(ctx, d_str, d_tok, d_s, d_e, (uint32_t)n, false);
+                <<<nblocks, BLOCK_SIZE>>>(ctx, d_str, d_tok, d_s, d_l, (uint32_t)n, false);
             gpuAssert(cudaDeviceSynchronize());
         }
         // Token count is stable for a fixed input; read after warmup.
@@ -438,7 +439,7 @@ static int lexer_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
             ctx.reset();
             gpuAssert(cudaEventRecord(ev0));
             lexer<uint32_t, index_t, BLOCK_SIZE, ITEMS_PER_THREAD>
-                <<<nblocks, BLOCK_SIZE>>>(ctx, d_str, d_tok, d_s, d_e, (uint32_t)n, false);
+                <<<nblocks, BLOCK_SIZE>>>(ctx, d_str, d_tok, d_s, d_l, (uint32_t)n, false);
             gpuAssert(cudaEventRecord(ev1));
             gpuAssert(cudaEventSynchronize(ev1));
             gpuAssert(cudaEventElapsedTime(&times_ms[i], ev0, ev1));
@@ -451,7 +452,7 @@ static int lexer_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
             gpuAssert(cudaEventRecord(ev0));
             gpuAssert(cudaMemcpyAsync(d_str, data, n, cudaMemcpyHostToDevice));
             lexer<uint32_t, index_t, BLOCK_SIZE, ITEMS_PER_THREAD>
-                <<<nblocks, BLOCK_SIZE>>>(ctx, d_str, d_tok, d_s, d_e, (uint32_t)n, false);
+                <<<nblocks, BLOCK_SIZE>>>(ctx, d_str, d_tok, d_s, d_l, (uint32_t)n, false);
             gpuAssert(cudaMemcpyAsync(h_tok.data(), d_tok, n * sizeof(terminal_t), cudaMemcpyDeviceToHost));
             gpuAssert(cudaEventRecord(ev1));
             gpuAssert(cudaEventSynchronize(ev1));
@@ -459,22 +460,19 @@ static int lexer_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
         }
 
         ctx.cleanUp();
-        cudaFree(d_str); cudaFree(d_tok); cudaFree(d_s); cudaFree(d_e);
+        cudaFree(d_str); cudaFree(d_tok); cudaFree(d_s); cudaFree(d_l);
 
         // Total estimated DRAM traffic per kernel run:
         //   reads:  n bytes (d_string)
-        //   writes: num_tok × (terminal_t + 2×index_t) bytes (d_terminals, d_starts, d_ends)
-        //   scan lookback (d_state_states + d_maxadd_states): 2 × num_tiles ×
-        //     (sizeof(state_t) + sizeof(uint64_t) + 1) bytes — negligible vs payload
-        // The shmem states[] array (n × sizeof(state_t) total) is shared memory,
-        // not DRAM, and is not counted here.
+        //   writes: num_tok × (terminal_t + index_t + length_t) bytes
+        //   scan lookback arrays: negligible vs payload
         uint32_t num_tiles = numBlocks((uint32_t)n, BLOCK_SIZE, ITEMS_PER_THREAD);
         size_t scan_bytes = 2 * (size_t)num_tiles *
-            (sizeof(state_t) + sizeof(state_t) +  // aggregates + prefixes (state scan)
-             sizeof(uint64_t) + sizeof(uint64_t) + // aggregates + prefixes (maxadd scan)
-             2);                                    // statuses (1 byte each, two scans)
+            (sizeof(state_t) + sizeof(state_t) +
+             sizeof(uint64_t) + sizeof(uint64_t) +
+             2);
         size_t dram_bytes = n
-            + (size_t)num_tok * (sizeof(terminal_t) + 2 * sizeof(index_t))
+            + (size_t)num_tok * (sizeof(terminal_t) + sizeof(index_t) + sizeof(length_t))
             + scan_bytes;
 
         auto print_stats = [&](const char* label, std::vector<float>& tms, size_t traffic) {
@@ -727,7 +725,7 @@ static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
 //
 // Frame payload: n raw bytes.  Response record (SoA sections): u8 valid;
 // if valid: u64 num_tokens; num_tokens × terminal_t token ids;
-// num_tokens × index_t starts; num_tokens × index_t ends; u64 num_nodes;
+// num_tokens × index_t starts; num_tokens × length_t lengths; u64 num_nodes;
 // num_nodes × production_t production ids; num_nodes × index_t parents;
 // num_tokens × index_t token parents.
 // Same format as the generated C backend's combined mode.
@@ -737,7 +735,8 @@ static int parser_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
 
 struct BothResult {
     std::vector<terminal_t> toks;
-    std::vector<index_t>    starts, ends;
+    std::vector<index_t>    starts;
+    std::vector<length_t>   lengths;
     BothTree                tree;
 };
 
@@ -749,20 +748,20 @@ static bool both_one(const uint8_t* bytes, uint64_t n, BothResult& res) {
     uint8_t*    d_string    = nullptr;
     terminal_t* d_terminals = nullptr;
     index_t*    d_starts    = nullptr;
-    index_t*    d_ends      = nullptr;
+    length_t*   d_lengths   = nullptr;
 
     if (n > 0) {
         gpuAssert(cudaMalloc(&d_string,    n * sizeof(uint8_t)));
         gpuAssert(cudaMalloc(&d_terminals, n * sizeof(terminal_t)));
         gpuAssert(cudaMalloc(&d_starts,    n * sizeof(index_t)));
-        gpuAssert(cudaMalloc(&d_ends,      n * sizeof(index_t)));
+        gpuAssert(cudaMalloc(&d_lengths,   n * sizeof(length_t)));
         gpuAssert(cudaMemcpy(d_string, bytes, n, cudaMemcpyHostToDevice));
 
         // Single-chunk launch on a fresh context (no streaming carry-over).
         LexerCtx<uint32_t, index_t> ctx((uint32_t)n, BLOCK_SIZE, ITEMS_PER_THREAD);
         const uint32_t num_blocks = numBlocks((uint32_t)n, BLOCK_SIZE, ITEMS_PER_THREAD);
         lexer<uint32_t, index_t, BLOCK_SIZE, ITEMS_PER_THREAD><<<num_blocks, BLOCK_SIZE>>>(
-            ctx, d_string, d_terminals, d_starts, d_ends, (uint32_t)n, true);
+            ctx, d_string, d_terminals, d_starts, d_lengths, (uint32_t)n, true);
         gpuAssert(cudaDeviceSynchronize());
         gpuAssert(cudaPeekAtLastError());
         num_lex = ctx.terminalsSize();
@@ -773,10 +772,10 @@ static bool both_one(const uint8_t* bytes, uint64_t n, BothResult& res) {
     if (valid && num_lex > 0) {
         res.toks.resize(num_lex);
         res.starts.resize(num_lex);
-        res.ends.resize(num_lex);
-        gpuAssert(cudaMemcpy(res.toks.data(),   d_terminals, num_lex * sizeof(terminal_t), cudaMemcpyDeviceToHost));
-        gpuAssert(cudaMemcpy(res.starts.data(), d_starts,    num_lex * sizeof(index_t),    cudaMemcpyDeviceToHost));
-        gpuAssert(cudaMemcpy(res.ends.data(),   d_ends,      num_lex * sizeof(index_t),    cudaMemcpyDeviceToHost));
+        res.lengths.resize(num_lex);
+        gpuAssert(cudaMemcpy(res.toks.data(),    d_terminals, num_lex * sizeof(terminal_t), cudaMemcpyDeviceToHost));
+        gpuAssert(cudaMemcpy(res.starts.data(),  d_starts,    num_lex * sizeof(index_t),    cudaMemcpyDeviceToHost));
+        gpuAssert(cudaMemcpy(res.lengths.data(), d_lengths,   num_lex * sizeof(length_t),   cudaMemcpyDeviceToHost));
     }
 
     if (valid) {
@@ -794,7 +793,7 @@ static bool both_one(const uint8_t* bytes, uint64_t n, BothResult& res) {
     if (d_string)    cudaFree(d_string);
     if (d_terminals) cudaFree(d_terminals);
     if (d_starts)    cudaFree(d_starts);
-    if (d_ends)      cudaFree(d_ends);
+    if (d_lengths)   cudaFree(d_lengths);
     return valid;
 }
 
@@ -807,9 +806,9 @@ static void run_one_both_test(const uint8_t* bytes, uint64_t n, FILE* out) {
     }
     fputc(1, out);
     write_u64_le(out, (uint64_t)res.toks.size());
-    fwrite(res.toks.data(),   sizeof(terminal_t), res.toks.size(),   out);
-    fwrite(res.starts.data(), sizeof(index_t),    res.starts.size(), out);
-    fwrite(res.ends.data(),   sizeof(index_t),    res.ends.size(),   out);
+    fwrite(res.toks.data(),     sizeof(terminal_t), res.toks.size(),     out);
+    fwrite(res.starts.data(),   sizeof(index_t),    res.starts.size(),   out);
+    fwrite(res.lengths.data(),  sizeof(length_t),   res.lengths.size(),  out);
     write_u64_le(out, (uint64_t)res.tree.prods.size());
     fwrite(res.tree.prods.data(),         sizeof(production_t), res.tree.prods.size(),         out);
     fwrite(res.tree.parents.data(),       sizeof(index_t),      res.tree.parents.size(),       out);
@@ -918,18 +917,18 @@ static int both_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
         uint8_t*    d_string    = nullptr;
         terminal_t* d_terminals = nullptr;
         index_t*    d_starts    = nullptr;
-        index_t*    d_ends      = nullptr;
+        length_t*   d_lengths   = nullptr;
         gpuAssert(cudaMalloc(&d_string,    n * sizeof(uint8_t)));
         gpuAssert(cudaMalloc(&d_terminals, n * sizeof(terminal_t)));
         gpuAssert(cudaMalloc(&d_starts,    n * sizeof(index_t)));
-        gpuAssert(cudaMalloc(&d_ends,      n * sizeof(index_t)));
+        gpuAssert(cudaMalloc(&d_lengths,   n * sizeof(length_t)));
         gpuAssert(cudaMemcpy(d_string, data, n, cudaMemcpyHostToDevice));
 
         const uint32_t nblocks = numBlocks((uint32_t)n, BLOCK_SIZE, ITEMS_PER_THREAD);
         LexerCtx<uint32_t, index_t> ctx((uint32_t)n, BLOCK_SIZE, ITEMS_PER_THREAD);
 
         lexer<uint32_t, index_t, BLOCK_SIZE, ITEMS_PER_THREAD>
-            <<<nblocks, BLOCK_SIZE>>>(ctx, d_string, d_terminals, d_starts, d_ends, (uint32_t)n, true);
+            <<<nblocks, BLOCK_SIZE>>>(ctx, d_string, d_terminals, d_starts, d_lengths, (uint32_t)n, true);
         gpuAssert(cudaDeviceSynchronize());
         gpuAssert(cudaPeekAtLastError());
         uint32_t num_lex = ctx.terminalsSize();
@@ -941,7 +940,7 @@ static int both_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
             (uint64_t)m * (uint64_t)MAX_PRODS_PER_POSITION    > (uint64_t)INT_MAX) {
             fprintf(stderr, "error: benchmark input is not lexable (or exceeds capacity)\n");
             ctx.cleanUp();
-            cudaFree(d_string); cudaFree(d_terminals); cudaFree(d_starts); cudaFree(d_ends);
+            cudaFree(d_string); cudaFree(d_terminals); cudaFree(d_starts); cudaFree(d_lengths);
             ret = 1;
             continue;
         }
@@ -959,7 +958,7 @@ static int both_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
         auto run_pipeline = [&]() {
             ctx.reset();
             lexer<uint32_t, index_t, BLOCK_SIZE, ITEMS_PER_THREAD>
-                <<<nblocks, BLOCK_SIZE>>>(ctx, d_string, d_terminals, d_starts, d_ends, (uint32_t)n, true);
+                <<<nblocks, BLOCK_SIZE>>>(ctx, d_string, d_terminals, d_starts, d_lengths, (uint32_t)n, true);
             gpuAssert(cudaMemcpyAsync(pf.d_arr + 1, d_terminals,
                                       (size_t)num_lex * sizeof(terminal_t), cudaMemcpyDeviceToDevice));
             launchParserFused(pf, m);
@@ -978,7 +977,8 @@ static int both_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
         gpuAssert(cudaMemcpy(totals, pf.bufs.d_totals, 2 * sizeof(index_t), cudaMemcpyDeviceToHost));
         const index_t nt = totals[1] - (index_t)num_lex;
         std::vector<terminal_t>   h_toks(num_lex);
-        std::vector<index_t>      h_starts(num_lex), h_ends(num_lex), h_tparents(num_lex);
+        std::vector<index_t>      h_starts(num_lex), h_tparents(num_lex);
+        std::vector<length_t>     h_lengths(num_lex);
         std::vector<production_t> h_prods((size_t)nt);
         std::vector<index_t>      h_parents((size_t)nt);
 
@@ -1000,9 +1000,9 @@ static int both_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
             gpuAssert(cudaEventRecord(ev0));
             gpuAssert(cudaMemcpyAsync(d_string, data, n, cudaMemcpyHostToDevice));
             run_pipeline();
-            gpuAssert(cudaMemcpyAsync(h_toks.data(),   d_terminals, num_lex * sizeof(terminal_t), cudaMemcpyDeviceToHost));
-            gpuAssert(cudaMemcpyAsync(h_starts.data(), d_starts,    num_lex * sizeof(index_t),    cudaMemcpyDeviceToHost));
-            gpuAssert(cudaMemcpyAsync(h_ends.data(),   d_ends,      num_lex * sizeof(index_t),    cudaMemcpyDeviceToHost));
+            gpuAssert(cudaMemcpyAsync(h_toks.data(),    d_terminals, num_lex * sizeof(terminal_t), cudaMemcpyDeviceToHost));
+            gpuAssert(cudaMemcpyAsync(h_starts.data(),  d_starts,    num_lex * sizeof(index_t),    cudaMemcpyDeviceToHost));
+            gpuAssert(cudaMemcpyAsync(h_lengths.data(), d_lengths,   num_lex * sizeof(length_t),   cudaMemcpyDeviceToHost));
             if (nt > (index_t)0) {
                 gpuAssert(cudaMemcpyAsync(h_prods.data(),   pf.bufs.d_tree_prods,
                                           (size_t)nt * sizeof(production_t), cudaMemcpyDeviceToHost));
@@ -1028,7 +1028,7 @@ static int both_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
 
         freeParserFused(pf);
         ctx.cleanUp();
-        cudaFree(d_string); cudaFree(d_terminals); cudaFree(d_starts); cudaFree(d_ends);
+        cudaFree(d_string); cudaFree(d_terminals); cudaFree(d_starts); cudaFree(d_lengths);
 
         auto print_stats = [&](const char* label, std::vector<float>& tms) {
             double mean = 0, variance = 0, gbps = 0;

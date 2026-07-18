@@ -39,6 +39,7 @@ private:
   I* d_new_size;
   volatile J* d_new_last_start;
   volatile J* d_old_last_start;
+  volatile uint32_t* d_len_overflow;  // set to 1 by kernel on length_t overflow
 
   void swapLastStart() {
     J h_last_start;
@@ -91,6 +92,7 @@ public:
     gpuAssert(cudaMalloc((void**)&d_old_last_state, sizeof(state_t)));
     gpuAssert(cudaMalloc((void**)&d_new_last_start, sizeof(J)));
     gpuAssert(cudaMalloc((void**)&d_old_last_start, sizeof(J)));
+    gpuAssert(cudaMalloc((void**)&d_len_overflow, sizeof(uint32_t)));
 
     cudaMemset((void*)d_dyn_block_index, 0, sizeof(uint32_t));
     cudaMemset((void*)d_new_size, I(), sizeof(I));
@@ -98,6 +100,7 @@ public:
     cudaMemset((void*)d_old_last_state, IDENTITY, sizeof(state_t));
     cudaMemset((void*)d_new_last_start, J(), sizeof(J));
     cudaMemset((void*)d_old_last_start, J(), sizeof(J));
+    cudaMemset((void*)d_len_overflow, 0, sizeof(uint32_t));
   }
 
   void reset() {
@@ -108,6 +111,7 @@ public:
     cudaMemset((void*)d_old_last_state, IDENTITY, sizeof(state_t));
     cudaMemset((void*)d_new_last_start, 0, sizeof(J));
     cudaMemset((void*)d_old_last_start, 0, sizeof(J));
+    cudaMemset((void*)d_len_overflow, 0, sizeof(uint32_t));
     d_maxadd_states.reset();
     d_state_states.reset();
   }
@@ -121,6 +125,7 @@ public:
     if (d_new_size) cudaFree((void*)d_new_size);
     if (d_new_last_state) cudaFree((void*)d_new_last_state);
     if (d_old_last_state) cudaFree((void*)d_old_last_state);
+    if (d_len_overflow) cudaFree((void*)d_len_overflow);
     d_maxadd_states.cleanUp();
     d_state_states.cleanUp();
   }
@@ -187,10 +192,17 @@ public:
     return *d_old_last_start;
   }
 
+  __device__ __forceinline__
+  void signalLengthOverflow() const {
+    atomicOr((uint32_t*)d_len_overflow, 1u);
+  }
+
   bool isAccept() const {
     state_t h_last_state;
     gpuAssert(cudaMemcpy(&h_last_state, (const void*) d_new_last_state, sizeof(state_t), cudaMemcpyDeviceToHost));
-    return h_accept[get_index_cpu(h_last_state)];
+    uint32_t overflow = 0;
+    gpuAssert(cudaMemcpy(&overflow, (const void*) d_len_overflow, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    return overflow == 0 && h_accept[get_index_cpu(h_last_state)];
   }
 
   I terminalsSize() const {
@@ -214,7 +226,7 @@ public:
 template<typename I, typename J, I BLOCK_SIZE, I ITEMS_PER_THREAD>
 __global__ void
 __launch_bounds__(BLOCK_SIZE, (1024 / BLOCK_SIZE) < 16 ? (1024 / BLOCK_SIZE) : 16)
-lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_starts, J* d_ends, const I size, const bool is_last_chunk) {
+lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_starts, length_t* d_lengths, const I size, const bool is_last_chunk) {
   // Bank-conflict-free padding: we need (STRIDE * sizeof(state_t)) to be
   // ≡ 4 (mod 8) so the stride in 4-byte banks is odd (coprime with 32).
   // Required: STRIDE ≡ 4/sizeof(state_t) (mod 8/sizeof(state_t)), clamped to ≥ 1.
@@ -229,15 +241,17 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   constexpr I SHMEM_STRIDE = ITEMS_PER_THREAD + SHMEM_PAD;
   volatile __shared__ state_t states[SHMEM_STRIDE * BLOCK_SIZE];
   // Exchange buffer for the two-phase scatter on dense tiles.
-  // exch_t (terminals) and exch_j (starts/ends) are never live simultaneously,
-  // so they share one shmem region via a union (proper alignment for each type).
+  // exch_t (terminals), exch_j (starts), and exch_l (lengths) are never live
+  // simultaneously, so they share one shmem region via a union.
   constexpr I EXCH_ELEMS = ITEMS_PER_THREAD * BLOCK_SIZE;
   union {
     terminal_t as_t[EXCH_ELEMS];
     J          as_j[EXCH_ELEMS];
+    length_t   as_l[EXCH_ELEMS];
   } __shared__ exch;
   volatile terminal_t* exch_t = exch.as_t;
   volatile J*          exch_j = exch.as_j;
+  volatile length_t*   exch_l = exch.as_l;
   __shared__ state_t next_block_first_state;
   // Main slots: ceil(ITEMS_PER_THREAD / 8) uint64_t registers per thread.
   // One extra slot is added to cover the single byte past the block boundary
@@ -427,10 +441,9 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   }
 
   if (num_sel > BLOCK_SIZE) {
-    // Dense tile: two-phase scatter for terminals, starts, and ends.
+    // Dense tile: two-phase scatter for terminals, starts, and lengths.
     // Each array is compacted into the shmem exchange at tile-local offsets,
-    // then written out as coalesced wide stores; exch_j is reused for starts
-    // then ends with a __syncthreads() between passes.
+    // then written out as coalesced wide stores.
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
       if ((is_produce_state >> i) & 1) {
@@ -459,13 +472,19 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
 
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-      I gid = glb_offs + (I)threadIdx.x * ITEMS_PER_THREAD + (I)i;
       if ((is_produce_state >> i) & 1) {
-        exch_j[local_offs[i]] = ctx.addOffset(gid + 1);
+        I gid = glb_offs + (I)threadIdx.x * ITEMS_PER_THREAD + (I)i;
+        J tok_start = (Add<I>()(prefix, local_offs[i]) == I() && starts[i] == I())
+                        ? ctx.getLastStart()
+                        : ctx.addOffset(starts[i] - 1);
+        J tok_end   = ctx.addOffset(gid + 1);
+        J tok_len   = tok_end - tok_start;
+        if (tok_len > (J)(length_t)(-1)) ctx.signalLengthOverflow();
+        exch_l[local_offs[i]] = (length_t)tok_len;
       }
     }
     __syncthreads();
-    shmemToGlbVec<J, uint64_t, BLOCK_SIZE, I>(prefix, num_sel, d_ends, exch_j);
+    shmemToGlbVec<length_t, uint64_t, BLOCK_SIZE, I>(prefix, num_sel, d_lengths, exch_l);
   } else {
     // Sparse tile: direct scatter.
 #pragma unroll
@@ -476,12 +495,17 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
         I shmem_cur = (I)threadIdx.x * (SHMEM_STRIDE) + i;
         I offset = Add<I>()(prefix, local_offs[i]);
         d_terminals[offset] = get_terminal(states[shmem_cur]);
+        J tok_start, tok_end, tok_len;
         if (offset == I() && starts[i] == I()) {
-          d_starts[offset] = ctx.getLastStart();
+          tok_start = ctx.getLastStart();
         } else {
-          d_starts[offset] = ctx.addOffset(starts[i] - 1);
+          tok_start = ctx.addOffset(starts[i] - 1);
         }
-        d_ends[offset] = ctx.addOffset(gid + 1);
+        tok_end = ctx.addOffset(gid + 1);
+        tok_len = tok_end - tok_start;
+        if (tok_len > (J)(length_t)(-1)) ctx.signalLengthOverflow();
+        d_starts[offset]  = tok_start;
+        d_lengths[offset] = (length_t)tok_len;
       }
     }
   }

@@ -28,8 +28,8 @@ generateTerminals terminal_type terminal_names =
     [ cudafyEnum "terminal_t" terminal_type terminal_names
     ]
 
-indexTypeAlias :: Bool -> Text
-indexTypeAlias index32 =
+indexTypeAlias :: Bool -> Maybe UInt -> Text
+indexTypeAlias index32 mLenType =
   Text.unlines $
     (if index32 then ["#define INDEX32"] else [])
       ++ [ "#ifdef INDEX32",
@@ -38,12 +38,21 @@ indexTypeAlias index32 =
            "using index_t = int64_t;",
            "#endif"
          ]
+      ++ [ "using length_t = " <> lenT <> ";"
+         ]
+  where
+    lenT = case mLenType of
+      Nothing -> "std::make_unsigned_t<index_t>"
+      Just U8  -> "uint8_t"
+      Just U16 -> "uint16_t"
+      Just U32 -> "uint32_t"
+      Just U64 -> "uint64_t"
 
 compileHint :: Text
 compileHint = "// Compile: nvcc -O3 -std=c++17 -arch=native <this-file>.cu -o <output>"
 
-auxiliary :: Bool -> Analyzer [Text] -> Text
-auxiliary index32 analyzer =
+auxiliary :: Bool -> Maybe UInt -> Analyzer [Text] -> Text
+auxiliary index32 mLenType analyzer =
   case analyzerKind analyzer of
     Lex lexer ->
       Text.unlines
@@ -51,7 +60,7 @@ auxiliary index32 analyzer =
           Text.unlines (("// " <>) <$> meta analyzer),
           "#define HAS_LEXER",
           common,
-          indexTypeAlias index32,
+          indexTypeAlias index32 mLenType,
           generateTerminals terminal_type terminal_names,
           Lexer.generateLexer lexer,
           cudaCli
@@ -62,7 +71,7 @@ auxiliary index32 analyzer =
           Text.unlines (("// " <>) <$> meta analyzer),
           "#define HAS_PARSER",
           common,
-          indexTypeAlias index32,
+          indexTypeAlias index32 mLenType,
           generateTerminals terminal_type terminal_names,
           Parser.generateParser parser,
           cudaCli
@@ -75,7 +84,7 @@ auxiliary index32 analyzer =
           "#define HAS_PARSER",
           "#define HAS_RAW_INPUT",
           common,
-          indexTypeAlias index32,
+          indexTypeAlias index32 mLenType,
           generateTerminals terminal_type terminal_names,
           Lexer.generateLexer lexer,
           Parser.generateParser parser,
@@ -85,8 +94,8 @@ auxiliary index32 analyzer =
     terminal_type = terminalType analyzer
     terminal_names = terminalToName analyzer
 
-generator :: Bool -> Generator [Text]
-generator index32 =
+generator :: Bool -> Maybe UInt -> Generator [Text]
+generator index32 mLenType =
   Generator
-    { generate = auxiliary index32
+    { generate = auxiliary index32 mLenType
     }

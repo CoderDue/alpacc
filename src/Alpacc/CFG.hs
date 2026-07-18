@@ -50,7 +50,8 @@ data NTRule = NTRule
 
 data Params = Params
   { paramsLookback :: Int,
-    paramsLookahead :: Int
+    paramsLookahead :: Int,
+    paramsLength :: Maybe Int  -- token length bits: 8, 16, 32, or 64; Nothing = same as index_t
   }
   deriving (Show)
 
@@ -58,7 +59,8 @@ defaultParams :: Params
 defaultParams =
   Params
     { paramsLookback = 0,
-      paramsLookahead = 1
+      paramsLookahead = 1,
+      paramsLength = Nothing
     }
 
 data CFG = CFG
@@ -69,7 +71,7 @@ data CFG = CFG
   deriving (Show)
 
 pParam :: Parser (Params -> Params)
-pParam = pLookback <|> pLookahead <?> "parameter assignment"
+pParam = pLookback <|> pLookahead <|> pLength <?> "parameter assignment"
   where
     pParamInt name =
       lexeme name
@@ -82,6 +84,12 @@ pParam = pLookback <|> pLookahead <?> "parameter assignment"
 
     pLookahead =
       (\n p -> p {paramsLookahead = n}) <$> pParamInt "lookahead"
+
+    pLength = do
+      n <- pParamInt "length"
+      if n `elem` ([8, 16, 32, 64] :: [Int])
+        then pure (\p -> p {paramsLength = Just n})
+        else fail "length must be 8, 16, 32, or 64"
 
 pParams :: Parser Params
 pParams =
