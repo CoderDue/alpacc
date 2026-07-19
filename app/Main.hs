@@ -16,6 +16,7 @@ import Alpacc.Test
 import Alpacc.Test.Lexer (lexerTestsSingleLong)
 import Alpacc.Test.LexerParser (lexerParserTestsSingleLong)
 import Alpacc.Test.Parser (parserTestsSingleLong)
+import CudaProbe qualified
 import Control.Monad (unless)
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Lazy qualified as LBS
@@ -69,7 +70,12 @@ data GeneratorParameters = GeneratorParameters
     generatorOutput :: !(Maybe String),
     generatorGenerator :: !Gen,
     generatorBackend :: !Backend,
-    generatorIndex32 :: !Bool
+    generatorIndex32 :: !Bool,
+    generatorSharedMemory :: !(Maybe Int),
+    -- ^ Nothing = auto (probe local device); Just n = literal bytes.
+    generatorSmArch :: !(Maybe Int)
+    -- ^ Nothing = auto (probe local device); Just n = literal compute
+    -- capability × 10 (e.g. 75 for sm_75).
   }
   deriving (Show)
 
@@ -256,6 +262,20 @@ generatorParameters backend =
             <*> generateParametar
             <*> pure backend
             <*> switch (long "index32" <> help "Use 32-bit integers for indices (Futhark only).")
+            <*> optional
+                  ( option auto
+                      ( long "shared-memory"
+                          <> metavar "BYTES"
+                          <> help "Per-block shared memory budget baked into the generated CUDA kernel (CUDA backend only).  Default: auto-probe the local device via nvcc.  Overridable at nvcc time with -DALPACC_SHARED_MEMORY=<n>."
+                      )
+                  )
+            <*> optional
+                  ( option auto
+                      ( long "sm-arch"
+                          <> metavar "SM"
+                          <> help "Target GPU compute capability × 10 (e.g. 75 for sm_75, 80 for sm_80) baked in as ALPACC_SM_ARCH; the codegen picks BLOCK_SIZE / ITEMS_PER_THREAD from a per-arch tuning table when this is set (CUDA backend only).  Default: auto-probe the local device via nvcc.  Overridable at nvcc time with -DALPACC_SM_ARCH=<n>."
+                      )
+                  )
         )
 
 randomParameters :: Parser Command
@@ -362,19 +382,19 @@ bitsToUInt 32 = Just U32
 bitsToUInt 64 = Just U64
 bitsToUInt _  = Nothing
 
-backendGenerator :: Backend -> Bool -> Maybe UInt -> Generator [Text]
-backendGenerator CUDA    = Cuda.generator
-backendGenerator Futhark = Futhark.generator
-backendGenerator C       = C.generator
+backendGenerator :: Backend -> Bool -> Maybe UInt -> Int -> Int -> Generator [Text]
+backendGenerator CUDA    index32 mLenType shmem sm = Cuda.generator index32 mLenType shmem sm
+backendGenerator Futhark index32 mLenType _     _  = Futhark.generator index32 mLenType
+backendGenerator C       index32 mLenType _     _  = C.generator index32 mLenType
 
-generateProgram :: Backend -> Bool -> Maybe UInt -> Gen -> CFG -> Either Text Text
-generateProgram backend index32 mLenType gen cfg =
+generateProgram :: Backend -> Bool -> Maybe UInt -> Int -> Int -> Gen -> CFG -> Either Text Text
+generateProgram backend index32 mLenType shmem sm gen cfg =
   case gen of
     GenBoth -> generate generator <$> mkLexerParser cfg
     GenLexer -> generate generator <$> mkLexer cfg
     GenParser -> generate generator <$> mkParser cfg
   where
-    generator = backendGenerator backend index32 mLenType
+    generator = backendGenerator backend index32 mLenType shmem sm
 
 pathOfInput :: FilePath -> Input -> FilePath
 pathOfInput p StdInput = p
@@ -400,7 +420,8 @@ mainGenerator params = do
   let program_path = outputPath backend output input
   cfg <- readCfg input
   let mLenType = paramsLength (cfgParams cfg) >>= bitsToUInt
-  let either_program = generateProgram backend index32 mLenType gen cfg
+  (shmem, smArch) <- resolveCudaDeviceParams backend mShmem mSmArch
+  let either_program = generateProgram backend index32 mLenType shmem smArch gen cfg
 
   case either_program of
     Left e -> do
@@ -413,6 +434,41 @@ mainGenerator params = do
     input = generatorInput params
     gen = generatorGenerator params
     index32 = generatorIndex32 params
+    mShmem = generatorSharedMemory params
+    mSmArch = generatorSmArch params
+
+-- | Resolve --shared-memory and --sm-arch when either is left as auto.
+-- Only probes when the backend is CUDA (probing for C/Futhark is waste).
+-- Fails hard with a clear message when nvcc/GPU is unavailable and one of
+-- them is auto — the user can then rerun with explicit values.
+resolveCudaDeviceParams :: Backend -> Maybe Int -> Maybe Int -> IO (Int, Int)
+resolveCudaDeviceParams CUDA (Just s) (Just a) = pure (s, a)
+resolveCudaDeviceParams CUDA mShmem mSmArch = do
+  hPutStrLn stderr
+    "Probing local GPU via nvcc for --shared-memory / --sm-arch auto-defaults..."
+  eR <- CudaProbe.probeDevice
+  case eR of
+    Right r -> do
+      hPutStrLn stderr $
+        "  probe: sm_arch=" <> show (CudaProbe.probeSmArch r) <>
+        ", shared_memory=" <> show (CudaProbe.probeSharedMemory r) <> " bytes"
+      pure ( fromMaybe (CudaProbe.probeSharedMemory r) mShmem
+           , fromMaybe (CudaProbe.probeSmArch r)       mSmArch
+           )
+    Left err -> do
+      hPutStrLn stderr $
+        "error: --shared-memory / --sm-arch auto-probe failed:\n  " <>
+        probeErrMsg err <>
+        "\nPass explicit values, e.g. `alpacc cuda --shared-memory 49152 --sm-arch 75 ...`."
+      exitFailure
+  where
+    probeErrMsg (CudaProbe.ProbeNvccMissing s)    = s
+    probeErrMsg (CudaProbe.ProbeCompileFailed s)  = s
+    probeErrMsg (CudaProbe.ProbeRunFailed s)      = s
+    probeErrMsg (CudaProbe.ProbeParseFailed s)    = s
+-- Non-CUDA backends never need these values; use portable placeholders.
+resolveCudaDeviceParams _ mShmem mSmArch =
+  pure (fromMaybe 49152 mShmem, fromMaybe 75 mSmArch)
 
 mainRandom :: RandomParameters -> IO ()
 mainRandom params =

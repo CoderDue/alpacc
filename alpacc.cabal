@@ -110,6 +110,8 @@ executable alpacc
   default-language:   GHC2021
   ghc-options:        -threaded -O2 -rtsopts -Wall
   main-is:            Main.hs
+  other-modules:
+    CudaProbe
 
   default-extensions:
     DeriveGeneric
@@ -137,6 +139,9 @@ executable alpacc
     , extra
     , composition
     , bytestring
+    , process
+    , directory
+    , temporary
 
   hs-source-dirs:     app
 

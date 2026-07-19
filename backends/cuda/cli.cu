@@ -47,6 +47,49 @@ static inline uint64_t decode_le64(const uint8_t* p) {
 }
 
 // ---------------------------------------------------------------------------
+// Compile-time (BLOCK_SIZE, ITEMS_PER_THREAD) selection.
+// ---------------------------------------------------------------------------
+//
+// Both are baked in at nvcc-invocation time.  Precedence for each:
+//   1. Explicit -DALPACC_BLOCK_SIZE=<n> / -DALPACC_ITEMS_PER_THREAD=<n>
+//      always wins.
+//   2. The per-arch tuning table (alpacc_ipt_tuning<SM, ELEM_BYTES>) picks
+//      a CUB-style value for the codegen-baked ALPACC_SM_ARCH.
+//   3. Fallback for unknown arches or when the table entry is 0: BS=256
+//      and the largest ITEMS_PER_THREAD that fits in ALPACC_SHARED_MEMORY.
+// Table-picked IPT is capped by the shmem-fits max so no combination
+// overflows the (possibly overridden) shmem budget.
+//
+// No runtime dispatch: exactly one specialised kernel is instantiated per
+// binary.  To try a different tuning, rebuild with different -D flags.
+#ifdef HAS_LEXER
+#ifndef ALPACC_BLOCK_SIZE
+constexpr uint32_t ALPACC_BLOCK_SIZE = []{
+  constexpr uint32_t table_bs = arch_block_size<ALPACC_SM_ARCH, state_t, index_t>();
+  return table_bs;
+}();
+#endif
+
+#ifndef ALPACC_ITEMS_PER_THREAD
+constexpr uint32_t ALPACC_ITEMS_PER_THREAD = []{
+  constexpr uint32_t shmem_max =
+      max_items_per_thread<uint32_t, state_t, index_t, length_t, terminal_t,
+                            ALPACC_BLOCK_SIZE, ALPACC_SHARED_MEMORY>();
+  constexpr uint32_t table = arch_ipt<ALPACC_SM_ARCH, state_t, index_t>();
+  // Table = 0 means unknown arch; fall back to the shmem-search maximum.
+  // Otherwise clamp the table pick to what actually fits.
+  return table == 0 ? shmem_max
+                    : (table < shmem_max ? table : shmem_max);
+}();
+#endif
+#else
+// Parser-only builds don't have the lexer types in scope; default plainly.
+#ifndef ALPACC_BLOCK_SIZE
+#define ALPACC_BLOCK_SIZE 256
+#endif
+#endif
+
+// ---------------------------------------------------------------------------
 // Argument parsing helpers
 // ---------------------------------------------------------------------------
 
@@ -58,6 +101,12 @@ static void print_layout(void) {
     printf("production_t=%zu\n", sizeof(production_t));
 #endif
     printf("index_t=%zu\n", sizeof(index_t));
+#ifdef HAS_LEXER
+    printf("shared_memory=%u\n", (unsigned)ALPACC_SHARED_MEMORY);
+    printf("sm_arch=%u\n", (unsigned)ALPACC_SM_ARCH);
+    printf("block_size=%u\n", (unsigned)ALPACC_BLOCK_SIZE);
+    printf("items_per_thread=%u\n", (unsigned)ALPACC_ITEMS_PER_THREAD);
+#endif
 }
 
 static void usage(const char* prog) {
@@ -65,23 +114,21 @@ static void usage(const char* prog) {
         "Usage: %s [options]\n"
         "  -i FILE              input file (default: stdin)\n"
         "  -o FILE              output file (default: stdout)\n"
-        "  --block-size N       128 or 256 (default: 256)\n"
-        "  --items-per-thread N 2, 4, or 8 (default: auto)\n"
-        "  --shared-memory N    shared memory budget bytes (default: device)\n"
         "  --timeit             print kernel time to stderr\n"
         "  --server             counted-batch loop until EOF (flush per response)\n"
         "  --layout             print native type sizes and exit\n"
         "  --benchmark N        time N runs (GPU-only, pre-alloc, no I/O in loop)\n"
         "  --warmup N           warmup runs before timing (default: 3)\n"
+        "\n"
+        "Note: BLOCK_SIZE and ITEMS_PER_THREAD are baked in at compile time.\n"
+        "      Rebuild with -DALPACC_BLOCK_SIZE=<n> or -DALPACC_ITEMS_PER_THREAD=<n>\n"
+        "      to change them.  Run --layout to see the current values.\n"
         , prog);
 }
 
 struct CliArgs {
     const char* input_file   = nullptr;   // null → stdin
     const char* output_file  = nullptr;   // null → stdout
-    uint32_t    block_size   = 256;
-    uint32_t    ipt          = 0;         // 0 = auto
-    uint32_t    shared_mem   = 0;         // 0 = device query
     bool        timeit       = false;
     bool        server       = false;
     uint32_t    benchmark    = 0;    // 0 = off; >0 = number of timed runs
@@ -111,23 +158,20 @@ static CliArgs parse_args(int argc, char* argv[]) {
             a.input_file = argv[++i];
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             a.output_file = argv[++i];
-        } else if (strcmp(argv[i], "--block-size") == 0 && i + 1 < argc) {
-            if (!parse_uint32(argv[++i], &a.block_size) ||
-                (a.block_size != 128 && a.block_size != 256)) {
-                fprintf(stderr, "error: --block-size must be 128 or 256\n");
-                exit(1);
-            }
-        } else if (strcmp(argv[i], "--items-per-thread") == 0 && i + 1 < argc) {
-            if (!parse_uint32(argv[++i], &a.ipt) ||
-                (a.ipt != 2 && a.ipt != 4 && a.ipt != 8)) {
-                fprintf(stderr, "error: --items-per-thread must be 2, 4, or 8\n");
-                exit(1);
-            }
-        } else if (strcmp(argv[i], "--shared-memory") == 0 && i + 1 < argc) {
-            if (!parse_uint32(argv[++i], &a.shared_mem)) {
-                fprintf(stderr, "error: --shared-memory must be a positive integer\n");
-                exit(1);
-            }
+        } else if (strcmp(argv[i], "--block-size") == 0 ||
+                   strcmp(argv[i], "--items-per-thread") == 0 ||
+                   strcmp(argv[i], "--shared-memory") == 0) {
+            // Consume the value (if any) so a stale script doesn't misparse
+            // the next flag as the value, and warn: these knobs are now
+            // compile-time only.
+            fprintf(stderr,
+                "warning: %s is compile-time only in this build; rebuild with "
+                "-DALPACC_%s=<n> to change it (see --layout for current values).\n",
+                argv[i],
+                strcmp(argv[i], "--block-size") == 0 ? "BLOCK_SIZE" :
+                strcmp(argv[i], "--items-per-thread") == 0 ? "ITEMS_PER_THREAD" :
+                                                             "SHARED_MEMORY");
+            if (i + 1 < argc) i++;
         } else if (strcmp(argv[i], "--benchmark") == 0 && i + 1 < argc) {
             if (!parse_uint32(argv[++i], &a.benchmark) || a.benchmark == 0) {
                 fprintf(stderr, "error: --benchmark must be a positive integer\n");
@@ -144,37 +188,6 @@ static CliArgs parse_args(int argc, char* argv[]) {
         }
     }
     return a;
-}
-
-// ---------------------------------------------------------------------------
-// Device query helpers
-// ---------------------------------------------------------------------------
-
-static uint32_t device_shared_mem() {
-    int dev; cudaGetDevice(&dev);
-    cudaDeviceProp prop; cudaGetDeviceProperties(&prop, dev);
-    return (uint32_t)prop.sharedMemPerBlock;
-}
-
-// Given a shared memory budget and block size, find the largest IPT in
-// {2,4,8} that fits, or 2 if nothing fits (caller will assert later).
-static uint32_t auto_ipt(uint32_t shmem_budget, uint32_t bs) {
-    // Use the lexer's shmem formula (parser kernels use far less).
-    // Try 8, 4, 2 in descending order.
-    constexpr uint32_t candidates[] = {8, 4, 2};
-    for (uint32_t ipt : candidates) {
-        // Approximate: states + indices tiles, three cub::BlockScan temp
-        // storages (one per scan instantiation), and per-scan lookback
-        // buffers. Conservative upper bounds with state_t = 4, I = 4.
-        size_t est = (size_t)4 * ipt * bs             // states
-                   + (size_t)4 * ipt * bs             // indices
-                   + 3 * (size_t)8 * bs               // cub BlockScan temp x3
-                   + 3 * ((size_t)4 * WARP + WARP + 4)// lookback values/statuses/prefix x3
-                   + 8;                               // next_block_first_state + last_start
-        if (est <= (size_t)shmem_budget * 9 / 10)
-            return ipt;
-    }
-    return 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -207,29 +220,6 @@ static uint8_t* slurp(FILE* f, size_t* out_len) {
     *out_len = len;
     return buf;
 }
-
-// ---------------------------------------------------------------------------
-// Dispatch table for (BLOCK_SIZE, ITEMS_PER_THREAD) combinations
-// ---------------------------------------------------------------------------
-//
-// DISPATCH_BS_IPT(bs, ipt, EXPR) expands EXPR with template args <bs_val,ipt_val>
-// appended, covering BS∈{128,256} × IPT∈{2,4,8} (6 combinations).
-// Usage: DISPATCH_BS_IPT(bs, ipt, fn)(args...)
-//   expands to fn<128,2>(args...) or fn<128,4>(args...) etc.
-
-#define DISPATCH_BS_IPT(bs, ipt, fn, ...)                                        \
-    ([&]() -> int {                                                               \
-        if      ((bs)==128 && (ipt)==2) return fn<128,2>(__VA_ARGS__);           \
-        else if ((bs)==128 && (ipt)==4) return fn<128,4>(__VA_ARGS__);           \
-        else if ((bs)==128 && (ipt)==8) return fn<128,8>(__VA_ARGS__);           \
-        else if ((bs)==256 && (ipt)==2) return fn<256,2>(__VA_ARGS__);           \
-        else if ((bs)==256 && (ipt)==4) return fn<256,4>(__VA_ARGS__);           \
-        else if ((bs)==256 && (ipt)==8) return fn<256,8>(__VA_ARGS__);           \
-        else {                                                                    \
-            fprintf(stderr, "unsupported (block_size=%u, ipt=%u)\n", bs, ipt);  \
-            return 1;                                                             \
-        }                                                                         \
-    }())
 
 // ---------------------------------------------------------------------------
 // Lexer-only mode (framed test batches)
@@ -1080,25 +1070,20 @@ int main(int argc, char* argv[]) {
     if (a.input_file)  { in  = fopen(a.input_file,  "rb"); if (!in)  { perror(a.input_file);  return 1; } }
     if (a.output_file) { out = fopen(a.output_file, "wb"); if (!out) { perror(a.output_file); return 1; } }
 
-    // Resolve shared memory budget
-    uint32_t shmem = a.shared_mem ? a.shared_mem : device_shared_mem();
-
-    // Resolve IPT
-    uint32_t ipt = a.ipt ? a.ipt : auto_ipt(shmem, a.block_size);
-    uint32_t bs  = a.block_size;
-
-    // Validate: pick the largest supported IPT ≤ requested that fits in shmem
-    // (if user overrode IPT, trust them; the kernel will assert on bad shmem).
+    // Resolve shared memory budget (only used for --items-per-thread=auto in
+    // Compile-time (BLOCK_SIZE, ITEMS_PER_THREAD) — exactly one specialised
+    // kernel instantiation per binary.  Change either by rebuilding with
+    // -DALPACC_BLOCK_SIZE=<n> / -DALPACC_ITEMS_PER_THREAD=<n>.
 
 #if defined(HAS_LEXER) && !defined(HAS_PARSER)
     // ---- Lex-only mode ----
     int ret;
     if (a.benchmark > 0)
-        ret = DISPATCH_BS_IPT(bs, ipt, lexer_benchmark, in, a.warmup, a.benchmark);
+        ret = lexer_benchmark<ALPACC_BLOCK_SIZE, ALPACC_ITEMS_PER_THREAD>(in, a.warmup, a.benchmark);
     else if (a.server)
-        ret = DISPATCH_BS_IPT(bs, ipt, lexer_server_impl, in, out);
+        ret = lexer_server_impl<ALPACC_BLOCK_SIZE, ALPACC_ITEMS_PER_THREAD>(in, out);
     else
-        ret = DISPATCH_BS_IPT(bs, ipt, run_lexer_batch_impl, in, out, a.timeit);
+        ret = run_lexer_batch_impl<ALPACC_BLOCK_SIZE, ALPACC_ITEMS_PER_THREAD>(in, out, a.timeit);
     if (in  != stdin)  fclose(in);
     if (out != stdout) fclose(out);
     return ret;
@@ -1118,15 +1103,13 @@ int main(int argc, char* argv[]) {
 
 #elif defined(HAS_LEXER) && defined(HAS_PARSER)
     // ---- Both mode: raw bytes → lexer → parser → CST nodes (default) ----
-    // --server loops counted raw-byte batches; --benchmark times the real
-    // bytes → lexer → fused parser (with compact tree) pipeline.
     int ret;
     if (a.benchmark > 0)
-        ret = DISPATCH_BS_IPT(bs, ipt, both_benchmark, in, a.warmup, a.benchmark);
+        ret = both_benchmark<ALPACC_BLOCK_SIZE, ALPACC_ITEMS_PER_THREAD>(in, a.warmup, a.benchmark);
     else if (a.server)
-        ret = DISPATCH_BS_IPT(bs, ipt, both_server_impl, in, out);
+        ret = both_server_impl<ALPACC_BLOCK_SIZE, ALPACC_ITEMS_PER_THREAD>(in, out);
     else
-        ret = DISPATCH_BS_IPT(bs, ipt, both_batch_impl, in, out);
+        ret = both_batch_impl<ALPACC_BLOCK_SIZE, ALPACC_ITEMS_PER_THREAD>(in, out);
     if (in  != stdin)  fclose(in);
     if (out != stdout) fclose(out);
     return ret;

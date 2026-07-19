@@ -1,3 +1,182 @@
+// ---------------------------------------------------------------------------
+// Compile-time shared-memory accounting for the lexer kernel.
+//
+// The kernel's per-block shmem footprint has three parts:
+//   1. IPT-scaling storage: `states[SHMEM_STRIDE * BLOCK_SIZE]` and the
+//      `exch` union `[IPT * BLOCK_SIZE]`.  These dominate at large IPT.
+//   2. cub::BlockScan TempStorage for the state scan (state_t) and the two
+//      SoA scans (u32, shared between Max and Add).  cub gives us an exact
+//      sizeof() for each, so we can query it as a constexpr.
+//   3. Small fixed scalars: `next_block_first_state`, `last_start`,
+//      `num_sel_sh`, and the lookbackPrefixPair warp buffers.
+//
+// max_items_per_thread() below scans IPT from 1 to some cap (1024) and
+// returns the largest value that keeps the total under `usable * SHMEM /
+// 100` (default 90%).  Because it's constexpr the search folds away at
+// compile time; the returned IPT feeds straight into the kernel template.
+template<typename I, typename state_t, typename J, typename length_t, typename terminal_t>
+constexpr size_t exch_elem_bytes() {
+  size_t t = sizeof(terminal_t);
+  size_t j = sizeof(J);
+  size_t l = sizeof(length_t);
+  return (t > j ? (t > l ? t : l) : (j > l ? j : l));
+}
+
+template<typename I, typename state_t, uint32_t BLOCK_SIZE>
+constexpr size_t shmem_pad_stride(uint32_t items_per_thread) {
+  // Mirror the SHMEM_PAD calculation from the kernel body: STRIDE picked so
+  // (STRIDE * sizeof(state_t)) ≡ 4 (mod 8), yielding conflict-free reads for
+  // the blocked state layout.  Padding depends only on state_t's byte width
+  // and IPT.
+  uint32_t shmem_mod    = 8u / (uint32_t)sizeof(state_t);
+  uint32_t shmem_target = 4u / (uint32_t)sizeof(state_t);
+  uint32_t shmem_rem    = items_per_thread % shmem_mod;
+  uint32_t shmem_raw    = (shmem_target - shmem_rem + shmem_mod) % shmem_mod;
+  uint32_t shmem_pad    = (shmem_raw == 0) ? shmem_mod : shmem_raw;
+  return (size_t)(items_per_thread + shmem_pad);
+}
+
+template<typename I, typename state_t, typename J, typename length_t, typename terminal_t, uint32_t BLOCK_SIZE>
+constexpr size_t lexer_shmem_variable(uint32_t items_per_thread) {
+  size_t states_bytes = sizeof(state_t) * shmem_pad_stride<I, state_t, BLOCK_SIZE>(items_per_thread) * BLOCK_SIZE;
+  size_t exch_bytes   = exch_elem_bytes<I, state_t, J, length_t, terminal_t>() * items_per_thread * BLOCK_SIZE;
+  return states_bytes + exch_bytes;
+}
+
+template<typename I, typename state_t, uint32_t BLOCK_SIZE>
+constexpr size_t lexer_shmem_fixed() {
+  // cub TempStorage: one for the state scan (state_t) and one shared between
+  // the two SoA scans (u32).  sizeof gives us the exact per-instantiation
+  // size cub picks for this (T, BLOCK_SIZE) pair.
+  size_t cub_state_temp = sizeof(typename cub::BlockScan<state_t, BLOCK_SIZE>::TempStorage);
+  size_t cub_u32_temp   = sizeof(typename cub::BlockScan<uint32_t,  BLOCK_SIZE>::TempStorage);
+  // lookbackPrefixPair shmem: two warp-sized value arrays (I each) + one
+  // status array + two shmem prefix scalars.
+  size_t lookback = 2u * sizeof(I) * WARP + sizeof(uint8_t) * WARP + 2u * sizeof(I);
+  size_t fixed_scalars = sizeof(state_t)      // next_block_first_state
+                        + sizeof(I)           // last_start
+                        + sizeof(I);          // num_sel_sh
+  return cub_state_temp + cub_u32_temp + lookback + fixed_scalars;
+}
+
+// Largest ITEMS_PER_THREAD ≤ HARD_CAP whose per-block shmem footprint fits
+// in floor(SHARED_MEMORY * USABLE_PCT / 100) bytes.  Reserving 10% by
+// default (USABLE_PCT = 90) leaves headroom for cub internals and any small
+// implicit allocations we haven't modelled.
+template<typename I, typename state_t, typename J, typename length_t, typename terminal_t,
+         uint32_t BLOCK_SIZE, uint32_t SHARED_MEMORY,
+         uint32_t HARD_CAP = 1024, uint32_t USABLE_PCT = 90>
+constexpr uint32_t max_items_per_thread() {
+  size_t usable = (size_t)SHARED_MEMORY * USABLE_PCT / 100u;
+  size_t fixed = lexer_shmem_fixed<I, state_t, BLOCK_SIZE>();
+  uint32_t best = 1;
+  for (uint32_t ipt = 1; ipt <= HARD_CAP; ipt++) {
+    size_t total = fixed + lexer_shmem_variable<I, state_t, J, length_t, terminal_t, BLOCK_SIZE>(ipt);
+    if (total <= usable) best = ipt;
+    else break;
+  }
+  return best;
+}
+
+// ---------------------------------------------------------------------------
+// Per-arch tuning table (CUB-style).
+//
+// CUB stores a nominal IPT in 4-byte-work units per (arch, algorithm) and
+// scales at instantiation by `NOMINAL_ITEMS_PER_THREAD_4B * 4 / sizeof(T)`.
+// We mirror that pattern: the table holds `nominal_ipt_4B` and
+// `block_size`, and the lexer takes ELEM_BYTES = max(sizeof(state_t),
+// sizeof(index_t)) as the type-size bucket — that's the widest live
+// element per thread in the scan hot path (state_t drives the state scan,
+// index_t drives the max/add scans and is either 4 or 8 bytes).
+//
+// The initial values are CUB's DeviceScan `NOMINAL_ITEMS_PER_THREAD_4B` for
+// each arch — a reasonable starting point.  Replace with measured optima
+// per grammar/arch as they become known.  Rows with nominal_ipt_4B == 0
+// mean "unknown arch; fall back to the shmem-based search".
+template<int SM_ARCH, size_t ELEM_BYTES>
+struct alpacc_ipt_tuning {
+  static constexpr uint32_t nominal_ipt_4B = 0;
+  static constexpr uint32_t block_size     = 256;
+};
+
+// Pascal (sm_60, sm_61) — Tesla P100 / GP102
+template<size_t ELEM> struct alpacc_ipt_tuning<60, ELEM> {
+  static constexpr uint32_t nominal_ipt_4B = 15;
+  static constexpr uint32_t block_size     = 128;
+};
+template<size_t ELEM> struct alpacc_ipt_tuning<61, ELEM> {
+  static constexpr uint32_t nominal_ipt_4B = 15;
+  static constexpr uint32_t block_size     = 128;
+};
+
+// Volta (sm_70) — V100
+template<size_t ELEM> struct alpacc_ipt_tuning<70, ELEM> {
+  static constexpr uint32_t nominal_ipt_4B = 15;
+  static constexpr uint32_t block_size     = 128;
+};
+
+// Turing (sm_75) — T4, 1660 Ti, RTX 20xx
+template<size_t ELEM> struct alpacc_ipt_tuning<75, ELEM> {
+  static constexpr uint32_t nominal_ipt_4B = 8;
+  static constexpr uint32_t block_size     = 256;
+};
+
+// Ampere data-centre (sm_80) — A100
+template<size_t ELEM> struct alpacc_ipt_tuning<80, ELEM> {
+  static constexpr uint32_t nominal_ipt_4B = 12;
+  static constexpr uint32_t block_size     = 128;
+};
+
+// Ampere consumer (sm_86) — RTX 30xx, A40
+template<size_t ELEM> struct alpacc_ipt_tuning<86, ELEM> {
+  static constexpr uint32_t nominal_ipt_4B = 12;
+  static constexpr uint32_t block_size     = 128;
+};
+
+// Ada Lovelace (sm_89) — RTX 40xx, L4/L40
+template<size_t ELEM> struct alpacc_ipt_tuning<89, ELEM> {
+  static constexpr uint32_t nominal_ipt_4B = 12;
+  static constexpr uint32_t block_size     = 128;
+};
+
+// Hopper (sm_90) — H100
+template<size_t ELEM> struct alpacc_ipt_tuning<90, ELEM> {
+  static constexpr uint32_t nominal_ipt_4B = 15;
+  static constexpr uint32_t block_size     = 128;
+};
+
+// Blackwell (sm_100) — B100/B200
+template<size_t ELEM> struct alpacc_ipt_tuning<100, ELEM> {
+  static constexpr uint32_t nominal_ipt_4B = 15;
+  static constexpr uint32_t block_size     = 128;
+};
+
+// Type-size bucket driver: the widest live element that the scan pipeline
+// touches per thread.  We use max(state_t, index_t) — length_t and
+// terminal_t are always narrower than these on realistic grammars.
+template<typename state_t, typename J>
+constexpr size_t elem_bytes() {
+  return sizeof(state_t) > sizeof(J) ? sizeof(state_t) : sizeof(J);
+}
+
+// Table-driven IPT (0 if the arch is unknown, in which case callers fall
+// back to max_items_per_thread<>()).
+template<int SM_ARCH, typename state_t, typename J>
+constexpr uint32_t arch_ipt() {
+  constexpr size_t bytes = elem_bytes<state_t, J>();
+  constexpr uint32_t nominal = alpacc_ipt_tuning<SM_ARCH, bytes>::nominal_ipt_4B;
+  if (nominal == 0) return 0;
+  // Scale from 4B-work units to the actual per-thread element size.
+  uint32_t scaled = nominal * 4u / (uint32_t)bytes;
+  return scaled == 0 ? 1 : scaled;
+}
+
+template<int SM_ARCH, typename state_t, typename J>
+constexpr uint32_t arch_block_size() {
+  constexpr size_t bytes = elem_bytes<state_t, J>();
+  return alpacc_ipt_tuning<SM_ARCH, bytes>::block_size;
+}
+
 __device__ __host__ __forceinline__
 state_t get_index(state_t state) {
   return (state & ENDO_MASK) >> ENDO_OFFSET;
