@@ -294,50 +294,33 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     }
   }
 
-  // Write toState results into blocked shmem (thread t owns
-  // states[t*SHMEM_STRIDE .. t*SHMEM_STRIDE+IPT)).  Iterating in blocked
-  // order (outer loop over items 0..IPT-1) makes shmem_idx = t*SHMEM_STRIDE+i
-  // with no integer division.  Thread t's item i is byte i of copy_reg[0]
-  // (for IPT <= EPV=8) or byte i%EPV of copy_reg[i/EPV] in general.
-  {
-    constexpr uint32_t EPV = sizeof(uint64_t);
-    const I t_base_gid = glb_offs + (I)threadIdx.x * ITEMS_PER_THREAD;
-    const I shmem_base = (I)threadIdx.x * SHMEM_STRIDE;
 #pragma unroll
-    for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
-      I gid = t_base_gid + (I)i;
-      uint32_t reg_off = i;  // item i is chars_reg[i] in blocked layout
-      if (gid < size) {
-        if (gid == 0) {
-          states[shmem_base + i] = ctx(ctx.getLastState(),
-              reinterpret_cast<state_t>(ctx.toState(chars_reg[reg_off])));
-        } else {
-          states[shmem_base + i] = ctx.toState(chars_reg[reg_off]);
-        }
-      } else {
-        states[shmem_base + i] = IDENTITY;
-      }
-    }
-    // The byte immediately past this block (lid_off == IPT*BLOCK_SIZE) lives
-    // at striped position i=IPT/EPV, j=0 for thread 0 — i.e. chars_reg[IPT]
-    // for the thread whose striped slot covers that position.  In blocked
-    // layout it's always thread 0's reg byte at offset IPT (= EPV * (IPT/EPV)
-    // + IPT%EPV), which lives in copy_reg[IPT/EPV] byte IPT%EPV.
-    // Equivalently: for thread t, the striped extra slot (copy_reg[VPT-1])
-    // covers global bytes starting at (VPT-1)*BLOCK_SIZE*EPV + t*EPV.
-    // The boundary byte is at global offset BLOCK_SIZE*IPT, so it belongs to
-    // the thread where (VPT-1)*BLOCK_SIZE*EPV + t*EPV == BLOCK_SIZE*IPT,
-    // i.e. t = (BLOCK_SIZE*IPT - (VPT-1)*BLOCK_SIZE*EPV) / EPV.
-    // For IPT==EPV (the common case): VPT-1=1, t=0, byte index 0.
-    constexpr uint32_t BOUNDARY_THREAD =
-        (BLOCK_SIZE * ITEMS_PER_THREAD - (VPT - 1) * BLOCK_SIZE * EPV) / EPV;
-    constexpr uint32_t BOUNDARY_BYTE   =
-        (BLOCK_SIZE * ITEMS_PER_THREAD - (VPT - 1) * BLOCK_SIZE * EPV) % EPV;
-    if (threadIdx.x == BOUNDARY_THREAD) {
-      I boundary_gid = glb_offs + (I)(BLOCK_SIZE * ITEMS_PER_THREAD);
-      if (boundary_gid < size) {
-        uint8_t* extra = reinterpret_cast<uint8_t*>(&copy_reg[VPT - 1]);
-        next_block_first_state = ctx.toState(extra[BOUNDARY_BYTE]);
+  for (uint32_t i = 0; i < VPT; i++) {
+    I lid = (I)i * BLOCK_SIZE + threadIdx.x;
+    I _gid = glb_offs + (I)sizeof(uint64_t) * lid;
+    for (uint32_t j = 0; j < sizeof(uint64_t); j++) {
+      I gid = _gid + (I)j;
+      I lid_off = (I)sizeof(uint64_t) * lid + (I)j;
+      uint32_t reg_off = sizeof(uint64_t) * i + j;
+      bool is_in_block = lid_off < (I)(ITEMS_PER_THREAD * BLOCK_SIZE);
+      // Blocked layout with SHMEM_STRIDE padding to break u16 bank conflicts.
+      // lid_off/IPT = thread index, lid_off%IPT = item index within thread,
+      // matching the read pattern states[t*SHMEM_STRIDE + item_i].
+      I shmem_idx = (lid_off / ITEMS_PER_THREAD) * SHMEM_STRIDE + (lid_off % ITEMS_PER_THREAD);
+      if (gid < size && is_in_block) {
+          if (gid == 0) {
+            states[shmem_idx] = ctx(ctx.getLastState(), reinterpret_cast<state_t>(ctx.toState(chars_reg[reg_off])));
+          } else {
+            states[shmem_idx] = ctx.toState(chars_reg[reg_off]);
+          }
+      } else if (is_in_block) {
+          states[shmem_idx] = IDENTITY;
+      } else if (lid_off == (I)(ITEMS_PER_THREAD * BLOCK_SIZE) && gid < size) {
+          // First byte of the next block, needed for the boundary produce
+          // test.  Guarded by gid < size (not is_last_chunk): interior block
+          // boundaries exist in the last chunk too, and for the final block
+          // the byte is out of range regardless of chunk position.
+          next_block_first_state = ctx.toState(chars_reg[reg_off]);
       }
     }
   }
@@ -462,6 +445,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
 
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+      I lid = threadIdx.x * ITEMS_PER_THREAD + i;
       if ((is_produce_state >> i) & 1) {
         I offset = local_offs[i];
         if (Add<I>()(prefix, offset) == I() && starts[i] == I()) {
