@@ -70,7 +70,12 @@ private:
 public:
   const I CHUNK_SIZE;
   States<I, state_t> d_state_states;
-  States<I, uint64_t> d_maxadd_states;
+  // SoA inter-block buffer for the (max token-start, +produce-count) scan.
+  // Both components are I (u32); keeping them in separate arrays avoids the
+  // former packed-u64 layout that dragged 8-byte traffic through the warp
+  // scan for two 4-byte values, and matches how the block-local scan runs
+  // them as independent scalar reductions.
+  PairStates<I, I, I> d_maxadd_states;
 
   LexerCtx(const I chunk_size,
            const I block_size,
@@ -83,7 +88,7 @@ public:
     cudaMemcpy(d_compose, h_compose, sizeof(h_compose),
                  cudaMemcpyHostToDevice);
 
-    d_maxadd_states = States<I, uint64_t>(num_blocks);
+    d_maxadd_states = PairStates<I, I, I>(num_blocks);
     d_state_states = States<I, state_t>(num_blocks);
 
     gpuAssert(cudaMalloc((void**)&d_dyn_block_index, sizeof(uint32_t)));
@@ -359,20 +364,28 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     __syncthreads();
   }
 
-  // Fused (max, +) scan over u64 pairs held in registers, in blocked layout
+  // Split (max, +) block-local scans over u32 registers in blocked layout
   // (thread t owns tile positions [t*IPT, (t+1)*IPT)): the token-start Max
-  // scan rides in the high word (0 = "no start seen", produce at gid encodes
-  // gid + 1) and the compaction Add scan in the low word (produce flag), so
-  // one lookback round replaces the former two.  All loops below use blocked
-  // indexing so registers, the produce bitmask, and shmem stay consistent.
-  uint64_t pair[ITEMS_PER_THREAD];
+  // scan runs over start codes (0 = "no start seen", produce at gid encodes
+  // gid + 1) and the compaction Add scan runs over produce flags.  The two
+  // block-local scans are independent so we run them separately with scalar
+  // operators — the former fused u64 MaxAdd combine had ~4 dependent
+  // operations per reduction step (shift/mask/max/add threading through
+  // cub's binary tree), whereas the split u32 scalar operators run at one
+  // instruction per combine and give the compiler ILP across the two scans.
+  // The inter-block handshake then runs *once* over the SoA PairStates
+  // buffer via lookbackPrefixPair, so we don't pay for two lookback rounds.
+  // All loops below use blocked indexing so registers, the produce bitmask,
+  // and shmem stay consistent.
+  uint32_t start_codes[ITEMS_PER_THREAD];
+  uint32_t produce_flags[ITEMS_PER_THREAD];
 
 #pragma unroll
   for (I i = 0; i < ITEMS_PER_THREAD; i++) {
     I lid = threadIdx.x * ITEMS_PER_THREAD + i;
     I gid = glb_offs + lid;
     bool is_next_produce = false;
-    uint64_t start_code = 0;
+    uint32_t start_code = 0;
     // Padded shmem indices for this item and the next global item.
     I shmem_cur  = (I)threadIdx.x * (SHMEM_STRIDE) + i;
     I shmem_next = (i < ITEMS_PER_THREAD - 1)
@@ -398,16 +411,36 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
         is_next_produce &= is_not_ignore;
       }
 
-      start_code = is_produce(state) ? (uint64_t)(gid + 1) : 0;
+      start_code = is_produce(state) ? (uint32_t)(gid + 1) : 0u;
     }
     is_produce_state |= is_next_produce << i;
-    pair[i] = (start_code << 32) | (uint64_t)(is_next_produce ? 1 : 0);
+    start_codes[i]   = start_code;
+    produce_flags[i] = is_next_produce ? 1u : 0u;
   }
 
-  const uint64_t bprefix =
-      scanReg<uint64_t, I, MaxAdd, ITEMS_PER_THREAD, BLOCK_SIZE>(pair, ctx.d_maxadd_states, MaxAdd(), 0, dyn_index);
-  const I prefix = (I)(uint32_t)bprefix;
-  const I max_prefix = (I)(bprefix >> 32);
+  // Two independent block-local scans on scalar u32 monoids.  Both cub
+  // BlockScans share one TempStorage — they run sequentially in the same
+  // thread, so the storage is only live during one at a time.
+  using BlockScan32 = cub::BlockScan<uint32_t, BLOCK_SIZE>;
+  __shared__ typename BlockScan32::TempStorage scan_temp;
+  const uint32_t max_agg =
+      scanRegLocal<uint32_t, I, Max<uint32_t>, ITEMS_PER_THREAD, BLOCK_SIZE>(
+          start_codes, scan_temp, Max<uint32_t>());
+  const uint32_t add_agg =
+      scanRegLocal<uint32_t, I, Add<uint32_t>, ITEMS_PER_THREAD, BLOCK_SIZE>(
+          produce_flags, scan_temp, Add<uint32_t>());
+
+  // Single fused decoupled-lookback round over the SoA PairStates buffer.
+  // The two component aggregates live in separate arrays and the block
+  // status is shared, so the inter-block warp scan reads both components in
+  // parallel with one status atomic per predecessor tile — same handshake
+  // cost as the former packed-u64 layout but without paying for a u64 load
+  // when u32 will do.
+  I max_prefix, prefix;
+  lookbackPrefixPair<I, I, I, Max<I>, Add<I>>(
+      ctx.d_maxadd_states, Max<I>(), Add<I>(), (I)0, (I)0, dyn_index,
+      (I)max_agg, (I)add_agg,
+      max_prefix, prefix);
 
   I starts[ITEMS_PER_THREAD];
   I local_offs[ITEMS_PER_THREAD];
@@ -418,15 +451,15 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   for (I i = 0; i < ITEMS_PER_THREAD; i++) {
     I lid = threadIdx.x * ITEMS_PER_THREAD + i;
     I gid = glb_offs + lid;
-    starts[i] = max(max_prefix, (I)(pair[i] >> 32));
-    local_offs[i] = ((is_produce_state >> i) & 1) ? (I)(uint32_t)pair[i] - 1 : I();
+    starts[i] = max(max_prefix, (I)start_codes[i]);
+    local_offs[i] = ((is_produce_state >> i) & 1) ? (I)produce_flags[i] - 1 : I();
     if (gid == size - 1) {
       last_start = starts[i];
     }
   }
 
   if (threadIdx.x == BLOCK_SIZE - 1) {
-    num_sel_sh = (I)(uint32_t)pair[ITEMS_PER_THREAD - 1];
+    num_sel_sh = (I)produce_flags[ITEMS_PER_THREAD - 1];
   }
   __syncthreads();
 

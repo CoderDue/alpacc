@@ -92,6 +92,50 @@ struct States {
   }
 };
 
+// Structure-of-arrays inter-block state buffer for a component-wise scan on
+// two independent monoids (TA, OPA) and (TB, OPB).  The two components are
+// always published atomically together, so the block-status array is shared
+// between them — one atomic release/acquire round per block covers both.
+// This avoids the packed-u64 layout that forced both components to share the
+// same width (and dragged the wider width's traffic through the reduction
+// even when one component would fit in a narrower type).
+template<typename I, typename TA, typename TB>
+struct PairStates {
+  volatile TA*  a_aggregates = nullptr;
+  volatile TA*  a_prefixes   = nullptr;
+  volatile TB*  b_aggregates = nullptr;
+  volatile TB*  b_prefixes   = nullptr;
+  AtomicStatus* statuses     = nullptr;
+  I num_blocks = 0;
+
+  PairStates(I num_blocks) : num_blocks(num_blocks) {
+    cudaMalloc((void**)&a_aggregates, num_blocks * sizeof(TA));
+    cudaMalloc((void**)&a_prefixes,   num_blocks * sizeof(TA));
+    cudaMalloc((void**)&b_aggregates, num_blocks * sizeof(TB));
+    cudaMalloc((void**)&b_prefixes,   num_blocks * sizeof(TB));
+    cudaMalloc((void**)&statuses,     num_blocks * sizeof(AtomicStatus));
+    cudaMemset((void*) statuses, Invalid, num_blocks * sizeof(AtomicStatus));
+  }
+
+  PairStates() {
+  }
+
+  void reset() {
+    if (statuses) cudaMemset((void*) statuses, Invalid, num_blocks * sizeof(AtomicStatus));
+  }
+
+  void cleanUp() {
+    if (a_aggregates) cudaFree((void*) a_aggregates);
+    if (a_prefixes)   cudaFree((void*) a_prefixes);
+    if (b_aggregates) cudaFree((void*) b_aggregates);
+    if (b_prefixes)   cudaFree((void*) b_prefixes);
+    if (statuses)     cudaFree((void*) statuses);
+    a_aggregates = nullptr; a_prefixes = nullptr;
+    b_aggregates = nullptr; b_prefixes = nullptr;
+    statuses = nullptr;
+  }
+};
+
 __device__ inline Status
 combine(Status a, Status b) {
   if (a == Invalid || b == Invalid)
@@ -207,6 +251,134 @@ lookbackPrefix(States<I, T> states,
   return shmem_prefix;
 }
 
+// Component-wise warp scan on two independent monoids sharing a single
+// status array.  Both components take the same "skip when this lane has a
+// resolved Prefix" rule — hence one status stream governs both.
+template<typename TA, typename TB, typename I, typename OPA, typename OPB>
+__device__ inline void
+scanWarpPair(volatile TA* a_values,
+             volatile TB* b_values,
+             volatile Status* statuses,
+             OPA op_a,
+             OPB op_b,
+             const uint8_t lane) {
+  uint8_t h;
+  const I tid = threadIdx.x;
+
+#pragma unroll
+  for (uint8_t d = 0; d < LG_WARP; d++) {
+    if ((h = 1 << d) <= lane) {
+      bool is_not_aggregate = statuses[tid] != Aggregate;
+      a_values[tid] = is_not_aggregate ? a_values[tid] : op_a(a_values[tid - h], a_values[tid]);
+      b_values[tid] = is_not_aggregate ? b_values[tid] : op_b(b_values[tid - h], b_values[tid]);
+      statuses[tid] = combine(statuses[tid - h], statuses[tid]);
+    }
+    __syncwarp();
+  }
+}
+
+// Decoupled-lookback inter-block prefix for a two-component (max/add-style)
+// scan with SoA state buffers.  Same handshake protocol as lookbackPrefix
+// — one status atomic per block, warp-level scan across the predecessor
+// tiles — but the two component aggregates live in separate arrays inside
+// PairStates, so neither is forced to widen to the other's type.
+//
+// Returns the exclusive block prefix for both components via the
+// (prefix_a, prefix_b) reference parameters (valid in all threads).
+template<typename TA, typename TB, typename I, typename OPA, typename OPB>
+__device__ inline void
+lookbackPrefixPair(PairStates<I, TA, TB> states,
+                   OPA op_a,
+                   OPB op_b,
+                   TA ne_a,
+                   TB ne_b,
+                   uint32_t dyn_idx,
+                   TA aggregate_a,
+                   TB aggregate_b,
+                   TA& out_prefix_a,
+                   TB& out_prefix_b) {
+  volatile __shared__ TA a_values[WARP];
+  volatile __shared__ TB b_values[WARP];
+  volatile __shared__ Status statuses[WARP];
+  volatile __shared__ TA shmem_prefix_a;
+  volatile __shared__ TB shmem_prefix_b;
+  const uint8_t lane = threadIdx.x & (WARP - 1);
+  const bool is_first = threadIdx.x == 0;
+
+  if (is_first) {
+    states.statuses[dyn_idx].store(Invalid, cuda::memory_order_relaxed);
+  }
+  __syncthreads();
+
+  if (is_first) {
+    states.a_aggregates[dyn_idx] = aggregate_a;
+    states.b_aggregates[dyn_idx] = aggregate_b;
+  }
+
+  if (dyn_idx == 0 && is_first) {
+    states.a_prefixes[dyn_idx] = aggregate_a;
+    states.b_prefixes[dyn_idx] = aggregate_b;
+  }
+  if (dyn_idx == 0 && is_first) {
+    states.statuses[dyn_idx].store(Prefix, cuda::memory_order_release);
+  } else if (is_first) {
+    states.statuses[dyn_idx].store(Aggregate, cuda::memory_order_release);
+  }
+
+  TA prefix_a = ne_a;
+  TB prefix_b = ne_b;
+  if (threadIdx.x < WARP && dyn_idx != 0) {
+    I lookback_idx = threadIdx.x + dyn_idx;
+    I lookback_warp = WARP;
+    Status status = Aggregate;
+    do {
+      if (lookback_warp <= lookback_idx) {
+        I idx = lookback_idx - lookback_warp;
+        Status s = states.statuses[idx].load(cuda::memory_order_acquire);
+        statuses[threadIdx.x] = s;
+        a_values[threadIdx.x] = s == Prefix ? states.a_prefixes[idx] : states.a_aggregates[idx];
+        b_values[threadIdx.x] = s == Prefix ? states.b_prefixes[idx] : states.b_aggregates[idx];
+      } else {
+        statuses[threadIdx.x] = Aggregate;
+        a_values[threadIdx.x] = ne_a;
+        b_values[threadIdx.x] = ne_b;
+      }
+
+      scanWarpPair<TA, TB, I, OPA, OPB>(a_values, b_values, statuses, op_a, op_b, lane);
+
+      TA result_a = a_values[WARP - 1];
+      TB result_b = b_values[WARP - 1];
+      status = statuses[WARP - 1];
+
+      if (status == Invalid)
+        continue;
+
+      if (is_first) {
+        prefix_a = op_a(result_a, prefix_a);
+        prefix_b = op_b(result_b, prefix_b);
+      }
+
+      lookback_warp += WARP;
+    } while (status != Prefix);
+  }
+
+  if (is_first) {
+    shmem_prefix_a = prefix_a;
+    shmem_prefix_b = prefix_b;
+  }
+
+  __syncthreads();
+
+  if (is_first) {
+    states.a_prefixes[dyn_idx] = op_a(prefix_a, aggregate_a);
+    states.b_prefixes[dyn_idx] = op_b(prefix_b, aggregate_b);
+    states.statuses[dyn_idx].store(Prefix, cuda::memory_order_release);
+  }
+
+  out_prefix_a = shmem_prefix_a;
+  out_prefix_b = shmem_prefix_b;
+}
+
 // Single-pass device scan over one block's tile: cub::BlockScan (register
 // scan, warp shuffles) for the block-level phase + decoupled lookback for
 // the inter-block prefix. The tile lives in shared memory in blocked layout
@@ -244,6 +416,29 @@ scan(volatile T* shmem,
   return prefix;
 }
 
+// Block-local half of scanReg: cub::BlockScan::InclusiveScan on the tile
+// held in blocked-layout registers.  Writes the inclusive scan back into
+// items and returns the block-wide aggregate to all threads.  Does NOT
+// apply an inter-block prefix — callers that need the exclusive block
+// prefix from decoupled lookback call lookbackPrefix separately.
+//
+// Splitting the scan into block-local + lookback lets callers with two
+// independent monoids run the block-local phase separately (each with its
+// own scalar operator, shorter critical path per combine) and then perform
+// a single fused decoupled-lookback handshake over both, avoiding a second
+// inter-block round.  Both phases share TempStorage via the caller's
+// declaration; passing it in also lets the caller reuse one shared
+// allocation across several scans in the same kernel.
+template<typename T, typename I, typename OP, I ITEMS_PER_THREAD, I BLOCK_SIZE>
+__device__ inline T
+scanRegLocal(T (&items)[ITEMS_PER_THREAD],
+             typename cub::BlockScan<T, BLOCK_SIZE>::TempStorage& temp_storage,
+             OP op) {
+  T aggregate;
+  cub::BlockScan<T, BLOCK_SIZE>(temp_storage).InclusiveScan(items, items, op, aggregate);
+  return aggregate;
+}
+
 // Register-tile variant of scan: the caller supplies the tile in blocked
 // layout registers (thread t owns items [t*ITEMS_PER_THREAD, (t+1)*IPT)).
 // Items are replaced by their block-local inclusive scan (no inter-block
@@ -259,9 +454,7 @@ scanReg(T (&items)[ITEMS_PER_THREAD],
   using BlockScanT = cub::BlockScan<T, BLOCK_SIZE>;
   __shared__ typename BlockScanT::TempStorage temp_storage;
 
-  T aggregate;
-  BlockScanT(temp_storage).InclusiveScan(items, items, op, aggregate);
-
+  T aggregate = scanRegLocal<T, I, OP, ITEMS_PER_THREAD, BLOCK_SIZE>(items, temp_storage, op);
   return lookbackPrefix<T, I, OP>(states, op, ne, dyn_idx, aggregate);
 }
 
@@ -272,13 +465,10 @@ struct Add {
   }
 };
 
-// Component-wise (max, +) on two u32 lanes packed in a u64: max in the high
-// word, sum in the low word.  Both component monoids have identity 0, so the
-// packed identity is 0.  The lanes are combined separately, so a low-word
-// carry can never spill into the high word.
-struct MaxAdd {
-  __device__ __forceinline__ uint64_t operator()(uint64_t a, uint64_t b) const {
-    uint64_t mx = max(a >> 32, b >> 32);
-    return (mx << 32) | (uint64_t)((uint32_t)a + (uint32_t)b);
+template<typename I>
+struct Max {
+  __device__ __forceinline__ I operator()(I a, I b) const {
+    return a > b ? a : b;
   }
 };
+
