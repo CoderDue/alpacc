@@ -84,22 +84,27 @@ constexpr uint32_t max_items_per_thread() {
 // CUB stores a nominal IPT in 4-byte-work units per (arch, algorithm) and
 // scales at instantiation by `NOMINAL_ITEMS_PER_THREAD_4B * 4 / sizeof(T)`.
 // We mirror that pattern: the table holds `nominal_ipt_4B` and
-// `block_size`, and the lexer takes ELEM_BYTES = max(sizeof(state_t),
-// sizeof(index_t)) as the type-size bucket — that's the widest live
-// element per thread in the scan hot path (state_t drives the state scan,
-// index_t drives the max/add scans and is either 4 or 8 bytes).
+// `block_size`, and the lexer takes ELEM_BYTES = sizeof(index_t) as the
+// type-size bucket — the max/add scans over start codes and produce
+// flags are index_t-sized and drive the per-item register pressure at
+// the block boundary.  state_t affects an earlier scan whose shmem cost
+// is folded into `max_items_per_thread()` as a clamp.
 //
-// The initial values are CUB's DeviceScan `NOMINAL_ITEMS_PER_THREAD_4B` for
-// each arch — a reasonable starting point.  Replace with measured optima
-// per grammar/arch as they become known.  Rows with nominal_ipt_4B == 0
-// mean "unknown arch; fall back to the shmem-based search".
+// Values marked `[measured]` come from
+// `benchmarks/sweep-cuda-lexer.sh` on the JSON grammar for the given
+// arch and are the fastest observed setting at ELEM_BYTES = 4
+// (state_t = u16, index_t = i32).  Values marked `[cub]` are copied
+// directly from CUB's DeviceScan `NOMINAL_ITEMS_PER_THREAD_4B` and are
+// starting points until we have measurements.  Rows with
+// nominal_ipt_4B == 0 mean "unknown arch; fall back to the shmem-based
+// search".  Replace `[cub]` with `[measured]` as sweep data comes in.
 template<int SM_ARCH, size_t ELEM_BYTES>
 struct alpacc_ipt_tuning {
   static constexpr uint32_t nominal_ipt_4B = 0;
   static constexpr uint32_t block_size     = 256;
 };
 
-// Pascal (sm_60, sm_61) — Tesla P100 / GP102
+// Pascal (sm_60, sm_61) — Tesla P100 / GP102          [cub]
 template<size_t ELEM> struct alpacc_ipt_tuning<60, ELEM> {
   static constexpr uint32_t nominal_ipt_4B = 15;
   static constexpr uint32_t block_size     = 128;
@@ -109,54 +114,64 @@ template<size_t ELEM> struct alpacc_ipt_tuning<61, ELEM> {
   static constexpr uint32_t block_size     = 128;
 };
 
-// Volta (sm_70) — V100
+// Volta (sm_70) — V100                                 [cub]
 template<size_t ELEM> struct alpacc_ipt_tuning<70, ELEM> {
   static constexpr uint32_t nominal_ipt_4B = 15;
   static constexpr uint32_t block_size     = 128;
 };
 
-// Turing (sm_75) — T4, 1660 Ti, RTX 20xx
+// Turing (sm_75) — T4, 1660 Ti, RTX 20xx               [measured]
+// Sweep on the JSON grammar (index_t = i32, 10M-token dataset) with
+// `benchmarks/sweep-cuda-lexer.sh` picked BS=256, IPT=12 as the
+// fastest (2832 μs kernel-only vs 2929 μs at CUB's IPT=8).
+// nominal_ipt_4B = 12 * 4 / 4 = 12.
 template<size_t ELEM> struct alpacc_ipt_tuning<75, ELEM> {
-  static constexpr uint32_t nominal_ipt_4B = 8;
+  static constexpr uint32_t nominal_ipt_4B = 12;
   static constexpr uint32_t block_size     = 256;
 };
 
-// Ampere data-centre (sm_80) — A100
+// Ampere data-centre (sm_80) — A100                    [cub]
 template<size_t ELEM> struct alpacc_ipt_tuning<80, ELEM> {
   static constexpr uint32_t nominal_ipt_4B = 12;
   static constexpr uint32_t block_size     = 128;
 };
 
-// Ampere consumer (sm_86) — RTX 30xx, A40
+// Ampere consumer (sm_86) — RTX 30xx, A40              [cub]
 template<size_t ELEM> struct alpacc_ipt_tuning<86, ELEM> {
   static constexpr uint32_t nominal_ipt_4B = 12;
   static constexpr uint32_t block_size     = 128;
 };
 
-// Ada Lovelace (sm_89) — RTX 40xx, L4/L40
+// Ada Lovelace (sm_89) — RTX 40xx, L4/L40              [cub]
 template<size_t ELEM> struct alpacc_ipt_tuning<89, ELEM> {
   static constexpr uint32_t nominal_ipt_4B = 12;
   static constexpr uint32_t block_size     = 128;
 };
 
-// Hopper (sm_90) — H100
+// Hopper (sm_90) — H100                                [cub]
 template<size_t ELEM> struct alpacc_ipt_tuning<90, ELEM> {
   static constexpr uint32_t nominal_ipt_4B = 15;
   static constexpr uint32_t block_size     = 128;
 };
 
-// Blackwell (sm_100) — B100/B200
+// Blackwell (sm_100) — B100/B200                       [cub]
 template<size_t ELEM> struct alpacc_ipt_tuning<100, ELEM> {
   static constexpr uint32_t nominal_ipt_4B = 15;
   static constexpr uint32_t block_size     = 128;
 };
 
-// Type-size bucket driver: the widest live element that the scan pipeline
-// touches per thread.  We use max(state_t, index_t) — length_t and
-// terminal_t are always narrower than these on realistic grammars.
+// Type-size bucket driver: sizeof(index_t).  The block-local max and add
+// scans run on I = uint32_t but their downstream register arrays
+// (`starts[IPT]`, `local_offs[IPT]`) and the SoA lookback buffers are
+// index_t-sized, which is what drives the scan's per-item register
+// pressure at the block boundary.  state_t affects a separate scan that
+// runs first; its impact on IPT is captured indirectly through the shmem
+// clamp in `max_items_per_thread()`.  length_t and terminal_t are always
+// narrower and don't move the optimum in practice.
 template<typename state_t, typename J>
 constexpr size_t elem_bytes() {
-  return sizeof(state_t) > sizeof(J) ? sizeof(state_t) : sizeof(J);
+  (void)sizeof(state_t);  // silence unused-template-parameter warnings
+  return sizeof(J);
 }
 
 // Table-driven IPT (0 if the arch is unknown, in which case callers fall

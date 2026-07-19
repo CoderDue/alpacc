@@ -25,20 +25,43 @@ cudaCli = $(embedStringFile "backends/cuda/cli.cu")
 generateTerminals :: UInt -> [Text] -> Text
 generateTerminals terminal_type terminal_names =
   Text.unlines
-    [ cudafyEnum "terminal_t" terminal_type terminal_names
+    [ "#ifndef ALPACC_TERMINAL_T",
+      "#define ALPACC_TERMINAL_T " <> cudafy terminal_type,
+      "#endif",
+      cudafyEnumRaw "terminal_t" "ALPACC_TERMINAL_T" terminal_names
     ]
 
+-- | Emit an enum with a raw (already-computed) underlying-type token.
+-- Used so terminal_t's underlying type can go through the ALPACC_TERMINAL_T
+-- macro instead of being baked directly.
+cudafyEnumRaw :: Text -> Text -> [Text] -> Text
+cudafyEnumRaw name underlying names =
+  "enum " <> name <> " : " <> underlying
+    <> " {" <> Text.intercalate "," names <> "};"
+
+-- | Emit index_t and length_t as #ifndef-guarded typedefs so a builder can
+-- override either at nvcc invocation time via -DALPACC_INDEX_T=<type> or
+-- -DALPACC_LENGTH_T=<type> without regenerating the source.  The codegen
+-- defaults come from --index32 and the grammar's `length = <bits>` param.
 indexTypeAlias :: Bool -> Maybe UInt -> Text
 indexTypeAlias index32 mLenType =
   Text.unlines $
     (if index32 then ["#define INDEX32"] else [])
-      ++ [ "#ifdef INDEX32",
+      ++ [ "#ifndef ALPACC_INDEX_T",
+           "#ifdef INDEX32",
            "using index_t = int32_t;",
            "#else",
            "using index_t = int64_t;",
+           "#endif",
+           "#else",
+           "using index_t = ALPACC_INDEX_T;",
            "#endif"
          ]
-      ++ [ "using length_t = " <> lenT <> ";"
+      ++ [ "#ifndef ALPACC_LENGTH_T",
+           "using length_t = " <> lenT <> ";",
+           "#else",
+           "using length_t = ALPACC_LENGTH_T;",
+           "#endif"
          ]
   where
     lenT = case mLenType of

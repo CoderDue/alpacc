@@ -18,7 +18,11 @@ generateLexer :: Lexer -> Text
 generateLexer lex =
   (Text.strip . Text.pack)
     [i|
+#ifndef ALPACC_STATE_T
 using state_t = #{cudafy state_type};
+#else
+using state_t = ALPACC_STATE_T;
+#endif
 
 const size_t NUM_STATES = #{cudafy $ endomorphismsSize parallel_lexer};
 const size_t NUM_TRANS = 256;
