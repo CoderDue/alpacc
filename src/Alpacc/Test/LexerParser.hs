@@ -14,7 +14,7 @@ import Alpacc.Parser.LLP
 import Alpacc.Lexer.DFA
 import Alpacc.Lexer.FSA
 import Alpacc.Lexer.RegularExpression
-import Alpacc.Test.Lexer (TestMode (..), cfgLengthType, decodeWith, getUInt, putUInt, randomSeed)
+import Alpacc.Test.Lexer (TestMode (..), cfgLengthType, decodeWith, getSInt, getUInt, indexType, putSInt, putUInt, randomSeed)
 import Alpacc.Types
 import Alpacc.Util
 import Codec.Binary.UTF8.String (encodeChar)
@@ -78,34 +78,34 @@ newtype Inputs = Inputs [Input] deriving (Show)
 -- u64 num_tokens; token ids (terminal_t); starts (index_t); lengths (length_t);
 -- u64 num_nodes; production ids (production_t); parents (index_t);
 -- token parents (index_t, one per token).
-putOutput :: UInt -> UInt -> UInt -> Output -> Put
-putOutput _ _ _ (Output Nothing) = putWord8 0
-putOutput tw pw lw (Output (Just (CombinedResult toks tree))) = do
+putOutput :: UInt -> IInt -> UInt -> UInt -> Output -> Put
+putOutput _ _ _ _ (Output Nothing) = putWord8 0
+putOutput tw iw pw lw (Output (Just (CombinedResult toks tree))) = do
   putWord8 1
   putWord64le (fromIntegral $ length toks)
   mapM_ (putUInt tw . token) toks
-  mapM_ (putWord64le . fst . span) toks
+  mapM_ (putSInt iw . fromIntegral . fst . span) toks
   mapM_ (\lx -> putUInt lw (snd (span lx) - fst (span lx))) toks
   putWord64le (fromIntegral $ Seq.length $ flatProductions tree)
   mapM_ (putUInt pw) (flatProductions tree)
-  mapM_ putWord64le (flatParents tree)
-  mapM_ putWord64le (flatTokenParents tree)
+  mapM_ (putSInt iw . fromIntegral) (flatParents tree)
+  mapM_ (putSInt iw . fromIntegral) (flatTokenParents tree)
 
-getOutput :: UInt -> UInt -> UInt -> Get Output
-getOutput tw pw lw = do
+getOutput :: UInt -> IInt -> UInt -> UInt -> Get Output
+getOutput tw iw pw lw = do
   is_valid <- getWord8
   if is_valid == 1
     then do
       num_tokens <- getWord64le
       let nt = fromIntegral num_tokens
       ids <- replicateM nt (getUInt tw)
-      starts <- replicateM nt getWord64le
+      starts <- replicateM nt (fromIntegral <$> getSInt iw)
       lens <- replicateM nt (getUInt lw)
       num_nodes <- getWord64le
       let nn = fromIntegral num_nodes
       prods <- replicateM nn (getUInt pw)
-      parents <- replicateM nn getWord64le
-      token_parents <- replicateM nt getWord64le
+      parents <- replicateM nn (fromIntegral <$> getSInt iw)
+      token_parents <- replicateM nt (fromIntegral <$> getSInt iw)
       let toks = zipWith3 (\t i l -> Lexeme t (i, i + l)) ids starts lens
           tree =
             FlatTree
@@ -141,15 +141,15 @@ getInputs = do
   i <- getWord64le
   Inputs <$> replicateM (fromIntegral i) getInput
 
-putOutputs :: UInt -> UInt -> UInt -> Outputs -> Put
-putOutputs tw pw lw (Outputs results) = do
+putOutputs :: UInt -> IInt -> UInt -> UInt -> Outputs -> Put
+putOutputs tw iw pw lw (Outputs results) = do
   putWord64le (fromIntegral $ length results)
-  mapM_ (putOutput tw pw lw) results
+  mapM_ (putOutput tw iw pw lw) results
 
-getOutputs :: UInt -> UInt -> UInt -> Get Outputs
-getOutputs tw pw lw = do
+getOutputs :: UInt -> IInt -> UInt -> UInt -> Get Outputs
+getOutputs tw iw pw lw = do
   i <- getWord64le
-  Outputs <$> replicateM (fromIntegral i) (getOutput tw pw lw)
+  Outputs <$> replicateM (fromIntegral i) (getOutput tw iw pw lw)
 
 parse :: CFG -> Int -> Int -> Text -> Either Text (Maybe CombinedResult)
 parse cfg q k str = do
@@ -481,11 +481,12 @@ generateSingleLongLexerParserInput len _alpha dfa_lexer grammar h = do
     unaug (AugmentedTerminal (Used t)) = Just t
     unaug _ = Nothing
 
-lexerParserTests :: TestMode -> CFG -> Int -> Bool -> Either Text (LBS.ByteString, LBS.ByteString)
-lexerParserTests mode cfg n noOutputs = do
+lexerParserTests :: TestMode -> CFG -> Int -> Bool -> Bool -> Either Text (LBS.ByteString, LBS.ByteString)
+lexerParserTests mode cfg n noOutputs index32 = do
   let q = paramsLookback $ cfgParams cfg
       k = paramsLookahead $ cfgParams cfg
-      lw = cfgLengthType cfg
+      lw = cfgLengthType index32 cfg
+      iw = indexType index32
   spec <- cfgToDFALexerSpec cfg
   grammar <- cfgToGrammar cfg
   table <- llpParserTableWithStarts q k $ getGrammar grammar
@@ -502,7 +503,7 @@ lexerParserTests mode cfg n noOutputs = do
       let comb = listProducts n $ Set.toList alpha
           inp  = toInputs comb
           out  = if noOutputs then Outputs [] else toOutputs q k encoder dfa maybe_ignore (getGrammar grammar) table comb
-      pure (runPut $ putInputs inp, runPut $ putOutputs tw pw lw out)
+      pure (runPut $ putInputs inp, runPut $ putOutputs tw iw pw lw out)
     SingleLong ->
       Left "SingleLong mode must be handled via lexerParserTestsSingleLong"
   where
@@ -560,10 +561,11 @@ copySection src dst = do
 lexerParserTestsSingleLong ::
   CFG ->
   Int ->
+  Bool ->                      -- ^ True = index_t is int32_t (--index32)
   Handle ->                    -- ^ handle to write framed .inputs payload into
   Maybe (FilePath, Handle) ->  -- ^ Just (.outputs path, handle); Nothing when noOutputs
   IO (Either Text ())
-lexerParserTestsSingleLong cfg n h mOut = do
+lexerParserTestsSingleLong cfg n index32 h mOut = do
   let q = paramsLookback $ cfgParams cfg
       k = paramsLookahead $ cfgParams cfg
   case cfgToDFALexerSpec cfg of
@@ -577,7 +579,8 @@ lexerParserTestsSingleLong cfg n h mOut = do
           Right pw ->
             let ignore = T "ignore"
                 encoder = fromSymbolToTerminalEncoder $ encodeSymbols ignore grammar
-                lw = cfgLengthType cfg
+                lw = cfgLengthType index32 cfg
+                iw = indexType index32
              in case terminalIntType encoder of
                   Left e -> pure (Left e)
                   Right tw -> do
@@ -608,14 +611,14 @@ lexerParserTestsSingleLong cfg n h mOut = do
                           -- intermediate token list.
                           let emitProduction p parent = do
                                 LBS.hPut (secProds sections) (runPut (putUInt pw p))
-                                LBS.hPut (secParents sections) (runPut (putWord64le parent))
+                                LBS.hPut (secParents sections) (runPut (putSInt iw (fromIntegral parent)))
                               emitTokenParent parent =
-                                LBS.hPut (secTokenParents sections) (runPut (putWord64le parent))
+                                LBS.hPut (secTokenParents sections) (runPut (putSInt iw (fromIntegral parent)))
                           (stepFn, finalize) <-
                             llpParseDirectPush (getGrammar grammar) q k homoTable emitProduction emitTokenParent
                           let pushTok (Lexeme t m@(i, j)) = do
                                 LBS.hPut outH (runPut (putUInt tw (encTok t)))
-                                LBS.hPut (secStarts sections) (runPut (putWord64le i))
+                                LBS.hPut (secStarts sections) (runPut (putSInt iw (fromIntegral i)))
                                 LBS.hPut (secLengths sections) (runPut (putUInt lw (j - i)))
                                 stepFn (AugmentedTerminal (Used t), m)
                           mLex <- tokenizeWithBS dfa maybe_ignore payload pushTok
@@ -636,8 +639,8 @@ lexerParserTestsSingleLong cfg n h mOut = do
                               copySection (secTokenParents sections) outH
                               pure (Right ())
 
-lexerParserTestsCompare :: CFG -> ByteString -> ByteString -> ByteString -> Either Text ()
-lexerParserTestsCompare cfg input expected result = do
+lexerParserTestsCompare :: CFG -> Bool -> ByteString -> ByteString -> ByteString -> Either Text ()
+lexerParserTestsCompare cfg index32 input expected result = do
   grammar <- cfgToGrammar cfg
   pw <- productionIntType grammar
   let ignore = T "ignore"
@@ -647,11 +650,12 @@ lexerParserTestsCompare cfg input expected result = do
           [ (fromIntegral i :: Word64, t)
           | (i, Used t) <- zip [0 :: Integer ..] (toTerminals encoder)
           ]
-      lw = cfgLengthType cfg
+      lw = cfgLengthType index32 cfg
+      iw = indexType index32
   tw <- terminalIntType encoder
   Inputs inp <- decodeWith "Error: Could not parse input file." getInputs input
-  Outputs ex <- decodeWith "Error: Could not parse expected output file." (getOutputs tw pw lw) expected
-  Outputs res <- decodeWith "Error: Could not parse result output file." (getOutputs tw pw lw) result
+  Outputs ex <- decodeWith "Error: Could not parse expected output file." (getOutputs tw iw pw lw) expected
+  Outputs res <- decodeWith "Error: Could not parse result output file." (getOutputs tw iw pw lw) result
   failwith (length inp == length ex) "Error: Input and expected output file do not have the same number of tests."
   failwith (length inp == length res) "Error: Input and result output file do not have the same number of tests."
 

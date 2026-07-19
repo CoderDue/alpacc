@@ -26,10 +26,11 @@
 set -euo pipefail
 
 show_usage() {
-    echo "Usage: $0 <grammar.alp> [backend] [length]"
+    echo "Usage: $0 <grammar.alp> [backend] [length] [--index32]"
     echo "  grammar.alp  path to the .alp grammar file"
     echo "  backend      c (default), cuda, or any futhark backend"
     echo "  length       input length (default: 100000)"
+    echo "  --index32    generate + verify with 32-bit index_t (default: 64-bit)"
 }
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
@@ -44,9 +45,14 @@ export PATH="$HOME/bin:$PATH"
 GRAMMAR="$(realpath "$1")"
 backend="${2:-c}"
 length="${3:-100000}"
+index_flag="${4:-}"
+if [ -n "$index_flag" ] && [ "$index_flag" != "--index32" ]; then
+    echo "error: unrecognised argument '$index_flag' (expected --index32 or omitted)" >&2
+    show_usage; exit 1
+fi
 grammar_name="$(basename "$GRAMMAR" .alp)"
 
-echo "Testing '$grammar_name' grammar with backend '$backend' (length=$length)..."
+echo "Testing '$grammar_name' grammar with backend '$backend' (length=$length${index_flag:+, $index_flag})..."
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 temp_dir=$(mktemp -d)
@@ -61,7 +67,7 @@ setup_c() { :; }
 run_backend_c() {
     local mode_flag="$1" stem="$2"
     # shellcheck disable=SC2086
-    if ! alpacc c "$GRAMMAR" $mode_flag -o "${stem}.c"; then
+    if ! alpacc c "$GRAMMAR" $mode_flag $index_flag -o "${stem}.c"; then
         echo "ERROR: alpacc c failed"; return 1
     fi
     if ! cc -std=c99 -O2 ${CFLAGS:-} -o "${stem}" "${stem}.c" &>/dev/null; then
@@ -80,7 +86,7 @@ run_backend_cuda() {
     local mode_flag="$1" stem="$2"
     local arch="${CUDA_ARCH:-native}"
     # shellcheck disable=SC2086
-    if ! alpacc cuda "$GRAMMAR" $mode_flag -o "${stem}.cu"; then
+    if ! alpacc cuda "$GRAMMAR" $mode_flag $index_flag -o "${stem}.cu"; then
         echo "ERROR: alpacc cuda failed"; return 1
     fi
     if ! nvcc -O3 -std=c++17 -arch="$arch" -o "${stem}" "${stem}.cu" &>/dev/null; then
@@ -114,7 +120,7 @@ run_backend_futhark() {
     cp -r "$futhark_pkg_dir/lib" .
     cp "$futhark_pkg_dir/futhark.pkg" .
     # shellcheck disable=SC2086
-    if ! alpacc futhark "$GRAMMAR" $mode_flag; then
+    if ! alpacc futhark "$GRAMMAR" $mode_flag $index_flag; then
         echo "ERROR: alpacc futhark failed"; return 1
     fi
     # futhark script -b emits a 16-byte header before the binary payload; strip it.
@@ -170,7 +176,7 @@ run_test() {
     cd "$work_dir"
 
     # shellcheck disable=SC2086
-    if ! alpacc test generate "$GRAMMAR" --single-long --length "$length" $mode_flag; then
+    if ! alpacc test generate "$GRAMMAR" --single-long --length "$length" $mode_flag $index_flag; then
         echo "ERROR: alpacc test generate failed for $mode_name mode"; return 1
     fi
 
@@ -181,7 +187,7 @@ run_test() {
     # shellcheck disable=SC2086
     if ! alpacc test compare "$GRAMMAR" \
             "${grammar_name}.inputs" "${grammar_name}.outputs" "${grammar_name}.results" \
-            $mode_flag; then
+            $mode_flag $index_flag; then
         echo "ERROR: test FAILED for $grammar_name $mode_name mode"; return 1
     fi
 

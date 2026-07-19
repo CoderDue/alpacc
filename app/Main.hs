@@ -88,7 +88,8 @@ data TestGenerateParameters = TestGenerateParameters
     testGenerateLength :: !Int,
     testGenerateGenerator :: !Gen,
     testGenerateMode :: !TestMode,
-    testGenerateNoOutputs :: !Bool
+    testGenerateNoOutputs :: !Bool,
+    testGenerateIndex32 :: !Bool
   }
   deriving (Show)
 
@@ -97,7 +98,8 @@ data TestCompareParameters = TestCompareParameters
     testCompareInput :: !String,
     testCompareExpected :: !String,
     testCompareResult :: !String,
-    testCompareGenerator :: !Gen
+    testCompareGenerator :: !Gen,
+    testCompareIndex32 :: !Bool
   }
   deriving (Show)
 
@@ -280,6 +282,7 @@ testGenerateParameters =
               ( long "no-outputs"
                   <> help "Only write the .inputs file, skip generating .outputs."
               )
+            <*> switch (long "index32" <> help "Use 32-bit indices in the .outputs wire format (matches the generator's --index32).")
         )
 
 testCompareParameters :: Parser Command
@@ -291,6 +294,7 @@ testCompareParameters =
             <*> argument str (metavar "FILE")
             <*> argument str (metavar "FILE")
             <*> generateParametar
+            <*> switch (long "index32" <> help "Interpret the result file with 32-bit indices (matches the generator's --index32).")
         )
 
 testCommands :: Parser Command
@@ -436,7 +440,7 @@ mainTestGenerate params = do
   case testGenerateGenerator params of
     GenLexer -> case mode of
       Exhaustive -> do
-        (inputs, ouputs) <- eitherToIO $ lexerTests mode cfg len noOutputs
+        (inputs, ouputs) <- eitherToIO $ lexerTests mode cfg len noOutputs index32
         LBS.writeFile (name <> ".inputs") inputs
         unless noOutputs $ LBS.writeFile (name <> ".outputs") ouputs
       SingleLong -> do
@@ -445,7 +449,7 @@ mainTestGenerate params = do
         mOutH <- if noOutputs
                    then pure Nothing
                    else Just <$> openBinaryFile (name <> ".outputs") WriteMode
-        result <- lexerTestsSingleLong cfg len h mOutH
+        result <- lexerTestsSingleLong cfg len index32 h mOutH
         hClose h
         mapM_ hClose mOutH
         eitherToIO result
@@ -466,7 +470,7 @@ mainTestGenerate params = do
         eitherToIO result
     GenBoth -> case mode of
       Exhaustive -> do
-        (inputs, ouputs) <- eitherToIO $ lexerParserTests mode cfg len noOutputs
+        (inputs, ouputs) <- eitherToIO $ lexerParserTests mode cfg len noOutputs index32
         LBS.writeFile (name <> ".inputs") inputs
         unless noOutputs $ LBS.writeFile (name <> ".outputs") ouputs
       SingleLong -> do
@@ -476,7 +480,7 @@ mainTestGenerate params = do
         mOutH <- if noOutputs
                    then pure Nothing
                    else Just . (outputsFile,) <$> openBinaryFile outputsFile WriteMode
-        result <- lexerParserTestsSingleLong cfg len h mOutH
+        result <- lexerParserTestsSingleLong cfg len index32 h mOutH
         hClose h
         mapM_ (hClose . snd) mOutH
         eitherToIO result
@@ -486,6 +490,7 @@ mainTestGenerate params = do
     len = testGenerateLength params
     mode = testGenerateMode params
     noOutputs = testGenerateNoOutputs params
+    index32 = testGenerateIndex32 params
 
 mainTestCompare :: TestCompareParameters -> IO ()
 mainTestCompare params = do
@@ -496,7 +501,7 @@ mainTestCompare params = do
 
   case testCompareGenerator params of
     GenLexer -> do
-      () <- eitherToIO $ lexerTestsCompare cfg input_bytes expected_bytes result_bytes
+      () <- eitherToIO $ lexerTestsCompare cfg index32 input_bytes expected_bytes result_bytes
       putStrLn "Tests passes."
       pure ()
     GenParser -> do
@@ -504,7 +509,7 @@ mainTestCompare params = do
       putStrLn "Tests passes."
       pure ()
     GenBoth -> do
-      () <- eitherToIO $ lexerParserTestsCompare cfg input_bytes expected_bytes result_bytes
+      () <- eitherToIO $ lexerParserTestsCompare cfg index32 input_bytes expected_bytes result_bytes
       putStrLn "Tests passes."
       pure ()
   where
@@ -512,6 +517,7 @@ mainTestCompare params = do
     input = testCompareInput params
     expected = testCompareExpected params
     result = testCompareResult params
+    index32 = testCompareIndex32 params
 
 main :: IO ()
 main = do

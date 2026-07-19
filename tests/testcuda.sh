@@ -13,14 +13,16 @@
 # Requires nvcc and an NVIDIA GPU; not run in hosted CI (GPU-less).
 
 show_usage() {
-    echo "Usage: $0 [q_value] [k_value] [target_runs] [parallel_jobs] [type_flag] [arch]"
+    echo "Usage: $0 [q_value] [k_value] [target_runs] [parallel_jobs] [type_flag] [arch] [--index32]"
     echo "  q_value:       -q parameter for alpacc (default: 1)"
     echo "  k_value:       -k parameter for alpacc (default: 1)"
     echo "  target_runs:   number of successful grammars (default: 10)"
     echo "  parallel_jobs: number of parallel jobs (default: 1)"
     echo "  type_flag:     --lexer, --parser, or empty for combined (default: empty)"
     echo "  arch:          nvcc -arch value (default: native)"
+    echo "  --index32:     pass --index32 to generator and test tools (default: 64-bit)"
     echo "Example: $0 1 1 20 1 '' native"
+    echo "Example: $0 1 1 20 1 '' native --index32"
 }
 
 if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
@@ -35,6 +37,11 @@ target="${3:-10}"
 parallel_jobs="${4:-1}"
 type_flag="${5:-}"
 arch="${6:-native}"
+index_flag="${7:-}"
+if [ -n "$index_flag" ] && [ "$index_flag" != "--index32" ]; then
+    echo "Error: unrecognised index flag '$index_flag' (expected --index32 or empty)"
+    show_usage; exit 1
+fi
 
 if ! [[ "$q_value" =~ ^[0-9]+$ ]] || ! [[ "$k_value" =~ ^[0-9]+$ ]] || ! [[ "$target" =~ ^[0-9]+$ ]]; then
     echo "Error: q_value, k_value, and target must be positive integers"
@@ -48,7 +55,7 @@ fi
 
 echo "Starting alpacc CUDA testing..."
 echo "Target: $target successful grammars"
-echo "Using -q $q_value -k $k_value ${type_flag:-<combined>}"
+echo "Using -q $q_value -k $k_value ${type_flag:-<combined>} ${index_flag}"
 echo "nvcc arch: $arch"
 echo "Running with $parallel_jobs parallel jobs"
 
@@ -69,6 +76,7 @@ run_test() {
     local done_file=$7
     local arch=$8
     local type_flag=$9
+    local index_flag=${10}
 
     local work_dir="$temp_dir/job_$job_id"
     mkdir -p "$work_dir"
@@ -93,7 +101,7 @@ ALPEOF
 
         # Try to generate CUDA code; skip grammars that fail codegen,
         # but fail fast on configuration errors or endless codegen failures.
-        if ! alpacc cuda random.alp $type_flag &> codegen_err.txt; then
+        if ! alpacc cuda random.alp $type_flag $index_flag &> codegen_err.txt; then
             if grep -q "must be positive" codegen_err.txt; then
                 echo "ERROR: alpacc rejected the configuration itself (job $job_id):"
                 cat codegen_err.txt
@@ -114,7 +122,7 @@ ALPEOF
         fi
 
         # Generate test inputs (small, to keep GPU memory bounded)
-        alpacc test generate random.alp $type_flag --length 4 &> /dev/null
+        alpacc test generate random.alp $type_flag $index_flag --length 4 &> /dev/null
 
         local all_ok=true
 
@@ -125,11 +133,11 @@ ALPEOF
                     -i random.inputs -o "results_${bs}_${ipt}.bin" 2>/dev/null
 
                 if ! alpacc test compare random.alp random.inputs random.outputs \
-                        "results_${bs}_${ipt}.bin" $type_flag &> /dev/null; then
+                        "results_${bs}_${ipt}.bin" $type_flag $index_flag &> /dev/null; then
                     echo "===== FAIL: batch BS=$bs IPT=$ipt, job $job_id ====="
                     cat random.alp
                     alpacc test compare random.alp random.inputs random.outputs \
-                        "results_${bs}_${ipt}.bin" $type_flag
+                        "results_${bs}_${ipt}.bin" $type_flag $index_flag
                     all_ok=false
                     break 2
                 fi
@@ -181,7 +189,7 @@ ALPEOF
 export -f run_test
 
 seq 1 $target | parallel --no-notice -j "$parallel_jobs" --halt soon,fail=1 --line-buffer \
-    "run_test {} $q_value $k_value $temp_dir $counter_file $target $done_file $arch '$type_flag'"
+    "run_test {} $q_value $k_value $temp_dir $counter_file $target $done_file $arch '$type_flag' '$index_flag'"
 
 final_count=$(cat "$counter_file")
 if [ "$final_count" -ge "$target" ]; then

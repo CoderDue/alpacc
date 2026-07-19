@@ -10,6 +10,10 @@ module Alpacc.Test.Lexer
     uintBytes,
     decodeWith,
     cfgLengthType,
+    indexType,
+    putSInt,
+    getSInt,
+    sintBytes,
   )
 where
 
@@ -39,7 +43,8 @@ import Data.Maybe (listToMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Word (Word8, Word64)
+import Data.Int (Int32, Int64)
+import Data.Word (Word8, Word32, Word64)
 import System.IO (Handle, SeekMode (..), hFlush, hSeek, hSetFileSize, hTell)
 import System.Random
 
@@ -90,35 +95,61 @@ getUInt U64 = getWord64le
 uintBytes :: UInt -> Word64
 uintBytes = fromIntegral . (`div` 8) . numBits
 
+-- | Little-endian, two's-complement putter for wire @index_t@ (signed).
+--   Only 32-bit and 64-bit widths are supported by the wire format.
+putSInt :: IInt -> Int64 -> Put
+putSInt I32 = putWord32le . fromIntegral . (fromIntegral :: Int64 -> Int32)
+putSInt I64 = putWord64le . fromIntegral
+putSInt w   = error $ "putSInt: unsupported wire width " <> show w
+
+-- | Little-endian, two's-complement getter for wire @index_t@ (signed).
+getSInt :: IInt -> Get Int64
+getSInt I32 = fromIntegral . (fromIntegral :: Word32 -> Int32) <$> getWord32le
+getSInt I64 = (fromIntegral :: Word64 -> Int64) <$> getWord64le
+getSInt w   = error $ "getSInt: unsupported wire width " <> show w
+
+sintBytes :: IInt -> Word64
+sintBytes I32 = 4
+sintBytes I64 = 8
+sintBytes w   = error $ "sintBytes: unsupported wire width " <> show w
+
 decodeWith :: Text -> Get a -> ByteString -> Either Text a
 decodeWith err g =
   bimap (const err) (\(_, _, a) -> a)
     . runGetOrFail g
     . LBS.fromStrict
 
--- | Derive the length-field type from a CFG's params (defaults to U64).
-cfgLengthType :: CFG -> UInt
-cfgLengthType cfg = case paramsLength (cfgParams cfg) of
+-- | Derive the length-field type from a CFG's params. When no explicit
+-- `length` param is set, defaults to the unsigned counterpart of index_t
+-- (U32 when --index32, else U64), matching the wire-protocol spec and
+-- the CUDA/Futhark generator defaults.
+cfgLengthType :: Bool -> CFG -> UInt
+cfgLengthType index32 cfg = case paramsLength (cfgParams cfg) of
   Just 8  -> U8
   Just 16 -> U16
   Just 32 -> U32
   Just 64 -> U64
-  _       -> U64
+  _       -> if index32 then U32 else U64
 
-putOutput :: UInt -> UInt -> Output -> Put
-putOutput _ _ (Output Nothing) = putWord8 0
-putOutput tw lw (Output (Just ts)) = do
+-- | Wire width of index_t for a given --index32 setting.
+indexType :: Bool -> IInt
+indexType True  = I32
+indexType False = I64
+
+putOutput :: UInt -> IInt -> UInt -> Output -> Put
+putOutput _ _ _ (Output Nothing) = putWord8 0
+putOutput tw iw lw (Output (Just ts)) = do
   putWord8 1
   putWord64le (fromIntegral $ length ts)
   mapM_ putToken ts
   where
     putToken (Lexeme t (i, j)) = do
       putUInt tw t
-      putWord64le i
+      putSInt iw (fromIntegral i)
       putUInt lw (j - i)
 
-getOutput :: UInt -> UInt -> Get Output
-getOutput tw lw = do
+getOutput :: UInt -> IInt -> UInt -> Get Output
+getOutput tw iw lw = do
   is_valid <- getWord8
   if is_valid == 1
     then do
@@ -128,7 +159,7 @@ getOutput tw lw = do
   where
     getLexeme = do
       t <- getUInt tw
-      i <- getWord64le
+      i <- fromIntegral <$> getSInt iw
       len <- getUInt lw
       pure $ Lexeme t (i, i + len)
 
@@ -157,15 +188,15 @@ getInputs = do
   i <- getWord64le
   Inputs <$> replicateM (fromIntegral i) getInput
 
-putOutputs :: UInt -> UInt -> Outputs -> Put
-putOutputs tw lw (Outputs results) = do
+putOutputs :: UInt -> IInt -> UInt -> Outputs -> Put
+putOutputs tw iw lw (Outputs results) = do
   putWord64le (fromIntegral $ length results)
-  mapM_ (putOutput tw lw) results
+  mapM_ (putOutput tw iw lw) results
 
-getOutputs :: UInt -> UInt -> Get Outputs
-getOutputs tw lw = do
+getOutputs :: UInt -> IInt -> UInt -> Get Outputs
+getOutputs tw iw lw = do
   i <- getWord64le
-  Outputs <$> replicateM (fromIntegral i) (getOutput tw lw)
+  Outputs <$> replicateM (fromIntegral i) (getOutput tw iw lw)
 
 -- | Precomputed dense-indexed DFA structures for the token-targeted walk.
 -- States are renumbered to dense Ints so the walk loop uses O(1) array
@@ -357,12 +388,13 @@ generateSingleLongInputFromDFA mBudget len alpha dfa_lexer =
          in map (alphaArr !) randomIndices
    in if null result then fallback else take len result
 
-lexerTests :: TestMode -> CFG -> Int -> Bool -> Either Text (LBS.ByteString, LBS.ByteString)
-lexerTests mode cfg k noOutputs = do
+lexerTests :: TestMode -> CFG -> Int -> Bool -> Bool -> Either Text (LBS.ByteString, LBS.ByteString)
+lexerTests mode cfg k noOutputs index32 = do
   spec <- cfgToDFALexerSpec cfg
   let ts = Map.keys $ regexMap spec
       encoder = encodeTerminals (T "ignore") $ parsingTerminals ts
-      lw = cfgLengthType cfg
+      lw = cfgLengthType index32 cfg
+      iw = indexType index32
   tw <- terminalIntType encoder
   dfa <-
     maybeToEither "Error: Could not encode tokens." $
@@ -380,7 +412,7 @@ lexerTests mode cfg k noOutputs = do
            in (toInputs [singleInput], if noOutputs then emptyOutputs else toOutputs dfa ignore [singleInput])
   pure
     ( runPut $ putInputs inputs,
-      runPut $ putOutputs tw lw outputs
+      runPut $ putOutputs tw iw lw outputs
     )
   where
     toOutputs dfa ignore = Outputs . fmap (Output . tokenize dfa ignore)
@@ -393,10 +425,11 @@ lexerTests mode cfg k noOutputs = do
 lexerTestsSingleLong ::
   CFG ->
   Int ->
+  Bool ->         -- ^ True = index_t is int32_t (--index32)
   Handle ->       -- ^ .inputs handle (ReadWriteMode for seek-back)
   Maybe Handle -> -- ^ Just outH to stream .outputs; Nothing when noOutputs
   IO (Either Text ())
-lexerTestsSingleLong cfg k h mOutH = do
+lexerTestsSingleLong cfg k index32 h mOutH = do
   case cfgToDFALexerSpec cfg of
     Left e -> pure (Left e)
     Right spec -> do
@@ -409,7 +442,8 @@ lexerTestsSingleLong cfg k h mOutH = do
                  lexerDFA (0 :: Integer) $ mapSymbols unBytes spec of
             Nothing -> pure (Left "Error: Could not encode tokens.")
             Just dfa -> do
-              let lw     = cfgLengthType cfg
+              let lw     = cfgLengthType index32 cfg
+                  iw     = indexType index32
                   ignore = fromIntegral <$> terminalLookup (T "ignore") encoder
                   alpha  = alphabet $ fsa dfa
                   singleInput = generateSingleLongInputFromDFA (Just 16) k alpha dfa
@@ -433,7 +467,7 @@ lexerTestsSingleLong cfg k h mOutH = do
                   let putLexeme (Lexeme t (i, j)) = do
                         LBS.hPut outH $ runPut $ do
                           putUInt tw t
-                          putWord64le i
+                          putSInt iw (fromIntegral i)
                           putUInt lw (j - i)
                         modifyIORef' tokCountRef (+ 1)
                   mResult <- tokenizeWithBS dfa ignore payload putLexeme
@@ -459,21 +493,22 @@ lexerBytes cfg k = do
       alpha = alphabet $ fsa dfa
   pure $ ByteString.pack $ generateSingleLongInputFromDFA (Just 16) k alpha dfa
 
-lexerTestsCompare :: CFG -> ByteString -> ByteString -> ByteString -> Either Text ()
-lexerTestsCompare cfg input expected result = do
+lexerTestsCompare :: CFG -> Bool -> ByteString -> ByteString -> ByteString -> Either Text ()
+lexerTestsCompare cfg index32 input expected result = do
   spec <- cfgToDFALexerSpec cfg
 
   let ts = Map.keys $ regexMap spec
       encoder = encodeTerminals (T "ignore") $ parsingTerminals ts
-      lw = cfgLengthType cfg
+      lw = cfgLengthType index32 cfg
+      iw = indexType index32
   tw <- terminalIntType encoder
   encodings <-
     maybeToEither "Error: Could not encode tokens." $
       mapM (fmap fromIntegral . (`terminalLookup` encoder)) ts
   let int_to_token = Map.fromList $ zip encodings ts
   Inputs inp <- decodeWith "Error: Could not parse input file." getInputs input
-  Outputs ex <- decodeWith "Error: Could not parse expected output file." (getOutputs tw lw) expected
-  Outputs res <- decodeWith "Error: Could not parse result output file." (getOutputs tw lw) result
+  Outputs ex <- decodeWith "Error: Could not parse expected output file." (getOutputs tw iw lw) expected
+  Outputs res <- decodeWith "Error: Could not parse result output file." (getOutputs tw iw lw) result
   failwith (length inp == length ex) "Error: Input and expected output file do not have the same number of tests."
   failwith (length inp == length res) "Error: Input and result output file do not have the same number of tests."
 

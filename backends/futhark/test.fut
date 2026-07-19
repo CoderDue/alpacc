@@ -12,8 +12,8 @@
 --   output: u64 num_tests, then per test a response record:
 --           u8 valid; if valid: u64 count, then native-width fields.
 -- All integers are little-endian; token/production ids use the
--- grammar's native widths, starts and parents are 8 bytes (idx.t),
--- lengths use the grammar's len.t width.
+-- grammar's native widths, starts and parents are sizeof(idx.t) bytes
+-- (2's-complement signed), lengths use the grammar's len.t width.
 
 import "lib/github.com/diku-dk/containers/core/opt"
 
@@ -43,12 +43,13 @@ module lexer_test
 
   def terminal_bytes : i64 = i64.i32 T.num_bits / 8
   def length_bytes   : i64 = i64.i32 len.num_bits / 8
-  def lexeme_bytes   : i64 = terminal_bytes + 8 + length_bytes
+  def idx_bytes      : i64 = i64.i32 idx.num_bits / 8
+  def lexeme_bytes   : i64 = terminal_bytes + idx_bytes + length_bytes
 
   #[inline]
   def encode_terminal ((t, (i, j)): (terminal, (idx.t, len.t))) : [lexeme_bytes]u8 =
     sized lexeme_bytes (encode_le terminal_bytes (u64.i64 (T.to_i64 t))
-                        ++ encode_u64 (u64.i64 (idx.to_i64 i))
+                        ++ encode_le idx_bytes    (u64.i64 (idx.to_i64 i))
                         ++ encode_le length_bytes (u64.i64 (len.to_i64 j)))
 
   #[inline]
@@ -151,10 +152,11 @@ module lexer_parser_test
   def terminal_bytes  : i64 = i64.i32 T.num_bits / 8
   def production_bytes: i64 = i64.i32 Q.num_bits / 8
   def length_bytes    : i64 = i64.i32 len.num_bits / 8
+  def idx_bytes       : i64 = i64.i32 idx.num_bits / 8
 
   #[inline]
-  def encode_idx (i: idx.t) : [8]u8 =
-    encode_u64 (u64.i64 (idx.to_i64 i))
+  def encode_idx (i: idx.t) : [idx_bytes]u8 =
+    encode_le idx_bytes (u64.i64 (idx.to_i64 i))
 
   -- SoA response record: u8 valid; u64 num_tokens; token ids, starts,
   -- lengths; u64 num_nodes; production ids, parents; token parents.
