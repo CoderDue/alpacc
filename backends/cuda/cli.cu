@@ -107,6 +107,10 @@ static void print_layout(void) {
     printf("block_size=%u\n", (unsigned)ALPACC_BLOCK_SIZE);
     printf("items_per_thread=%u\n", (unsigned)ALPACC_ITEMS_PER_THREAD);
 #endif
+#ifdef HAS_PARSER
+    printf("parser_block_size=%u\n", (unsigned)ALPACC_PARSER_BLOCK_SIZE);
+    printf("parser_items_per_thread=%u\n", (unsigned)ALPACC_PARSER_ITEMS_PER_THREAD);
+#endif
 }
 
 static void usage(const char* prog) {

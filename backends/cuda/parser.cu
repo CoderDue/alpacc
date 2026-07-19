@@ -45,9 +45,27 @@
 // ---------------------------------------------------------------------------
 // Fused kernel configuration
 // ---------------------------------------------------------------------------
+//
+// Block size and items-per-thread for the cooperative parser kernel.  Both
+// are compile-time constants — the kernel is not templated on them, so
+// changing them at runtime is not possible; rebuild with different -D
+// flags to try a different tuning.  Same override pattern as the lexer's
+// ALPACC_BLOCK_SIZE / ALPACC_ITEMS_PER_THREAD:
+//
+//   nvcc -DALPACC_PARSER_BLOCK_SIZE=128 -DALPACC_PARSER_ITEMS_PER_THREAD=8 ...
+//
+// Defaults (BS=256, IPT=4) are the tile size at which the fused pipeline
+// was originally tuned.  The parser and lexer kernels run back-to-back
+// (never concurrently) so their (BS, IPT) can be picked independently.
+#ifndef ALPACC_PARSER_BLOCK_SIZE
+#define ALPACC_PARSER_BLOCK_SIZE 256
+#endif
+#ifndef ALPACC_PARSER_ITEMS_PER_THREAD
+#define ALPACC_PARSER_ITEMS_PER_THREAD 4
+#endif
 
-constexpr uint32_t FUSED_BS  = 256;  // block size (also the scan tile size)
-constexpr int      FUSED_IPT = 4;    // SPT items per thread (logical B = 1024)
+constexpr uint32_t FUSED_BS  = ALPACC_PARSER_BLOCK_SIZE;   // block size (also the scan tile size)
+constexpr int      FUSED_IPT = ALPACC_PARSER_ITEMS_PER_THREAD;    // SPT items per thread (logical B = FUSED_BS * FUSED_IPT)
 
 // ---------------------------------------------------------------------------
 // Bracket helpers
