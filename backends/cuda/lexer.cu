@@ -132,8 +132,8 @@ template<size_t ELEM> struct alpacc_ipt_tuning<75, ELEM> {
 
 // Ampere data-centre (sm_80) — A100                    [cub]
 template<size_t ELEM> struct alpacc_ipt_tuning<80, ELEM> {
-  static constexpr uint32_t nominal_ipt_4B = 12;
-  static constexpr uint32_t block_size     = 128;
+  static constexpr uint32_t nominal_ipt_4B = 20;
+  static constexpr uint32_t block_size     = 256;
 };
 
 // Ampere consumer (sm_86) — RTX 30xx, A40              [cub]
