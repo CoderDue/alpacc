@@ -43,6 +43,51 @@ constexpr size_t lexer_shmem_variable(uint32_t items_per_thread) {
   return states_bytes + exch_bytes;
 }
 
+// ---------------------------------------------------------------------------
+// Hot-arena shmem: compact level-k DFA transformation tables loaded once
+// per block and reused across reduction depths.
+//
+// Layout: one contiguous byte arena split into two regions:
+//   HEAD — rolling working set, reused per depth (guarded by __syncthreads).
+//   TAIL — promotion tables that survive to Phase C.  Laid out as:
+//          [state_lvl_0_to_state_t | state_lvl_1_to_state_t | ...]
+//
+// When HOT_MAX_LEVEL >= 1 the head holds the L1 compose table during Phase B
+// (overwriting the Phase-A byte->id table after a __syncthreads).
+//
+// All sizes are compile-time constants from the emitter (NUM_STATES_LVL_k,
+// sizeof(state_lvl_k_t)) so the arena size folds to a constexpr.
+
+__host__ __device__ constexpr size_t hot_arena_head_bytes() {
+  size_t d0 = NUM_TRANS * sizeof(state_lvl_0_t);
+  size_t peak = d0;
+#if HOT_MAX_LEVEL >= 1
+  size_t d1 = (size_t)NUM_STATES_LVL_0 * NUM_STATES_LVL_0 * sizeof(state_lvl_1_t);
+  peak = peak > d1 ? peak : d1;
+#endif
+#if HOT_MAX_LEVEL >= 2
+  size_t d2 = (size_t)NUM_STATES_LVL_1 * NUM_STATES_LVL_1 * sizeof(state_lvl_2_t);
+  peak = peak > d2 ? peak : d2;
+#endif
+  // Round up to sizeof(state_t) so the tail's state_t* views are aligned.
+  return (peak + sizeof(state_t) - 1) / sizeof(state_t) * sizeof(state_t);
+}
+
+__host__ __device__ constexpr size_t hot_arena_tail_bytes() {
+  size_t s = NUM_STATES_LVL_0 * sizeof(state_t);
+#if HOT_MAX_LEVEL >= 1
+  s += NUM_STATES_LVL_1 * sizeof(state_t);
+#endif
+#if HOT_MAX_LEVEL >= 2
+  s += NUM_STATES_LVL_2 * sizeof(state_t);
+#endif
+  return s;
+}
+
+__host__ __device__ constexpr size_t hot_arena_bytes() {
+  return hot_arena_head_bytes() + hot_arena_tail_bytes();
+}
+
 template<typename I, typename state_t, uint32_t BLOCK_SIZE>
 constexpr size_t lexer_shmem_fixed() {
   // cub TempStorage: one for the state scan (state_t) and one shared between
@@ -56,7 +101,7 @@ constexpr size_t lexer_shmem_fixed() {
   size_t fixed_scalars = sizeof(state_t)      // next_block_first_state
                         + sizeof(I)           // last_start
                         + sizeof(I);          // num_sel_sh
-  return cub_state_temp + cub_u32_temp + lookback + fixed_scalars;
+  return cub_state_temp + cub_u32_temp + lookback + fixed_scalars + hot_arena_bytes();
 }
 
 // Largest ITEMS_PER_THREAD ≤ HARD_CAP whose per-block shmem footprint fits
@@ -220,6 +265,36 @@ bool is_produce_cpu(state_t state) {
   return (state & PRODUCE_MASK) >> PRODUCE_OFFSET;
 }
 
+// ---------------------------------------------------------------------------
+// HotLevel<N>: compile-time trait for each compact representation level.
+// Each specialisation provides:
+//   id_t  — the compact integer type for this level
+//   SIZE  — number of distinct IDs
+// The actual shmem pointers are kernel-local (cannot be stored here).
+//
+// NOTE: the register scan (LexerCtx::operator(), scanReg<LexerCtx>) still
+// operates on state_t and d_compose (global memory) in this landing.
+// Higher levels (HOT_MAX_LEVEL >= 1) will replace those paths in a
+// follow-up; the framework below is ready to receive them.
+template<int LEVEL> struct HotLevel;   // primary undefined
+
+template<> struct HotLevel<0> {
+  using id_t = state_lvl_0_t;
+  static constexpr size_t SIZE = NUM_STATES_LVL_0;
+};
+#if HOT_MAX_LEVEL >= 1
+template<> struct HotLevel<1> {
+  using id_t = state_lvl_1_t;
+  static constexpr size_t SIZE = NUM_STATES_LVL_1;
+};
+#endif
+#if HOT_MAX_LEVEL >= 2
+template<> struct HotLevel<2> {
+  using id_t = state_lvl_2_t;
+  static constexpr size_t SIZE = NUM_STATES_LVL_2;
+};
+#endif
+
 template<typename I, typename J>
 struct LexerCtx {
 
@@ -264,6 +339,13 @@ private:
 public:
   const I CHUNK_SIZE;
   States<I, state_t> d_state_states;
+  // Hot-level device tables: uploaded at construction, read by the kernel's
+  // cooperative-load phase into the per-block hot_arena.
+  state_lvl_0_t* d_to_state_lvl_0 = nullptr;
+  state_t*       d_state_lvl_0_to_state_t = nullptr;
+#if HOT_MAX_LEVEL >= 1
+  state_t*       d_state_lvl_1_to_state_t = nullptr;
+#endif
   // SoA inter-block buffer for the (max token-start, +produce-count) scan.
   // Both components are I (u32); keeping them in separate arrays avoids the
   // former packed-u64 layout that dragged 8-byte traffic through the warp
@@ -281,6 +363,18 @@ public:
     gpuAssert(cudaMalloc(&d_compose, sizeof(h_compose)));
     cudaMemcpy(d_compose, h_compose, sizeof(h_compose),
                  cudaMemcpyHostToDevice);
+    // Hot-level tables.
+    gpuAssert(cudaMalloc(&d_to_state_lvl_0, sizeof(h_to_state_lvl_0)));
+    cudaMemcpy(d_to_state_lvl_0, h_to_state_lvl_0, sizeof(h_to_state_lvl_0),
+               cudaMemcpyHostToDevice);
+    gpuAssert(cudaMalloc(&d_state_lvl_0_to_state_t, sizeof(h_state_lvl_0_to_state_t)));
+    cudaMemcpy(d_state_lvl_0_to_state_t, h_state_lvl_0_to_state_t, sizeof(h_state_lvl_0_to_state_t),
+               cudaMemcpyHostToDevice);
+#if HOT_MAX_LEVEL >= 1
+    gpuAssert(cudaMalloc(&d_state_lvl_1_to_state_t, sizeof(h_state_lvl_1_to_state_t)));
+    cudaMemcpy(d_state_lvl_1_to_state_t, h_state_lvl_1_to_state_t, sizeof(h_state_lvl_1_to_state_t),
+               cudaMemcpyHostToDevice);
+#endif
 
     d_maxadd_states = PairStates<I, I, I>(num_blocks);
     d_state_states = States<I, state_t>(num_blocks);
@@ -317,6 +411,11 @@ public:
 
   void cleanUp() {
     if (d_to_state) cudaFree(d_to_state);
+    if (d_to_state_lvl_0) cudaFree(d_to_state_lvl_0);
+    if (d_state_lvl_0_to_state_t) cudaFree(d_state_lvl_0_to_state_t);
+#if HOT_MAX_LEVEL >= 1
+    if (d_state_lvl_1_to_state_t) cudaFree(d_state_lvl_1_to_state_t);
+#endif
     if (d_new_last_start) cudaFree((void*)d_new_last_start);
     if (d_old_last_start) cudaFree((void*)d_old_last_start);
     if (d_compose) cudaFree(d_compose);
@@ -352,6 +451,10 @@ public:
   }
 
   __device__ __host__ __forceinline__
+  // Legacy byte->state_t path (used by host-side helpers and getLastState).
+  // The kernel tile-fill now goes through the shmem hot-level path
+  // (toState_hot lambda); this will be removed once all device call sites
+  // have migrated to the hot-level representation.
   state_t toState(const uint8_t &a) const {
 #ifdef __CUDA_ARCH__
     return __ldg(&d_to_state[a]);
@@ -467,6 +570,48 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   J*          exch_j = exch.as_j;
   length_t*   exch_l = exch.as_l;
   __shared__ state_t next_block_first_state;
+
+  // ---------------------------------------------------------------------------
+  // Hot-arena: compact level-k DFA tables in shared memory.
+  //
+  // HEAD (byte 0..hot_arena_head_bytes()-1): rolling working set.
+  //   Phase A (tile-fill): byte->L0 id table.
+  //   Phase B (reduction): L1 compose table overwrites Phase-A after sync.
+  // TAIL (hot_arena_head_bytes()..): promotion tables (id -> state_t),
+  //   one per level.  Written once at entry, live until promotion step.
+  //
+  // Aliasing between phases is safe because each phase boundary is guarded
+  // by __syncthreads() and no thread reads a Phase-A table after that barrier.
+  __shared__ __align__(8) unsigned char hot_arena[hot_arena_bytes()];
+
+  // Tail views: promotion tables (permanent for this kernel invocation).
+  state_t* s_state_lvl_0_to_state_t =
+      reinterpret_cast<state_t*>(hot_arena + hot_arena_head_bytes());
+#if HOT_MAX_LEVEL >= 1
+  state_t* s_state_lvl_1_to_state_t =
+      reinterpret_cast<state_t*>(hot_arena + hot_arena_head_bytes()
+                                 + NUM_STATES_LVL_0 * sizeof(state_t));
+#endif
+
+  // Head view for Phase A: byte -> L0 id.
+  state_lvl_0_t* s_to_state_lvl_0 =
+      reinterpret_cast<state_lvl_0_t*>(hot_arena);
+
+  // Cooperative population of the hot arena from global device pointers.
+  // Promotion tables (tail): written once, live for the full kernel.
+  for (I i = threadIdx.x; i < (I)NUM_STATES_LVL_0; i += BLOCK_SIZE)
+    s_state_lvl_0_to_state_t[i] = ctx.d_state_lvl_0_to_state_t[i];
+#if HOT_MAX_LEVEL >= 1
+  for (I i = threadIdx.x; i < (I)NUM_STATES_LVL_1; i += BLOCK_SIZE)
+    s_state_lvl_1_to_state_t[i] = ctx.d_state_lvl_1_to_state_t[i];
+#endif
+  // Head: Phase-A byte->L0 table.
+  for (I i = threadIdx.x; i < (I)NUM_TRANS; i += BLOCK_SIZE)
+    s_to_state_lvl_0[i] = ctx.d_to_state_lvl_0[i];
+
+  // All hot tables visible to all threads before tile-fill begins.
+  __syncthreads();
+
   // Main slots: ceil(ITEMS_PER_THREAD / 8) uint64_t registers per thread.
   // One extra slot is added to cover the single byte past the block boundary
   // needed for the boundary produce check (same as the original +1 trick).
@@ -516,6 +661,15 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   // in that case; for smaller IPT thread t's blocked items live in a
   // different thread's register slice.  See .claude-artifacts/
   // cuda-lexer-ipt-bug.md for details.
+
+  // Depth-0 helper: char -> state_lvl_0_t (shmem) -> state_t (shmem).
+  // The existing scanReg<LexerCtx> still consumes state_t in the tile;
+  // HOT_MAX_LEVEL >= 1 will insert a Phase-B reduction before that scan.
+  auto toState_hot = [&](uint8_t c) -> state_t {
+    state_lvl_0_t id = s_to_state_lvl_0[c];
+    return s_state_lvl_0_to_state_t[id];
+  };
+
 #pragma unroll
   for (uint32_t i = 0; i < VPT; i++) {
     I lid = (I)i * BLOCK_SIZE + threadIdx.x;
@@ -533,9 +687,9 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
       I shmem_idx = (lid_off / ITEMS_PER_THREAD) * SHMEM_STRIDE + (lid_off % ITEMS_PER_THREAD);
       if (gid < size && is_in_block) {
           if (gid == 0) {
-            states[shmem_idx] = ctx(ctx.getLastState(), reinterpret_cast<state_t>(ctx.toState(chars_reg[reg_off])));
+            states[shmem_idx] = ctx(ctx.getLastState(), toState_hot(chars_reg[reg_off]));
           } else {
-            states[shmem_idx] = ctx.toState(chars_reg[reg_off]);
+            states[shmem_idx] = toState_hot(chars_reg[reg_off]);
           }
       } else if (is_in_block) {
           states[shmem_idx] = IDENTITY;
@@ -544,7 +698,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
           // test.  Guarded by gid < size (not is_last_chunk): interior block
           // boundaries exist in the last chunk too, and for the final block
           // the byte is out of range regardless of chunk position.
-          next_block_first_state = ctx.toState(chars_reg[reg_off]);
+          next_block_first_state = toState_hot(chars_reg[reg_off]);
       }
     }
   }

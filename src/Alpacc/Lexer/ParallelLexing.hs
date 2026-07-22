@@ -3,6 +3,7 @@ module Alpacc.Lexer.ParallelLexing
     parallelLexer,
     EndoData (..),
     listCompositions,
+    lookupComposition,
     Sim (..),
   )
 where

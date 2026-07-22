@@ -1,5 +1,6 @@
 module Alpacc.Lexer.DFAParallelLexer
   ( intDfaParallelLexer,
+    dfaParallelLexer,
   )
 where
 

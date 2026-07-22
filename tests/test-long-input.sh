@@ -40,7 +40,6 @@ if [ $# -lt 1 ]; then
     echo "error: grammar file required" >&2; show_usage; exit 1
 fi
 
-export PATH="$HOME/bin:$PATH"
 
 GRAMMAR="$(realpath "$1")"
 backend="${2:-c}"

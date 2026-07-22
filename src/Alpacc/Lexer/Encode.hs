@@ -3,6 +3,7 @@ module Alpacc.Lexer.Encode
     IntParallelLexer (..),
     ParallelLexerMasks (..),
     stateIntType,
+    encodeEndoData,
   )
 where
 

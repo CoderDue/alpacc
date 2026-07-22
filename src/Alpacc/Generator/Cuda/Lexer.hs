@@ -1,6 +1,6 @@
 module Alpacc.Generator.Cuda.Lexer (generateLexer) where
 
-import Alpacc.Generator.Analyzer
+import Alpacc.Generator.Analyzer (HotLevelEmit (..), Lexer (..))
 import Alpacc.Generator.Cuda.Cudafy
 import Alpacc.Lexer.Encode
 import Alpacc.Lexer.ParallelLexing
@@ -13,6 +13,26 @@ import Prelude hiding (lex)
 
 cudaLexer :: Text
 cudaLexer = $(embedStringFile "backends/cuda/lexer.cu")
+
+emitHotLevel :: HotLevelEmit -> Text
+emitHotLevel hl =
+  (Text.strip . Text.pack)
+    [i|
+using state_lvl_#{n}_t = #{cudafy id_type};
+const size_t NUM_STATES_LVL_#{n} = #{helSize hl};
+#{byte_table}
+const state_t h_state_lvl_#{n}_to_state_t[NUM_STATES_LVL_#{n}] =
+  #{cudafy (helToStateT hl)};
+|]
+  where
+    n = helLevel hl
+    id_type = helIdType hl
+    byte_table = case helByteToId hl of
+      Nothing -> ""
+      Just ids ->
+        Text.pack
+          [i|const state_lvl_#{n}_t h_to_state_lvl_#{n}[NUM_TRANS] =
+  #{cudafy ids};|]
 
 generateLexer :: Lexer -> Text
 generateLexer lex =
@@ -43,6 +63,9 @@ const state_t h_compose[NUM_STATES * NUM_STATES] =
 
 const bool h_accept[NUM_STATES] =
   #{cudafy $ accept_array};
+
+#define HOT_MAX_LEVEL #{hot_max_level}
+#{hot_level_decls}
 |]
     <> cudaLexer
   where
@@ -59,6 +82,9 @@ const bool h_accept[NUM_STATES] =
     accept_array = acceptArray parallel_lexer
     iden = identity parallel_lexer
     state_type = stateType lex
+    hot_lvls = hotLevels lex
+    hot_max_level = length hot_lvls - 1 :: Int
+    hot_level_decls = Text.intercalate "\n" $ fmap emitHotLevel hot_lvls
 
     defToken t = [i|#define IGNORE_TOKEN #{t}|]
     ignore_token =

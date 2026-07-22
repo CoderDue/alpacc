@@ -2,6 +2,7 @@ module Alpacc.Generator.Analyzer
   ( Analyzer (..),
     Lexer (..),
     Parser (..),
+    HotLevelEmit (..),
     AnalyzerKind (..),
     Generator (..),
     mkLexer,
@@ -14,12 +15,14 @@ import Alpacc.CFG
 import Alpacc.Encode
 import Alpacc.Grammar
 import Alpacc.Lexer.DFA
-import Alpacc.Lexer.DFAParallelLexer
-import Alpacc.Lexer.Encode
+import Alpacc.Lexer.DFAParallelLexer (dfaParallelLexer)
+import Alpacc.Lexer.Encode (IntParallelLexer (..), ParallelLexerMasks (..), encodeEndoData, intParallelLexer, stateIntType)
+import Alpacc.Lexer.HotLevels
 import Alpacc.Lexer.ParallelLexing
 import Alpacc.Lexer.RegularExpression
 import Alpacc.Types
 import Data.Either.Extra
+import Data.IntMap.Strict qualified as IntMap
 import Data.Map qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as Text hiding (Text)
@@ -30,13 +33,24 @@ data Generator a
   { generate :: Analyzer a -> Text
   }
 
+-- | Emit-ready data for one hot level.
+data HotLevelEmit = HotLevelEmit
+  { helLevel :: !Int,
+    helSize :: !Int,
+    helIdType :: !UInt,
+    helToStateT :: ![Integer],
+    helByteToId :: !(Maybe [Integer])
+  }
+  deriving (Show)
+
 data Lexer
   = Lexer
   { stateType :: UInt,
     lexer :: IntParallelLexer Word8,
     ignoreToken :: Maybe Integer,
     deadToken :: Integer,
-    transitionToState :: [Integer]
+    transitionToState :: [Integer],
+    hotLevels :: [HotLevelEmit]
   }
   deriving (Show)
 
@@ -48,6 +62,55 @@ transitionToStateArray parallel_lexer =
       [0 .. 255]
   where
     to_endo = endomorphisms $ parLexer parallel_lexer
+
+-- Default shmem budget for hot level tables (in bytes).
+hotShmemBudget :: Int
+hotShmemBudget = 8192
+
+-- | Build the emit-ready hot levels from the pre-encoding parallel lexer.
+-- Uses the raw-E compositions to drive level construction, then encodes
+-- the promotion tables (hot_id -> state_t) via `encodeEndoData`.
+mkHotLevels ::
+  (Ord k) =>
+  ParallelLexerMasks ->
+  TerminalEncoder k ->
+  ParallelLexer Word8 (EndoData k) ->
+  [HotLevelEmit]
+mkHotLevels masks encoder raw_pl = fmap toEmit levels
+  where
+    encode = encodeEndoData masks encoder
+    raw_e_endos = fmap endo (endomorphisms raw_pl)
+    raw_e_comps = fmap (fmap endo) (compositions raw_pl)
+    raw_e_pl =
+      ParallelLexer
+        { compositions = raw_e_comps,
+          endomorphisms = raw_e_endos,
+          identity = endo (identity raw_pl),
+          endomorphismsSize = endomorphismsSize raw_pl,
+          dead = endo (dead raw_pl),
+          acceptArray = acceptArray raw_pl
+        }
+    levels = buildLevels hotShmemBudget raw_e_pl
+    e_to_endo_data =
+      IntMap.fromList $
+        [(endo v, v) | v <- Map.elems (endomorphisms raw_pl)]
+          ++ [(endo (identity raw_pl), identity raw_pl)]
+          ++ [(endo (dead raw_pl), dead raw_pl)]
+          ++ [ (endo v, v)
+             | row <- IntMap.elems (compositions raw_pl),
+               v <- IntMap.elems row
+             ]
+    encodeE e = case IntMap.lookup e e_to_endo_data of
+      Just ed -> encode ed
+      Nothing -> 0
+    toEmit hl =
+      HotLevelEmit
+        { helLevel = hlLevel hl,
+          helSize = hlSize hl,
+          helIdType = hotIdUInt hl,
+          helToStateT = fmap encodeE (hlToFullE hl),
+          helByteToId = fmap (fmap fromIntegral) (hlByteToId hl)
+        }
 
 data Parser
   = Parser
@@ -110,10 +173,13 @@ mkLexer cfg = do
       encoder = encodeTerminals ignore $ parsingTerminals $ dfaTerminals spec
       dfa = lexerDFA (0 :: Integer) $ mapSymbols unBytes spec
       terminal_to_name = nameTerminals encoder
+      raw_pl = dfaParallelLexer dfa
   terminal_type <- terminalIntType encoder
-  parallel_lexer <- intDfaParallelLexer encoder dfa
+  parallel_lexer <- intParallelLexer encoder raw_pl
   state_type <- stateIntType (parLexer parallel_lexer) encoder
   transition_to_state <- transitionToStateArray parallel_lexer
+  let lx_masks = parMasks parallel_lexer
+      hot_lvls = mkHotLevels lx_masks encoder raw_pl
   pure $
     Analyzer
       { analyzerKind =
@@ -123,7 +189,8 @@ mkLexer cfg = do
                 lexer = parallel_lexer,
                 deadToken = terminalDead encoder,
                 transitionToState = transition_to_state,
-                ignoreToken = terminalLookup ignore encoder
+                ignoreToken = terminalLookup ignore encoder,
+                hotLevels = hot_lvls
               },
         terminalToName = terminal_to_name,
         terminalType = terminal_type,
@@ -211,9 +278,12 @@ mkLexerParser cfg = do
   bracket_type <- bracketIntType s_encoder
   production_type <- productionIntType grammar
   hash_table <- llpHashTable q k empty_terminal grammar s_encoder
-  parallel_lexer <- intDfaParallelLexer t_encoder dfa
+  let raw_pl = dfaParallelLexer dfa
+  parallel_lexer <- intParallelLexer t_encoder raw_pl
   state_type <- stateIntType (parLexer parallel_lexer) t_encoder
   transition_to_state <- transitionToStateArray parallel_lexer
+  let lx_masks = parMasks parallel_lexer
+      hot_lvls = mkHotLevels lx_masks t_encoder raw_pl
   pure $
     Analyzer
       { analyzerKind =
@@ -223,7 +293,8 @@ mkLexerParser cfg = do
                   lexer = parallel_lexer,
                   deadToken = dead_token,
                   transitionToState = transition_to_state,
-                  ignoreToken = terminalLookup ignore t_encoder
+                  ignoreToken = terminalLookup ignore t_encoder,
+                  hotLevels = hot_lvls
                 }
             )
             ( Parser
