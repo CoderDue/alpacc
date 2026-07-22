@@ -344,6 +344,7 @@ public:
   state_lvl_0_t* d_to_state_lvl_0 = nullptr;
   state_t*       d_state_lvl_0_to_state_t = nullptr;
 #if HOT_MAX_LEVEL >= 1
+  state_lvl_1_t* d_compose_lvl_1 = nullptr;
   state_t*       d_state_lvl_1_to_state_t = nullptr;
 #endif
   // SoA inter-block buffer for the (max token-start, +produce-count) scan.
@@ -371,6 +372,9 @@ public:
     cudaMemcpy(d_state_lvl_0_to_state_t, h_state_lvl_0_to_state_t, sizeof(h_state_lvl_0_to_state_t),
                cudaMemcpyHostToDevice);
 #if HOT_MAX_LEVEL >= 1
+    gpuAssert(cudaMalloc(&d_compose_lvl_1, sizeof(h_compose_lvl_1)));
+    cudaMemcpy(d_compose_lvl_1, h_compose_lvl_1, sizeof(h_compose_lvl_1),
+               cudaMemcpyHostToDevice);
     gpuAssert(cudaMalloc(&d_state_lvl_1_to_state_t, sizeof(h_state_lvl_1_to_state_t)));
     cudaMemcpy(d_state_lvl_1_to_state_t, h_state_lvl_1_to_state_t, sizeof(h_state_lvl_1_to_state_t),
                cudaMemcpyHostToDevice);
@@ -414,6 +418,7 @@ public:
     if (d_to_state_lvl_0) cudaFree(d_to_state_lvl_0);
     if (d_state_lvl_0_to_state_t) cudaFree(d_state_lvl_0_to_state_t);
 #if HOT_MAX_LEVEL >= 1
+    if (d_compose_lvl_1) cudaFree(d_compose_lvl_1);
     if (d_state_lvl_1_to_state_t) cudaFree(d_state_lvl_1_to_state_t);
 #endif
     if (d_new_last_start) cudaFree((void*)d_new_last_start);
@@ -611,6 +616,11 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
 
   // All hot tables visible to all threads before tile-fill begins.
   __syncthreads();
+  // Head view for Phase B (aliased over Phase-A head after sync).
+#if HOT_MAX_LEVEL >= 1
+  state_lvl_1_t* s_compose_lvl_1 =
+      reinterpret_cast<state_lvl_1_t*>(hot_arena);
+#endif
 
   // Main slots: ceil(ITEMS_PER_THREAD / 8) uint64_t registers per thread.
   // One extra slot is added to cover the single byte past the block boundary
@@ -648,28 +658,16 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     }
   }
 
-  // Write toState results into blocked shmem (thread t owns
-  // states[t*SHMEM_STRIDE .. t*SHMEM_STRIDE+IPT)).  The register layout
-  // populated by glbToReg is *striped*: thread t's copy_reg[v] holds
-  // global bytes [v*BLOCK_SIZE*EPV + t*EPV, +EPV).  So the outer loop
-  // iterates striped positions (v, j) and computes both the destination
-  // shmem index and the source register byte from (v, j) — the register
-  // byte reg_off = v*EPV + j is guaranteed to belong to this thread.
-  // Iterating in blocked order (item i of thread t) is only safe when
-  // ITEMS_PER_THREAD == EPV, because thread t's blocked bytes t*IPT..
-  // t*IPT+IPT-1 only coincide with its striped bytes t*EPV..t*EPV+EPV-1
-  // in that case; for smaller IPT thread t's blocked items live in a
-  // different thread's register slice.  See .claude-artifacts/
-  // cuda-lexer-ipt-bug.md for details.
-
-  // Depth-0 helper: char -> state_lvl_0_t (shmem) -> state_t (shmem).
-  // The existing scanReg<LexerCtx> still consumes state_t in the tile;
-  // HOT_MAX_LEVEL >= 1 will insert a Phase-B reduction before that scan.
-  auto toState_hot = [&](uint8_t c) -> state_t {
-    state_lvl_0_t id = s_to_state_lvl_0[c];
-    return s_state_lvl_0_to_state_t[id];
-  };
-
+  // Phase A: map each byte to its L0 compact id.  glbToReg produced a
+  // *striped* register layout (thread t's copy_reg[v] holds global bytes
+  // [v*BLOCK_SIZE*EPV + t*EPV, +EPV)), so each thread's registers hold
+  // bytes that belong to *other* threads in blocked layout.  We route them
+  // through shmem: write in striped layout with shmem_idx =
+  //   (lid_off / IPT) * SHMEM_STRIDE + (lid_off % IPT)
+  // then each thread reads its own blocked slice back into registers.
+  // We reuse `states[]` (state_t tile, byte-addressable) as the transit
+  // buffer aliased as state_lvl_0_t.
+  state_lvl_0_t* l0_shmem = reinterpret_cast<state_lvl_0_t*>(states);
 #pragma unroll
   for (uint32_t i = 0; i < VPT; i++) {
     I lid = (I)i * BLOCK_SIZE + threadIdx.x;
@@ -679,41 +677,137 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
       I lid_off = (I)sizeof(uint64_t) * lid + (I)j;
       uint32_t reg_off = sizeof(uint64_t) * i + j;
       bool is_in_block = lid_off < (I)(ITEMS_PER_THREAD * BLOCK_SIZE);
-      // Blocked layout with SHMEM_STRIDE padding to break u16 bank conflicts.
-      // lid_off/IPT = thread index, lid_off%IPT = item index within thread,
-      // matching the read pattern states[t*SHMEM_STRIDE + item_i].  With
-      // ITEMS_PER_THREAD a power-of-two template constant the division and
-      // modulo compile down to shifts and masks.
-      I shmem_idx = (lid_off / ITEMS_PER_THREAD) * SHMEM_STRIDE + (lid_off % ITEMS_PER_THREAD);
-      if (gid < size && is_in_block) {
-          if (gid == 0) {
-            states[shmem_idx] = ctx(ctx.getLastState(), toState_hot(chars_reg[reg_off]));
-          } else {
-            states[shmem_idx] = toState_hot(chars_reg[reg_off]);
-          }
-      } else if (is_in_block) {
-          states[shmem_idx] = IDENTITY;
+      if (is_in_block) {
+        state_lvl_0_t id = (gid < size) ? s_to_state_lvl_0[chars_reg[reg_off]]
+                                        : s_to_state_lvl_0[0]; // identity byte
+        I shmem_idx = (lid_off / ITEMS_PER_THREAD) * SHMEM_STRIDE
+                    + (lid_off % ITEMS_PER_THREAD);
+        l0_shmem[shmem_idx] = id;
       } else if (lid_off == (I)(ITEMS_PER_THREAD * BLOCK_SIZE) && gid < size) {
-          // First byte of the next block, needed for the boundary produce
-          // test.  Guarded by gid < size (not is_last_chunk): interior block
-          // boundaries exist in the last chunk too, and for the final block
-          // the byte is out of range regardless of chunk position.
-          next_block_first_state = toState_hot(chars_reg[reg_off]);
+        // First byte of the next block for boundary produce test.
+        next_block_first_state = s_state_lvl_0_to_state_t[s_to_state_lvl_0[chars_reg[reg_off]]];
       }
     }
   }
-
   __syncthreads();
 
-  // State scan: read from shmem into registers, run scanReg (no TempStorage
-  // in shmem for state_t), then write inclusive results back so the
-  // produce-flag loop below can read states[lid] / states[lid+1].
+  // Reassemble this thread's blocked-layout IPT L0 ids from shmem.
+  state_lvl_0_t lvl0_ids[ITEMS_PER_THREAD];
   {
-    state_t st[ITEMS_PER_THREAD];
-    const I off = threadIdx.x * (SHMEM_STRIDE);
+    const I off = threadIdx.x * SHMEM_STRIDE;
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
-      st[i] = states[off + i];
+      lvl0_ids[i] = l0_shmem[off + i];
+  }
+  __syncthreads();
+
+#if HOT_MAX_LEVEL >= 1
+  // Phase B: pairwise in-register reduction using shmem L1 compose table.
+  // Reload the hot_arena head with the L1 compose table, aliasing over the
+  // Phase-A byte->L0 table.  Safe after __syncthreads: no thread reads
+  // s_to_state_lvl_0 past this point.
+  __syncthreads();
+  for (I i = threadIdx.x; i < (I)(NUM_STATES_LVL_0 * NUM_STATES_LVL_0); i += BLOCK_SIZE)
+    s_compose_lvl_1[i] = ctx.d_compose_lvl_1[i];
+  __syncthreads();
+
+  // Compose adjacent L0 pairs -> L1 ids; promote to state_t for the scan.
+  // The scan operates on a half-resolution tile (IPT/2 items per thread).
+  // OOB handling: characters past `size` must contribute IDENTITY to the
+  // scan (matching the baseline's `states[shmem_idx] = IDENTITY` for OOB
+  // positions).  For each pair (a, b):
+  //   both in-range  -> promote_L1(compose_L1(a, b))
+  //   a in-range only -> promote_L0(a)
+  //   b in-range only -> promote_L0(b)  [cannot happen: b > a in blocked layout]
+  //   neither in-range -> IDENTITY
+  constexpr uint32_t IPT1 = ITEMS_PER_THREAD / 2;
+  state_t scan_st[IPT1 > 0 ? IPT1 : 1];
+#pragma unroll
+  for (uint32_t i = 0; i < IPT1; i++) {
+    I gid_a = glb_offs + (I)threadIdx.x * ITEMS_PER_THREAD + (I)(2 * i);
+    I gid_b = gid_a + 1;
+    if (gid_b < size) {
+      state_lvl_0_t a = lvl0_ids[2 * i];
+      state_lvl_0_t b = lvl0_ids[2 * i + 1];
+      state_lvl_1_t composed = s_compose_lvl_1[(uint32_t)a * NUM_STATES_LVL_0 + (uint32_t)b];
+      scan_st[i] = s_state_lvl_1_to_state_t[composed];
+    } else if (gid_a < size) {
+      scan_st[i] = s_state_lvl_0_to_state_t[lvl0_ids[2 * i]];
+    } else {
+      scan_st[i] = IDENTITY;
+    }
+  }
+  // Carry the last (unpaired) L0 id as state_t when IPT is odd.
+#if (ITEMS_PER_THREAD % 2) == 1
+  {
+    I gid_last = glb_offs + (I)threadIdx.x * ITEMS_PER_THREAD + (I)(ITEMS_PER_THREAD - 1);
+    scan_st[IPT1] = (gid_last < size)
+        ? s_state_lvl_0_to_state_t[lvl0_ids[ITEMS_PER_THREAD - 1]]
+        : IDENTITY;
+  }
+#endif
+  constexpr uint32_t SCAN_IPT = IPT1 + (ITEMS_PER_THREAD % 2);
+
+  // Block-local exclusive scan + inter-block lookback on the reduced tile.
+  // excl_scan_st[i] gives the block-local exclusive prefix to pair i of this
+  // thread.  Composing with the inter-block pfx yields the full exclusive
+  // prefix to each pair, which we then expand back to per-character states.
+  {
+    using BlockScanSt = cub::BlockScan<state_t, BLOCK_SIZE>;
+    __shared__ typename BlockScanSt::TempStorage scan_temp_st;
+    state_t excl_scan_st[SCAN_IPT];
+    state_t agg_st;
+    BlockScanSt(scan_temp_st).ExclusiveScan(scan_st, excl_scan_st, IDENTITY, ctx, agg_st);
+    const state_t pfx = lookbackPrefix<state_t, I, LexerCtx<I, J>>(
+        ctx.d_state_states, ctx, IDENTITY, dyn_index, agg_st);
+
+    const I off = threadIdx.x * SHMEM_STRIDE;
+    for (uint32_t i = 0; i < SCAN_IPT; i++) {
+      uint32_t a = 2 * i;
+      uint32_t b = 2 * i + 1;
+      I gid_a = glb_offs + (I)threadIdx.x * ITEMS_PER_THREAD + (I)a;
+      I gid_b = gid_a + 1;
+      // Full exclusive prefix to pair i: inter-block pfx composed with the
+      // block-local exclusive prefix to this pair from prior threads/pairs.
+      state_t excl_pair = ctx(pfx, excl_scan_st[i]);
+      // For the very first position of the whole chunk, prepend getLastState()
+      // to carry over the cross-chunk DFA state.
+      if (dyn_index == 0 && threadIdx.x == 0 && i == 0)
+        excl_pair = ctx(excl_pair, ctx.getLastState());
+      // OOB positions get IDENTITY-composed, which is a no-op — matching the
+      // baseline's "fill OOB tile slots with IDENTITY then inclusive-scan"
+      // pattern (state after any OOB slot equals the state after the last
+      // valid slot before it, since IDENTITY is the monoid identity).
+      state_t incl_a = (gid_a < size)
+          ? ctx(excl_pair, s_state_lvl_0_to_state_t[lvl0_ids[a]])
+          : excl_pair;
+      states[off + a] = incl_a;
+      if (b < (uint32_t)ITEMS_PER_THREAD) {
+        state_t incl_b = (gid_b < size)
+            ? ctx(incl_a, s_state_lvl_0_to_state_t[lvl0_ids[b]])
+            : incl_a;
+        states[off + b] = incl_b;
+      }
+    }
+    __syncthreads();
+  }
+#else
+  // HOT_MAX_LEVEL == 0: promote L0 ids to state_t and run the full scan.
+  __syncthreads();
+  {
+    state_t st[ITEMS_PER_THREAD];
+    const I off = threadIdx.x * SHMEM_STRIDE;
+    bool is_first = (glb_offs == 0) && (threadIdx.x == 0);
+#pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+      I gid = glb_offs + (I)threadIdx.x * ITEMS_PER_THREAD + (I)i;
+      // OOB positions become IDENTITY so the inclusive scan (which then
+      // composes each item with the running block prefix) yields the state
+      // after the last valid character for all OOB slots.
+      st[i] = (gid < size) ? s_state_lvl_0_to_state_t[lvl0_ids[i]] : IDENTITY;
+      if (is_first && i == 0)
+        st[i] = ctx(ctx.getLastState(), st[i]);
+    }
     const state_t pfx = scanReg<state_t, I, LexerCtx<I, J>, ITEMS_PER_THREAD, BLOCK_SIZE>(
         st, ctx.d_state_states, ctx, IDENTITY, dyn_index);
 #pragma unroll
@@ -721,6 +815,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
       states[off + i] = ctx(pfx, st[i]);
     __syncthreads();
   }
+#endif
 
   // Split (max, +) block-local scans over u32 registers in blocked layout
   // (thread t owns tile positions [t*IPT, (t+1)*IPT)): the token-start Max

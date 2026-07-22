@@ -24,6 +24,7 @@ import Alpacc.Types
 import Data.Either.Extra
 import Data.IntMap.Strict qualified as IntMap
 import Data.Map qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text hiding (Text)
 import Data.Word
@@ -39,7 +40,10 @@ data HotLevelEmit = HotLevelEmit
     helSize :: !Int,
     helIdType :: !UInt,
     helToStateT :: ![Integer],
-    helByteToId :: !(Maybe [Integer])
+    helByteToId :: !(Maybe [Integer]),
+    -- | For level k>=1: flattened |L(k-1)|^2 -> Lk-id compose table.
+    -- Row-major by left argument: entry [a * |L(k-1)| + b] = compose(a, b).
+    helComposeTable :: !(Maybe [Integer])
   }
   deriving (Show)
 
@@ -103,13 +107,30 @@ mkHotLevels masks encoder raw_pl = fmap toEmit levels
     encodeE e = case IntMap.lookup e e_to_endo_data of
       Just ed -> encode ed
       Nothing -> 0
+    -- Build the compose table for level k>=1: maps (prev_id, prev_id) -> cur_id.
+    -- prev_es and cur_es are the full-E lists for level k-1 and k respectively.
+    -- The result is flattened row-major: entry [a * |prev| + b] = compose(a,b).
+    mkComposeTable prev_hl cur_hl =
+      let prev_es = hlToFullE prev_hl
+          cur_e_to_id = Map.fromList $ zip (hlToFullE cur_hl) [0 ..]
+          compose_raw a b = lookupComposition (compositions raw_e_pl) a b
+          entry a b = case compose_raw a b of
+            Just r -> fromMaybe 0 $ Map.lookup r cur_e_to_id
+            Nothing -> 0
+       in [entry a b | a <- prev_es, b <- prev_es]
     toEmit hl =
       HotLevelEmit
         { helLevel = hlLevel hl,
           helSize = hlSize hl,
           helIdType = hotIdUInt hl,
           helToStateT = fmap encodeE (hlToFullE hl),
-          helByteToId = fmap (fmap fromIntegral) (hlByteToId hl)
+          helByteToId = fmap (fmap fromIntegral) (hlByteToId hl),
+          helComposeTable =
+            if hlLevel hl == 0
+              then Nothing
+              else
+                let prev_hl = levels !! (hlLevel hl - 1)
+                 in Just $ fmap fromIntegral $ mkComposeTable prev_hl hl
         }
 
 data Parser

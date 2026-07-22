@@ -20,19 +20,28 @@ emitHotLevel hl =
     [i|
 using state_lvl_#{n}_t = #{cudafy id_type};
 const size_t NUM_STATES_LVL_#{n} = #{helSize hl};
-#{byte_table}
+#{byte_table}#{compose_table}
 const state_t h_state_lvl_#{n}_to_state_t[NUM_STATES_LVL_#{n}] =
   #{cudafy (helToStateT hl)};
 |]
   where
     n = helLevel hl
+    prev = n - 1
     id_type = helIdType hl
     byte_table = case helByteToId hl of
       Nothing -> ""
       Just ids ->
         Text.pack
           [i|const state_lvl_#{n}_t h_to_state_lvl_#{n}[NUM_TRANS] =
-  #{cudafy ids};|]
+  #{cudafy ids};
+|]
+    compose_table = case helComposeTable hl of
+      Nothing -> ""
+      Just tbl ->
+        Text.pack
+          [i|const state_lvl_#{n}_t h_compose_lvl_#{n}[NUM_STATES_LVL_#{prev} * NUM_STATES_LVL_#{prev}] =
+  #{cudafy tbl};
+|]
 
 generateLexer :: Lexer -> Text
 generateLexer lex =
