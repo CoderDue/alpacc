@@ -332,9 +332,9 @@ public:
   __device__ __host__ __forceinline__
   state_t operator()(const state_t &a, const state_t &b) const {
 #ifdef __CUDA_ARCH__
-    return __ldg(&d_compose[get_index(b) * NUM_STATES + get_index(a)]);
+    return __ldg(&d_compose[get_index(a) * NUM_STATES + get_index(b)]);
 #else
-    return d_compose[get_index(b) * NUM_STATES + get_index(a)];
+    return d_compose[get_index(a) * NUM_STATES + get_index(b)];
 #endif
   }
 
@@ -345,9 +345,9 @@ public:
   __device__ __host__ __forceinline__
   state_t operator()(const volatile state_t &a, const volatile state_t &b) const {
 #ifdef __CUDA_ARCH__
-    return __ldg(&d_compose[get_index(b) * NUM_STATES + get_index(a)]);
+    return __ldg(&d_compose[get_index(a) * NUM_STATES + get_index(b)]);
 #else
-    return d_compose[get_index(b) * NUM_STATES + get_index(a)];
+    return d_compose[get_index(a) * NUM_STATES + get_index(b)];
 #endif
   }
 

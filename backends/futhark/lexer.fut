@@ -70,7 +70,7 @@ module mk_lexer (L: lexer_context)
     #[unsafe]
     let a' = to_index a
     let b' = to_index b
-    in copy L.compositions[b' * L.state_size + a']
+    in copy L.compositions[a' * L.state_size + b']
 
   -- `first` is true for the first chunk of the input.  For later chunks the
   -- first byte is the one-byte overlap with the previous chunk: its

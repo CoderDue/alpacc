@@ -12,7 +12,7 @@
 static state_t compose(state_t a, state_t b) {
   uint64_t ai = (uint64_t)((a & ENDO_MASK) >> ENDO_OFFSET);
   uint64_t bi = (uint64_t)((b & ENDO_MASK) >> ENDO_OFFSET);
-  return COMPOSE[bi * NUM_STATES + ai];
+  return COMPOSE[ai * NUM_STATES + bi];
 }
 
 static terminal_t state_terminal(state_t s) {
