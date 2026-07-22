@@ -338,6 +338,10 @@ public:
 #endif
   }
 
+  // Volatile-arg overload retained for scanWarp in lookbackPrefix, which
+  // still holds its intermediates in volatile shmem (small buffers, ordered
+  // by __syncwarp).  Dropping volatile in the lexer body — the state tile
+  // and exchange union — has no effect here.
   __device__ __host__ __forceinline__
   state_t operator()(const volatile state_t &a, const volatile state_t &b) const {
 #ifdef __CUDA_ARCH__
@@ -443,7 +447,13 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   constexpr I SHMEM_RAW    = (SHMEM_TARGET - SHMEM_REM + SHMEM_MOD) % SHMEM_MOD;
   constexpr I SHMEM_PAD    = (SHMEM_RAW == 0) ? SHMEM_MOD : SHMEM_RAW;
   constexpr I SHMEM_STRIDE = ITEMS_PER_THREAD + SHMEM_PAD;
-  volatile __shared__ state_t states[SHMEM_STRIDE * BLOCK_SIZE];
+  // Non-volatile: every read/write of the state tile is fenced by an
+  // explicit __syncthreads() at the boundaries; cub::BlockScan handles its
+  // own barriers internally.  Dropping volatile lets nvcc merge adjacent
+  // loads and hoist them across independent compute, eliminating one of
+  // the top stalls reported by ncu (~30% est speedup on shmem stores,
+  // ~19% on shmem loads at HEAD).
+  __shared__ state_t states[SHMEM_STRIDE * BLOCK_SIZE];
   // Exchange buffer for the two-phase scatter on dense tiles.
   // exch_t (terminals), exch_j (starts), and exch_l (lengths) are never live
   // simultaneously, so they share one shmem region via a union.
@@ -453,9 +463,9 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     J          as_j[EXCH_ELEMS];
     length_t   as_l[EXCH_ELEMS];
   } __shared__ exch;
-  volatile terminal_t* exch_t = exch.as_t;
-  volatile J*          exch_j = exch.as_j;
-  volatile length_t*   exch_l = exch.as_l;
+  terminal_t* exch_t = exch.as_t;
+  J*          exch_j = exch.as_j;
+  length_t*   exch_l = exch.as_l;
   __shared__ state_t next_block_first_state;
   // Main slots: ceil(ITEMS_PER_THREAD / 8) uint64_t registers per thread.
   // One extra slot is added to cover the single byte past the block boundary
@@ -638,7 +648,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
 
   I starts[ITEMS_PER_THREAD];
   I local_offs[ITEMS_PER_THREAD];
-  volatile __shared__ I last_start;
+  __shared__ I last_start;
   __shared__ I num_sel_sh;
 
 #pragma unroll
