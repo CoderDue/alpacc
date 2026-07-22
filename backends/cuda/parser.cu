@@ -46,26 +46,116 @@
 // Fused kernel configuration
 // ---------------------------------------------------------------------------
 //
-// Block size and items-per-thread for the cooperative parser kernel.  Both
-// are compile-time constants — the kernel is not templated on them, so
-// changing them at runtime is not possible; rebuild with different -D
-// flags to try a different tuning.  Same override pattern as the lexer's
-// ALPACC_BLOCK_SIZE / ALPACC_ITEMS_PER_THREAD:
+// Block size and items-per-thread for the cooperative parser kernel are
+// compile-time constants.  Precedence:
 //
-//   nvcc -DALPACC_PARSER_BLOCK_SIZE=128 -DALPACC_PARSER_ITEMS_PER_THREAD=8 ...
+//   1. -DALPACC_PARSER_BLOCK_SIZE=<n> / -DALPACC_PARSER_ITEMS_PER_THREAD=<n>
+//      at nvcc time wins over everything else.
+//   2. The per-arch tuning table (alpacc_parser_tuning<SM, ELEM>) picks a
+//      value for the codegen-baked ALPACC_SM_ARCH.  ELEM = sizeof(index_t)
+//      drives the bucket, matching the lexer's convention.
+//   3. Fallback: BS=256, IPT=4 (the tile size at which the fused pipeline
+//      was originally tuned).
 //
-// Defaults (BS=256, IPT=4) are the tile size at which the fused pipeline
-// was originally tuned.  The parser and lexer kernels run back-to-back
-// (never concurrently) so their (BS, IPT) can be picked independently.
+// The parser and lexer kernels run back-to-back (never concurrently), so
+// their (BS, IPT) can be picked independently.
+//
+// NOTE: the PSE primitive (apsepDeviceSPT) currently carries
+// `static_assert(IPT == 4)` on its blocked Phase 1.  Overriding
+// ALPACC_PARSER_ITEMS_PER_THREAD to a value other than 4 will fail at
+// nvcc time — that's fine as a compile-time knob for future work when the
+// primitive's constraint is relaxed.
+
+// Per-arch tuning table for the parser.  Mirrors alpacc_ipt_tuning in
+// lexer.cu; separate template so the parser's numbers can't be confused
+// with the lexer's.  Unlike the lexer table (which stores CUB-style
+// nominal_ipt_4B units), the parser table stores the raw IPT value
+// directly — the PSE primitive's `static_assert(IPT == 4)` locks the
+// parser to a single IPT across index_t widths, so the CUB scaling
+// convention doesn't fit here.  If PSE's constraint is later relaxed to
+// allow multiple IPT values, this table's `items_per_thread` becomes a
+// per-arch tunable choice.
+//
+// Rows tagged [measured] come from `benchmarks/sweep-cuda-parser.sh`;
+// [cub] rows use CUB DeviceScan tuning as a starting point.  Rows with
+// items_per_thread == 0 mean "unknown arch; fall back to defaults".
+template<int SM_ARCH, size_t ELEM_BYTES>
+struct alpacc_parser_tuning {
+  static constexpr uint32_t items_per_thread = 0;
+  static constexpr uint32_t block_size       = 256;
+};
+
+// Turing (sm_75) — T4, 1660 Ti, RTX 20xx                [measured]
+// Sweep on the JSON grammar (index_t = i32, 10M-token dataset).  BS=256
+// remained the fastest across the {128, 256} × {4} options accessible
+// under the PSE static_assert.  Only BS was tunable at IPT=4 for the
+// present PSE primitive.
+template<size_t ELEM> struct alpacc_parser_tuning<75, ELEM> {
+  static constexpr uint32_t items_per_thread = 4;
+  static constexpr uint32_t block_size       = 256;
+};
+
+// Ampere data-centre (sm_80) — A100                     [cub]
+template<size_t ELEM> struct alpacc_parser_tuning<80, ELEM> {
+  static constexpr uint32_t items_per_thread = 4;
+  static constexpr uint32_t block_size       = 128;
+};
+
+// Ampere consumer (sm_86) — RTX 30xx, A40               [cub]
+template<size_t ELEM> struct alpacc_parser_tuning<86, ELEM> {
+  static constexpr uint32_t items_per_thread = 4;
+  static constexpr uint32_t block_size       = 128;
+};
+
+// Ada Lovelace (sm_89) — RTX 40xx, L4/L40               [cub]
+template<size_t ELEM> struct alpacc_parser_tuning<89, ELEM> {
+  static constexpr uint32_t items_per_thread = 4;
+  static constexpr uint32_t block_size       = 128;
+};
+
+// Hopper (sm_90) — H100                                 [cub]
+template<size_t ELEM> struct alpacc_parser_tuning<90, ELEM> {
+  static constexpr uint32_t items_per_thread = 4;
+  static constexpr uint32_t block_size       = 128;
+};
+
+// Blackwell (sm_100) — B100/B200                        [cub]
+template<size_t ELEM> struct alpacc_parser_tuning<100, ELEM> {
+  static constexpr uint32_t items_per_thread = 4;
+  static constexpr uint32_t block_size       = 128;
+};
+
+template<int SM_ARCH, typename J>
+constexpr uint32_t arch_parser_ipt() {
+  return alpacc_parser_tuning<SM_ARCH, sizeof(J)>::items_per_thread;
+}
+
+template<int SM_ARCH, typename J>
+constexpr uint32_t arch_parser_block_size() {
+  return alpacc_parser_tuning<SM_ARCH, sizeof(J)>::block_size;
+}
+
 #ifndef ALPACC_PARSER_BLOCK_SIZE
-#define ALPACC_PARSER_BLOCK_SIZE 256
-#endif
-#ifndef ALPACC_PARSER_ITEMS_PER_THREAD
-#define ALPACC_PARSER_ITEMS_PER_THREAD 4
+constexpr uint32_t alpacc_default_parser_block_size = []{
+  constexpr uint32_t table_bs = arch_parser_block_size<ALPACC_SM_ARCH, index_t>();
+  return table_bs;
+}();
+#define ALPACC_PARSER_BLOCK_SIZE alpacc_default_parser_block_size
 #endif
 
-constexpr uint32_t FUSED_BS  = ALPACC_PARSER_BLOCK_SIZE;   // block size (also the scan tile size)
-constexpr int      FUSED_IPT = ALPACC_PARSER_ITEMS_PER_THREAD;    // SPT items per thread (logical B = FUSED_BS * FUSED_IPT)
+#ifndef ALPACC_PARSER_ITEMS_PER_THREAD
+constexpr uint32_t alpacc_default_parser_ipt = []{
+  constexpr uint32_t table = arch_parser_ipt<ALPACC_SM_ARCH, index_t>();
+  return table == 0 ? 4u : table;
+}();
+#define ALPACC_PARSER_ITEMS_PER_THREAD alpacc_default_parser_ipt
+#endif
+
+// The kernel is templated on <BLOCK_SIZE, ITEMS_PER_THREAD>; the file-scope
+// constants below are the resolved values that get threaded into the launch
+// and buffer sizing.
+constexpr uint32_t FUSED_BS  = ALPACC_PARSER_BLOCK_SIZE;
+constexpr int      FUSED_IPT = ALPACC_PARSER_ITEMS_PER_THREAD;
 
 // ---------------------------------------------------------------------------
 // Bracket helpers
@@ -221,7 +311,14 @@ struct FusedBufs {
     // d_lb_arena and are reset (to Invalid == 0 / ticket 0) by one
     // cudaMemsetAsync per launch; aggregates/prefixes need no reset (only
     // read after a status published in the same launch).
-    States<index_t, uint64_t> states_ab;
+    //
+    // Phase A+B+C's (slen, plen) scan is a two-component sum; each
+    // component is an index_t-sized u32, and using PairStates keeps the
+    // two components in separate arrays (SoA) sharing one status stream.
+    // This avoids the packed-u64 layout that dragged 8-byte traffic through
+    // the warp scan for two 4-byte values, matching the split we did for
+    // the lexer's MaxAdd scan.
+    PairStates<index_t, uint32_t, uint32_t> states_ab;
     uint32_t* d_dyn_ab;             // Phase A+B+C ticket counter
     States<index_t, index_t> states_d;
     uint32_t* d_dyn_d;              // Phase D ticket counter
@@ -261,6 +358,7 @@ struct FusedBufs {
 // The fused cooperative kernel
 // ---------------------------------------------------------------------------
 
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
 __global__ void
 parserFusedKernel(FusedBufs b)
 {
@@ -270,32 +368,35 @@ parserFusedKernel(FusedBufs b)
     const index_t gsz   = (index_t)grid.size();
 
     // ---- Phase A+B+C: fused lookup + packed pair scan + direct scatter ----
-    // One ticket-loop pass: each thread loads its Q+K+FUSED_IPT-1 terminal
-    // window once (sentinel-extended) and slides it across its FUSED_IPT
+    // One ticket-loop pass: each thread loads its Q+K+ITEMS_PER_THREAD-1 terminal
+    // window once (sentinel-extended) and slides it across its ITEMS_PER_THREAD
     // consecutive positions; the (slen, plen) pair is packed into one u64
     // (slen high, plen low) and scanned once with decoupled lookback; the
     // exclusive offsets come straight out of the scan in registers and the
     // STACKS/PRODUCTIONS spans are scattered directly.  The thread owning
     // position m-1 writes d_totals, which the grid.sync() makes uniform.
     {
-        constexpr index_t TILE = (index_t)FUSED_BS * (index_t)FUSED_IPT;
-        constexpr int WIN = Q + K + FUSED_IPT - 1;
+        constexpr index_t TILE = (index_t)BLOCK_SIZE * (index_t)ITEMS_PER_THREAD;
+        constexpr int WIN = Q + K + ITEMS_PER_THREAD - 1;
         const index_t num_tiles_ab = (m + TILE - (index_t)1) / TILE;
         uint32_t tile;
         while ((tile = dynamicIndex(b.d_dyn_ab)) < (uint32_t)num_tiles_ab) {
             const index_t offset = (index_t)tile * TILE
-                                 + (index_t)threadIdx.x * (index_t)FUSED_IPT;
+                                 + (index_t)threadIdx.x * (index_t)ITEMS_PER_THREAD;
             terminal_t w[WIN];
 #pragma unroll
             for (int j = 0; j < WIN; j++) {
                 int64_t idx = (int64_t)offset + j - Q;
                 w[j] = (idx < 0 || idx >= (int64_t)m) ? EMPTY_TERMINAL : b.d_arr[idx];
             }
-            int32_t  ss[FUSED_IPT], ps[FUSED_IPT];
-            int32_t  slen[FUSED_IPT], plen[FUSED_IPT];
-            uint64_t items[FUSED_IPT];
+            int32_t  ss[ITEMS_PER_THREAD], ps[ITEMS_PER_THREAD];
+            int32_t  slen[ITEMS_PER_THREAD], plen[ITEMS_PER_THREAD];
+            // Two independent scalar u32 register tiles instead of a packed
+            // u64 tile.  Each block-local scan runs a single-instruction
+            // Add combine; nvcc gets to co-schedule the two scans (ILP).
+            uint32_t items_s[ITEMS_PER_THREAD], items_p[ITEMS_PER_THREAD];
 #pragma unroll
-            for (int j = 0; j < FUSED_IPT; j++) {
+            for (int j = 0; j < ITEMS_PER_THREAD; j++) {
                 ss[j] = ps[j] = 0;
                 slen[j] = plen[j] = 0;
                 index_t gid = offset + (index_t)j;
@@ -306,19 +407,32 @@ parserFusedKernel(FusedBufs b)
                     slen[j] = valid ? se - ss[j] : 0;
                     plen[j] = valid ? pe - ps[j] : 0;
                 }
-                items[j] = ((uint64_t)(uint32_t)slen[j] << 32)
-                         | (uint64_t)(uint32_t)plen[j];
+                items_s[j] = (uint32_t)slen[j];
+                items_p[j] = (uint32_t)plen[j];
             }
-            uint64_t prefix =
-                scanReg<uint64_t, index_t, PairAdd, FUSED_IPT, (index_t)FUSED_BS>(
-                    items, b.states_ab, PairAdd(), (uint64_t)0, tile);
+            // Two block-local scans (Add<u32>), then a single fused
+            // decoupled-lookback round over the SoA PairStates.  Both cub
+            // BlockScans share one TempStorage — they run sequentially in
+            // the same thread, so the storage is only live during one at a
+            // time.
+            using BlockScan32 = cub::BlockScan<uint32_t, (int)BLOCK_SIZE>;
+            __shared__ typename BlockScan32::TempStorage scan_temp;
+            const uint32_t s_agg =
+                scanRegLocal<uint32_t, index_t, Add<uint32_t>, ITEMS_PER_THREAD, (index_t)BLOCK_SIZE>(
+                    items_s, scan_temp, Add<uint32_t>());
+            const uint32_t p_agg =
+                scanRegLocal<uint32_t, index_t, Add<uint32_t>, ITEMS_PER_THREAD, (index_t)BLOCK_SIZE>(
+                    items_p, scan_temp, Add<uint32_t>());
+            uint32_t s_prefix_u32, p_prefix_u32;
+            lookbackPrefixPair<uint32_t, uint32_t, index_t, Add<uint32_t>, Add<uint32_t>>(
+                b.states_ab, Add<uint32_t>(), Add<uint32_t>(), (uint32_t)0, (uint32_t)0, tile,
+                s_agg, p_agg, s_prefix_u32, p_prefix_u32);
 #pragma unroll
-            for (int j = 0; j < FUSED_IPT; j++) {
+            for (int j = 0; j < ITEMS_PER_THREAD; j++) {
                 index_t gid = offset + (index_t)j;
                 if (gid < m) {
-                    uint64_t g = PairAdd()(prefix, items[j]);
-                    index_t s_incl = (index_t)(g >> 32);
-                    index_t p_incl = (index_t)(uint32_t)g;
+                    index_t s_incl = (index_t)(s_prefix_u32 + items_s[j]);
+                    index_t p_incl = (index_t)(p_prefix_u32 + items_p[j]);
                     index_t soff = s_incl - (index_t)slen[j];
                     index_t poff = p_incl - (index_t)plen[j];
                     for (int32_t t = 0; t < slen[j]; t++)
@@ -346,26 +460,26 @@ parserFusedKernel(FusedBufs b)
         // prefix, validity checked in-pass, depth written to d_scan.
         // Blocks fall through to the grid.sync() when tickets run out.
         {
-            constexpr index_t TILE = (index_t)FUSED_BS * (index_t)FUSED_IPT;
+            constexpr index_t TILE = (index_t)BLOCK_SIZE * (index_t)ITEMS_PER_THREAD;
             const index_t num_tiles_b = (num_brackets + TILE - (index_t)1) / TILE;
             uint32_t tile;
             while ((tile = dynamicIndex(b.d_dyn_d)) < (uint32_t)num_tiles_b) {
                 const index_t offset = (index_t)tile * TILE
-                                     + (index_t)threadIdx.x * (index_t)FUSED_IPT;
-                bracket_t brs[FUSED_IPT];
-                index_t   items[FUSED_IPT];
+                                     + (index_t)threadIdx.x * (index_t)ITEMS_PER_THREAD;
+                bracket_t brs[ITEMS_PER_THREAD];
+                index_t   items[ITEMS_PER_THREAD];
 #pragma unroll
-                for (int j = 0; j < FUSED_IPT; j++) {
+                for (int j = 0; j < ITEMS_PER_THREAD; j++) {
                     index_t gid = offset + (index_t)j;
                     bool in = gid < num_brackets;
                     brs[j]   = in ? b.d_brackets[gid] : (bracket_t)0;
                     items[j] = in ? BracketDelta()(brs[j]) : (index_t)0;
                 }
                 index_t prefix =
-                    scanReg<index_t, index_t, Add<index_t>, FUSED_IPT, (index_t)FUSED_BS>(
+                    scanReg<index_t, index_t, Add<index_t>, ITEMS_PER_THREAD, (index_t)BLOCK_SIZE>(
                         items, b.states_d, Add<index_t>(), (index_t)0, tile);
 #pragma unroll
-                for (int j = 0; j < FUSED_IPT; j++) {
+                for (int j = 0; j < ITEMS_PER_THREAD; j++) {
                     index_t gid = offset + (index_t)j;
                     if (gid < num_brackets) {
                         index_t s = prefix + items[j];
@@ -381,12 +495,12 @@ parserFusedKernel(FusedBufs b)
 
         // ---- Phase E: PSE(<=) over depths (apsepDeviceSPT, pse.cu) ----
         {
-            constexpr int B = (int)FUSED_BS * FUSED_IPT;
+            constexpr int B = (int)BLOCK_SIZE * ITEMS_PER_THREAD;
             const int nb         = (int)num_brackets;   // host guarantees ≤ INT_MAX
             const int spt_blocks = (nb + B - 1) / B;
             int M = 1;
             while (M < spt_blocks) M <<= 1;
-            apsepDeviceSPT<index_t, (int)FUSED_BS, FUSED_IPT, true>(
+            apsepDeviceSPT<index_t, (int)BLOCK_SIZE, ITEMS_PER_THREAD, true>(
                 grid, b.d_scan, b.d_match, nb, spt_blocks, M, M - 1,
                 b.d_unres, b.d_block_mins, b.d_block_warp_mins,
                 b.d_tree, b.d_prefix_min, b.d_p3_next, b.d_p1_next);
@@ -421,26 +535,26 @@ parserFusedKernel(FusedBufs b)
     // computed in registers from d_productions and the exclusive value
     // incl - delta is written straight to d_scan.
     {
-        constexpr index_t TILE = (index_t)FUSED_BS * (index_t)FUSED_IPT;
+        constexpr index_t TILE = (index_t)BLOCK_SIZE * (index_t)ITEMS_PER_THREAD;
         const index_t num_tiles_g = (num_prods + TILE - (index_t)1) / TILE;
         uint32_t tile;
         while ((tile = dynamicIndex(b.d_dyn_g)) < (uint32_t)num_tiles_g) {
             const index_t offset = (index_t)tile * TILE
-                                 + (index_t)threadIdx.x * (index_t)FUSED_IPT;
-            index_t deltas[FUSED_IPT];
-            index_t items[FUSED_IPT];
+                                 + (index_t)threadIdx.x * (index_t)ITEMS_PER_THREAD;
+            index_t deltas[ITEMS_PER_THREAD];
+            index_t items[ITEMS_PER_THREAD];
 #pragma unroll
-            for (int j = 0; j < FUSED_IPT; j++) {
+            for (int j = 0; j < ITEMS_PER_THREAD; j++) {
                 index_t gid = offset + (index_t)j;
                 deltas[j] = (gid < num_prods) ? ArityMinusOne()(b.d_productions[gid])
                                               : (index_t)0;
                 items[j]  = deltas[j];
             }
             index_t prefix =
-                scanReg<index_t, index_t, Add<index_t>, FUSED_IPT, (index_t)FUSED_BS>(
+                scanReg<index_t, index_t, Add<index_t>, ITEMS_PER_THREAD, (index_t)BLOCK_SIZE>(
                     items, b.states_g, Add<index_t>(), (index_t)0, tile);
 #pragma unroll
-            for (int j = 0; j < FUSED_IPT; j++) {
+            for (int j = 0; j < ITEMS_PER_THREAD; j++) {
                 index_t gid = offset + (index_t)j;
                 if (gid < num_prods)
                     b.d_scan[gid] = prefix + items[j] - deltas[j];   // exclusive scan value
@@ -451,12 +565,12 @@ parserFusedKernel(FusedBufs b)
 
     // ---- Phase H: PSE(<=) over the scan → parent vector (in d_match) ----
     {
-        constexpr int B = (int)FUSED_BS * FUSED_IPT;
+        constexpr int B = (int)BLOCK_SIZE * ITEMS_PER_THREAD;
         const int np         = (int)num_prods;      // host guarantees ≤ INT_MAX
         const int spt_blocks = (np + B - 1) / B;
         int M = 1;
         while (M < spt_blocks) M <<= 1;
-        apsepDeviceSPT<index_t, (int)FUSED_BS, FUSED_IPT, true>(
+        apsepDeviceSPT<index_t, (int)BLOCK_SIZE, ITEMS_PER_THREAD, true>(
             grid, b.d_scan, b.d_match, np, spt_blocks, M, M - 1,
             b.d_unres, b.d_block_mins, b.d_block_warp_mins,
             b.d_tree, b.d_prefix_min, b.d_p3_next, b.d_p1_next);
@@ -474,24 +588,24 @@ parserFusedKernel(FusedBufs b)
     // positions — and checks safe_zip in-pass.  There is no parents-fixup
     // pass: p_old is clamped when read instead.
     {
-        constexpr index_t TILE = (index_t)FUSED_BS * (index_t)FUSED_IPT;
+        constexpr index_t TILE = (index_t)BLOCK_SIZE * (index_t)ITEMS_PER_THREAD;
         const index_t num_tiles_i = (num_prods + TILE - (index_t)1) / TILE;
         uint32_t tile;
         while ((tile = dynamicIndex(b.d_dyn_i)) < (uint32_t)num_tiles_i) {
             const index_t offset = (index_t)tile * TILE
-                                 + (index_t)threadIdx.x * (index_t)FUSED_IPT;
-            index_t items[FUSED_IPT];
+                                 + (index_t)threadIdx.x * (index_t)ITEMS_PER_THREAD;
+            index_t items[ITEMS_PER_THREAD];
 #pragma unroll
-            for (int j = 0; j < FUSED_IPT; j++) {
+            for (int j = 0; j < ITEMS_PER_THREAD; j++) {
                 index_t gid = offset + (index_t)j;
                 items[j] = (gid < num_prods) ? IsTermFlag()(b.d_productions[gid])
                                              : (index_t)0;
             }
             index_t prefix =
-                scanReg<index_t, index_t, Add<index_t>, FUSED_IPT, (index_t)FUSED_BS>(
+                scanReg<index_t, index_t, Add<index_t>, ITEMS_PER_THREAD, (index_t)BLOCK_SIZE>(
                     items, b.states_i, Add<index_t>(), (index_t)0, tile);
 #pragma unroll
-            for (int j = 0; j < FUSED_IPT; j++) {
+            for (int j = 0; j < ITEMS_PER_THREAD; j++) {
                 index_t gid = offset + (index_t)j;
                 if (gid < num_prods) {
                     index_t incl = prefix + items[j];
@@ -504,19 +618,19 @@ parserFusedKernel(FusedBufs b)
         }
     }
     grid.sync();
-    // Blocked remap: each thread owns FUSED_IPT consecutive productions and
+    // Blocked remap: each thread owns ITEMS_PER_THREAD consecutive productions and
     // issues all loads for its batch (including the random d_scan[p_old]
     // gathers, via __ldg) before consuming any — the loop is latency-bound,
     // so memory-level parallelism, not bandwidth, is what this buys.
     {
-        constexpr index_t TILE = (index_t)FUSED_BS * (index_t)FUSED_IPT;
+        constexpr index_t TILE = (index_t)BLOCK_SIZE * (index_t)ITEMS_PER_THREAD;
         const index_t num_tiles_r = (num_prods + TILE - (index_t)1) / TILE;
         for (index_t t = (index_t)blockIdx.x; t < num_tiles_r; t += (index_t)gridDim.x) {
-            const index_t offset = t * TILE + (index_t)threadIdx.x * (index_t)FUSED_IPT;
-            production_t prod[FUSED_IPT];
-            index_t t_incl[FUSED_IPT], p_old[FUSED_IPT], p_scan[FUSED_IPT];
+            const index_t offset = t * TILE + (index_t)threadIdx.x * (index_t)ITEMS_PER_THREAD;
+            production_t prod[ITEMS_PER_THREAD];
+            index_t t_incl[ITEMS_PER_THREAD], p_old[ITEMS_PER_THREAD], p_scan[ITEMS_PER_THREAD];
 #pragma unroll
-            for (int j = 0; j < FUSED_IPT; j++) {
+            for (int j = 0; j < ITEMS_PER_THREAD; j++) {
                 index_t gid = offset + (index_t)j;
                 if (gid < num_prods) {
                     prod[j]   = b.d_productions[gid];
@@ -529,10 +643,10 @@ parserFusedKernel(FusedBufs b)
                 }
             }
 #pragma unroll
-            for (int j = 0; j < FUSED_IPT; j++)
+            for (int j = 0; j < ITEMS_PER_THREAD; j++)
                 p_scan[j] = __ldg(&b.d_scan[p_old[j]]);
 #pragma unroll
-            for (int j = 0; j < FUSED_IPT; j++) {
+            for (int j = 0; j < ITEMS_PER_THREAD; j++) {
                 index_t gid = offset + (index_t)j;
                 if (gid < num_prods) {
                     index_t p_new = p_old[j] - p_scan[j];
@@ -645,10 +759,14 @@ static ParserFused allocParserFused(index_t max_m) {
         b.d_p1_next = ctr + 4;
         b.states_ab.num_blocks = lb_tiles_m;
         b.states_ab.statuses   = st + lb_tiles_d + 2 * lb_tiles_p;
-        gpuAssert(cudaMalloc((void**)&b.states_ab.aggregates,
-                             (size_t)lb_tiles_m * sizeof(uint64_t)));
-        gpuAssert(cudaMalloc((void**)&b.states_ab.prefixes,
-                             (size_t)lb_tiles_m * sizeof(uint64_t)));
+        gpuAssert(cudaMalloc((void**)&b.states_ab.a_aggregates,
+                             (size_t)lb_tiles_m * sizeof(uint32_t)));
+        gpuAssert(cudaMalloc((void**)&b.states_ab.a_prefixes,
+                             (size_t)lb_tiles_m * sizeof(uint32_t)));
+        gpuAssert(cudaMalloc((void**)&b.states_ab.b_aggregates,
+                             (size_t)lb_tiles_m * sizeof(uint32_t)));
+        gpuAssert(cudaMalloc((void**)&b.states_ab.b_prefixes,
+                             (size_t)lb_tiles_m * sizeof(uint32_t)));
         b.d_dyn_d = ctr + 0;
         b.states_d.num_blocks = lb_tiles_d;
         b.states_d.statuses   = st;
@@ -684,7 +802,7 @@ static ParserFused allocParserFused(index_t max_m) {
 
     int bps = 0, sms = 0;
     gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &bps, parserFusedKernel, FUSED_BS, 0));
+        &bps, parserFusedKernel<FUSED_BS, FUSED_IPT>, FUSED_BS, 0));
     gpuAssert(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
     index_t needed   = std::max<index_t>(std::max(tiles_m, tiles_sc), 1);
     index_t resident = std::max<index_t>((index_t)bps * (index_t)sms, 1);
@@ -707,8 +825,10 @@ static void freeParserFused(ParserFused& p) {
     cudaFree(b.d_prefix_min);
     cudaFree(b.d_p3_next);
     cudaFree(p.d_lb_arena);
-    cudaFree((void*)b.states_ab.aggregates);
-    cudaFree((void*)b.states_ab.prefixes);
+    cudaFree((void*)b.states_ab.a_aggregates);
+    cudaFree((void*)b.states_ab.a_prefixes);
+    cudaFree((void*)b.states_ab.b_aggregates);
+    cudaFree((void*)b.states_ab.b_prefixes);
     cudaFree((void*)b.states_d.aggregates);
     cudaFree((void*)b.states_d.prefixes);
 #ifdef HAS_LEXER
@@ -731,7 +851,7 @@ static void launchParserFused(ParserFused& p, index_t m) {
     gpuAssert(cudaMemsetAsync(p.d_lb_arena, 0, p.lb_arena_bytes));
     void* args[] = { (void*)&p.bufs };
     gpuAssert(cudaLaunchCooperativeKernel(
-        (void*)parserFusedKernel, p.P, FUSED_BS, args, 0, nullptr));
+        (void*)parserFusedKernel<FUSED_BS, FUSED_IPT>, p.P, FUSED_BS, args, 0, nullptr));
     gpuAssert(cudaGetLastError());
 }
 
