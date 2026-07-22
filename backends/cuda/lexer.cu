@@ -695,40 +695,44 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     shmemToGlbVec<terminal_t, uint64_t, BLOCK_SIZE, I>(prefix, num_sel, d_terminals, exch_t);
     __syncthreads();
 
+    // Compute the tok_start values into per-thread registers *and* into
+    // exch_j in the same pass.  Keeping them in registers means the length
+    // loop below reads its own thread's register value directly instead of
+    // going through shmem — that avoids the extra sync we'd otherwise need
+    // between shmemToGlbVec's exch_j reads and the exch_l writes below
+    // (exch_l aliases exch_j via the union).
+    J tok_starts[ITEMS_PER_THREAD];
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
       if ((is_produce_state >> i) & 1) {
         I offset = local_offs[i];
+        J v;
         if (Add<I>()(prefix, offset) == I() && starts[i] == I()) {
-          exch_j[offset] = ctx.getLastStart();
+          v = ctx.getLastStart();
         } else {
-          exch_j[offset] = ctx.addOffset(starts[i] - 1);
+          v = ctx.addOffset(starts[i] - 1);
         }
+        tok_starts[i] = v;
+        exch_j[offset] = v;
       }
     }
     __syncthreads();
     shmemToGlbVec<J, uint64_t, BLOCK_SIZE, I>(prefix, num_sel, d_starts, exch_j);
     __syncthreads();
 
-    // Read starts from exch_j (which shmemToGlbVec left intact) and compute
-    // lengths into per-thread registers *before* any thread writes exch_l:
-    // exch_l aliases exch_j via the union, so an interleaved write would
-    // corrupt another thread's read from exch_j.
-    length_t tok_lens[ITEMS_PER_THREAD];
+    // Compute lengths directly from the per-thread tok_starts registers
+    // and write straight to exch_l.  Since we already have tok_starts[i]
+    // in a register, no shmem read is needed here.  With no exch_j read
+    // to protect, we can write exch_l (aliased to exch_j) as soon as the
+    // shmemToGlbVec above is fenced by the sync above — one fewer sync
+    // than the previous three-shmem-pass scheme.
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
       if ((is_produce_state >> i) & 1) {
         I gid = glb_offs + (I)threadIdx.x * ITEMS_PER_THREAD + (I)i;
-        J tok_len = ctx.addOffset(gid + 1) - (J)exch_j[local_offs[i]];
+        J tok_len = ctx.addOffset(gid + 1) - tok_starts[i];
         if ((length_t)(tok_len) != tok_len) ctx.signalLengthOverflow();
-        tok_lens[i] = (length_t)tok_len;
-      }
-    }
-    __syncthreads();
-#pragma unroll
-    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-      if ((is_produce_state >> i) & 1) {
-        exch_l[local_offs[i]] = tok_lens[i];
+        exch_l[local_offs[i]] = (length_t)tok_len;
       }
     }
     __syncthreads();
