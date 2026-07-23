@@ -101,10 +101,7 @@ constexpr size_t lexer_shmem_fixed() {
   size_t fixed_scalars = sizeof(state_t)      // next_block_first_state
                         + sizeof(I)           // last_start
                         + sizeof(I);          // num_sel_sh
-  // s_pfx_row: preloaded d_compose row of the inter-block prefix, used to
-  // turn ctx(pfx, x) into an shmem lookup during the Phase C expansion.
-  size_t pfx_row = (size_t)NUM_STATES * sizeof(state_t);
-  return cub_state_temp + cub_u32_temp + lookback + fixed_scalars + hot_arena_bytes() + pfx_row;
+  return cub_state_temp + cub_u32_temp + lookback + fixed_scalars + hot_arena_bytes();
 }
 
 // Largest ITEMS_PER_THREAD ≤ HARD_CAP whose per-block shmem footprint fits
@@ -767,36 +764,6 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     const state_t pfx = lookbackPrefix<state_t, I, LexerCtx<I, J>>(
         ctx.d_state_states, ctx, IDENTITY, dyn_index, agg_st);
 
-    // pfx is the same for every ctx(pfx, ...) call in the expansion loop
-    // below, so its d_compose row is broadcast-shared across the block.
-    // Load it once, vectorized via uint64_t, into shmem so the SCAN_IPT
-    // combines below hit shared memory instead of __ldg'ing global.
-    __shared__ __align__(8) state_t s_pfx_row[NUM_STATES];
-    {
-      const state_t* row = ctx.d_compose_row(pfx);
-      // Vectorized path is only sound when every row start is 8-byte aligned,
-      // i.e. NUM_STATES * sizeof(state_t) is a multiple of sizeof(uint64_t).
-      // Otherwise (odd NUM_STATES with 4-byte state_t, etc.) fall back to
-      // scalar so we never issue a misaligned 8-byte load.
-      constexpr bool ROW_VEC_OK =
-          ((uint32_t)NUM_STATES * (uint32_t)sizeof(state_t)) % (uint32_t)sizeof(uint64_t) == 0;
-      if (ROW_VEC_OK) {
-        constexpr uint32_t EPV = (uint32_t)(sizeof(uint64_t) / sizeof(state_t));
-        constexpr uint32_t N_VEC = ((uint32_t)NUM_STATES * (uint32_t)sizeof(state_t)) / (uint32_t)sizeof(uint64_t);
-        constexpr uint32_t VEC_ELEMS = N_VEC * EPV;
-        uint64_t* s_pfx_row_vec = reinterpret_cast<uint64_t*>(s_pfx_row);
-        const uint64_t* row_vec = reinterpret_cast<const uint64_t*>(row);
-        for (uint32_t v = threadIdx.x; v < N_VEC; v += BLOCK_SIZE)
-          s_pfx_row_vec[v] = row_vec[v];
-        for (uint32_t e = VEC_ELEMS + threadIdx.x; e < (uint32_t)NUM_STATES; e += BLOCK_SIZE)
-          s_pfx_row[e] = row[e];
-      } else {
-        for (uint32_t e = threadIdx.x; e < (uint32_t)NUM_STATES; e += BLOCK_SIZE)
-          s_pfx_row[e] = row[e];
-      }
-    }
-    __syncthreads();
-
     const I off = threadIdx.x * SHMEM_STRIDE;
     for (uint32_t i = 0; i < SCAN_IPT; i++) {
       uint32_t a = 2 * i;
@@ -805,9 +772,9 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
       I gid_b = gid_a + 1;
       // Full exclusive prefix to pair i: inter-block pfx composed with the
       // block-local exclusive prefix to this pair from prior threads/pairs.
-      // s_pfx_row is the pfx row of d_compose preloaded into shmem, so
-      // ctx(pfx, x) = s_pfx_row[get_index(x)].
-      state_t excl_pair = s_pfx_row[get_index(excl_scan_st[i])];
+      // ctx(pfx, ...) issues an __ldg on d_compose; broadcast across the
+      // block keeps it in L1 across the loop iterations.
+      state_t excl_pair = ctx(pfx, excl_scan_st[i]);
       // For the very first position of the whole chunk, prepend getLastState()
       // to carry over the cross-chunk DFA state.
       if (dyn_index == 0 && threadIdx.x == 0 && i == 0)
