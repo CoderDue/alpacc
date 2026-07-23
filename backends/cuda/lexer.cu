@@ -543,13 +543,11 @@ public:
   }
 };
 
-// __launch_bounds__ caps register allocation so at least 1024 threads' worth
-// of blocks fit per SM (clamped to the 16-blocks/SM hardware limit): without
-// it the scatter's register capture pushes past 64 regs/thread and occupancy
-// drops from ~99% to ~74%, which costs more than the coalescing wins.
+// Variant G: __launch_bounds__ removed. Nvcc picks regs/thread freely; if
+// the scatter's register capture pushes past 64 regs/thread, occupancy is
+// register-limited rather than shmem-limited.
 template<typename I, typename J, I BLOCK_SIZE, I ITEMS_PER_THREAD>
 __global__ void
-__launch_bounds__(BLOCK_SIZE, (1024 / BLOCK_SIZE) < 16 ? (1024 / BLOCK_SIZE) : 16)
 lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_starts, length_t* d_lengths, const I size, const bool is_last_chunk) {
   // Bank-conflict-free padding: we need (STRIDE * sizeof(state_t)) to be
   // ≡ 4 (mod 8) so the stride in 4-byte banks is odd (coprime with 32).
