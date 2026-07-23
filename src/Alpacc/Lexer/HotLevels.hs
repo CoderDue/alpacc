@@ -99,7 +99,7 @@ buildLevels budget pl = l0 : go l0
     go prev =
       let next = buildNextLevel compose prev
           compose_bytes = (hlSize prev * hlSize prev) * uintBytes (hotIdUInt next)
-       in if compose_bytes <= budget
+       in if compose_bytes <= budget && hlSize next > hlSize prev
             then next : go next
             else []
     uintBytes U8 = 1
