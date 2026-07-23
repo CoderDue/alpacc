@@ -421,7 +421,7 @@ static int lexer_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
         for (uint32_t i = 0; i < num_warmup; i++) {
             ctx.reset();
             lexer<uint32_t, index_t, BLOCK_SIZE, ITEMS_PER_THREAD>
-                <<<nblocks, BLOCK_SIZE>>>(ctx, d_str, d_tok, d_s, d_l, (uint32_t)n, false);
+                <<<nblocks, BLOCK_SIZE>>>(ctx, d_str, d_tok, d_s, d_l, (uint32_t)n, true);
             gpuAssert(cudaDeviceSynchronize());
         }
         // Token count is stable for a fixed input; read after warmup.
@@ -433,7 +433,7 @@ static int lexer_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
             ctx.reset();
             gpuAssert(cudaEventRecord(ev0));
             lexer<uint32_t, index_t, BLOCK_SIZE, ITEMS_PER_THREAD>
-                <<<nblocks, BLOCK_SIZE>>>(ctx, d_str, d_tok, d_s, d_l, (uint32_t)n, false);
+                <<<nblocks, BLOCK_SIZE>>>(ctx, d_str, d_tok, d_s, d_l, (uint32_t)n, true);
             gpuAssert(cudaEventRecord(ev1));
             gpuAssert(cudaEventSynchronize(ev1));
             gpuAssert(cudaEventElapsedTime(&times_ms[i], ev0, ev1));
@@ -446,7 +446,7 @@ static int lexer_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
             gpuAssert(cudaEventRecord(ev0));
             gpuAssert(cudaMemcpyAsync(d_str, data, n, cudaMemcpyHostToDevice));
             lexer<uint32_t, index_t, BLOCK_SIZE, ITEMS_PER_THREAD>
-                <<<nblocks, BLOCK_SIZE>>>(ctx, d_str, d_tok, d_s, d_l, (uint32_t)n, false);
+                <<<nblocks, BLOCK_SIZE>>>(ctx, d_str, d_tok, d_s, d_l, (uint32_t)n, true);
             gpuAssert(cudaMemcpyAsync(h_tok.data(), d_tok, n * sizeof(terminal_t), cudaMemcpyDeviceToHost));
             gpuAssert(cudaEventRecord(ev1));
             gpuAssert(cudaEventSynchronize(ev1));

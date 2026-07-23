@@ -11,10 +11,10 @@
 #
 # Defaults exercise the interesting ranges for the JSON grammar on
 # Turing-class GPUs:
-#   BS_LIST     = "128 256"
-#   IPT_LIST    = "1 2 4 6 8 12 16 20 26"
-#   STATE_LIST  = "uint8_t uint16_t uint32_t"
-#   INDEX_LIST  = "int32_t int64_t"
+#   BS_LIST     = "256"
+#   IPT_LIST    = "8 12 16 20"
+#   STATE_LIST  = "uint8_t"   (state_t is now endo_t fixed by codegen; this is a dummy)
+#   INDEX_LIST  = "int32_t"
 #
 # For each (state_t, index_t) the script:
 #   1. Generates the .cu once via `alpacc cuda --lexer` (no --index32 flag —
@@ -42,12 +42,12 @@ Positional args:
   dataset       framed .inputs file to feed the benchmark (default:
                 data-\$INPUT_SIZE.inputs alongside the grammar, generated
                 via the sibling Makefile if needed)
-  BS_LIST       space-separated block sizes  (default: "128 256")
-  IPT_LIST      space-separated IPT values    (default: "1 2 4 6 8 12 16 20 26")
+  BS_LIST       space-separated block sizes  (default: "256")
+  IPT_LIST      space-separated IPT values    (default: "8 12 16 20")
   STATE_LIST    space-separated C++ typedefs for state_t
-                (default: "uint8_t uint16_t uint32_t")
+                (default: "uint8_t"; state_t is now endo_t fixed by codegen, this is a dummy)
   INDEX_LIST    space-separated C++ typedefs for index_t
-                (default: "int32_t int64_t")
+                (default: "int32_t")
 
 Environment:
   INPUT_SIZE    passed to the sibling Makefile when generating the dataset
@@ -75,13 +75,13 @@ GRAMMAR="$(realpath "$1")"
 shift
 INPUT_FILE_ARG="${1:-}"
 [ $# -ge 1 ] && shift
-BS_LIST="${1:-128 256}"
+BS_LIST="${1:-256}"
 [ $# -ge 1 ] && shift
-IPT_LIST="${1:-1 2 4 6 8 12 16 20 26}"
+IPT_LIST="${1:-8 12 16 20}"
 [ $# -ge 1 ] && shift
-STATE_LIST="${1:-uint8_t uint16_t uint32_t}"
+STATE_LIST="${1:-uint8_t}"
 [ $# -ge 1 ] && shift
-INDEX_LIST="${1:-int32_t int64_t}"
+INDEX_LIST="${1:-int32_t}"
 [ $# -ge 1 ] && shift
 
 INPUT_SIZE="${INPUT_SIZE:-10485760}"

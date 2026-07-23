@@ -121,18 +121,20 @@ template<size_t ELEM> struct alpacc_ipt_tuning<70, ELEM> {
 };
 
 // Turing (sm_75) — T4, 1660 Ti, RTX 20xx               [measured]
-// Sweep on the JSON grammar (index_t = i32, 10M-token dataset) with
-// `benchmarks/sweep-cuda-lexer.sh` picked BS=256, IPT=12 as the
-// fastest (2832 μs kernel-only vs 2929 μs at CUB's IPT=8).
-// nominal_ipt_4B = 12 * 4 / 4 = 12.
+// Sweep on the JSON grammar (endo_t = u64, index_t = i32, 10M-token dataset)
+// with `benchmarks/sweep-cuda-lexer.sh` picked BS=256, IPT=8 as the fastest
+// (5374 μs); IPT=12 was slower and IPT≥16 hit shmem overflow.
+// endo_t is now u64 (was u16 state_t), so shmem budget is exhausted sooner.
+// nominal_ipt_4B = 8 * 4 / 4 = 8.
 template<size_t ELEM> struct alpacc_ipt_tuning<75, ELEM> {
-  static constexpr uint32_t nominal_ipt_4B = 12;
+  static constexpr uint32_t nominal_ipt_4B = 8;
   static constexpr uint32_t block_size     = 256;
 };
 
-// Ampere data-centre (sm_80) — A100                    [measured]
+// Ampere data-centre (sm_80) — A100                    [cub, needs re-sweep]
+// Previous measurement used old u16 state_t; endo_t is now u64, needs re-sweep.
 template<size_t ELEM> struct alpacc_ipt_tuning<80, ELEM> {
-  static constexpr uint32_t nominal_ipt_4B = 20;
+  static constexpr uint32_t nominal_ipt_4B = 8;
   static constexpr uint32_t block_size     = 256;
 };
 
