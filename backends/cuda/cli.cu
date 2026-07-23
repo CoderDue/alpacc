@@ -65,7 +65,7 @@ static inline uint64_t decode_le64(const uint8_t* p) {
 #ifdef HAS_LEXER
 #ifndef ALPACC_BLOCK_SIZE
 constexpr uint32_t ALPACC_BLOCK_SIZE = []{
-  constexpr uint32_t table_bs = arch_block_size<ALPACC_SM_ARCH, state_t, index_t>();
+  constexpr uint32_t table_bs = arch_block_size<ALPACC_SM_ARCH, endo_t, index_t>();
   return table_bs;
 }();
 #endif
@@ -73,9 +73,9 @@ constexpr uint32_t ALPACC_BLOCK_SIZE = []{
 #ifndef ALPACC_ITEMS_PER_THREAD
 constexpr uint32_t ALPACC_ITEMS_PER_THREAD = []{
   constexpr uint32_t shmem_max =
-      max_items_per_thread<uint32_t, state_t, index_t, length_t, terminal_t,
+      max_items_per_thread<uint32_t, endo_t, index_t, length_t, terminal_t,
                             ALPACC_BLOCK_SIZE, ALPACC_SHARED_MEMORY>();
-  constexpr uint32_t table = arch_ipt<ALPACC_SM_ARCH, state_t, index_t>();
+  constexpr uint32_t table = arch_ipt<ALPACC_SM_ARCH, endo_t, index_t>();
   // Table = 0 means unknown arch; fall back to the shmem-search maximum.
   // Otherwise clamp the table pick to what actually fits.
   return table == 0 ? shmem_max
@@ -462,7 +462,7 @@ static int lexer_benchmark(FILE* in, uint32_t warmup_runs, uint32_t n_runs) {
         //   scan lookback arrays: negligible vs payload
         uint32_t num_tiles = numBlocks((uint32_t)n, BLOCK_SIZE, ITEMS_PER_THREAD);
         size_t scan_bytes = 2 * (size_t)num_tiles *
-            (sizeof(state_t) + sizeof(state_t) +
+            (sizeof(endo_t) + sizeof(endo_t) +
              sizeof(uint64_t) + sizeof(uint64_t) +
              2);
         size_t dram_bytes = n
