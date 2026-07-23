@@ -92,7 +92,14 @@ const bool h_accept[NUM_STATES] =
     iden = identity parallel_lexer
     state_type = stateType lex
     hot_lvls = hotLevels lex
-    hot_max_level = length hot_lvls - 1 :: Int
+    -- Variant J: force HOT_MAX_LEVEL=0 in the emitted lexer.  The hot-level
+    -- Phase A/B compact-DFA framework adds ~2.4 KB per-block static shmem
+    -- that pushes JSON over the 3->2 blocks/SM occupancy cliff on sm_75 and
+    -- costs ~29% end-to-end without a corresponding arithmetic saving.
+    -- We keep the Haskell analysis and the emitted level tables (they are
+    -- dead code in the .cu at HOT_MAX_LEVEL=0) so re-enabling is a one-line
+    -- change if the trade-off improves on a different arch or grammar.
+    hot_max_level = 0 :: Int
     hot_level_decls = Text.intercalate "\n" $ fmap emitHotLevel hot_lvls
 
     defToken t = [i|#define IGNORE_TOKEN #{t}|]

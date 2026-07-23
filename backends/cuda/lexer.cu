@@ -590,16 +590,15 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   //
   // Aliasing between phases is safe because each phase boundary is guarded
   // by __syncthreads() and no thread reads a Phase-A table after that barrier.
+#if HOT_MAX_LEVEL >= 1
   __shared__ __align__(8) unsigned char hot_arena[hot_arena_bytes()];
 
   // Tail views: promotion tables (permanent for this kernel invocation).
   state_t* s_state_lvl_0_to_state_t =
       reinterpret_cast<state_t*>(hot_arena + hot_arena_head_bytes());
-#if HOT_MAX_LEVEL >= 1
   state_t* s_state_lvl_1_to_state_t =
       reinterpret_cast<state_t*>(hot_arena + hot_arena_head_bytes()
                                  + NUM_STATES_LVL_0 * sizeof(state_t));
-#endif
 
   // Head view for Phase A: byte -> L0 id.
   state_lvl_0_t* s_to_state_lvl_0 =
@@ -609,10 +608,8 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   // Promotion tables (tail): written once, live for the full kernel.
   for (I i = threadIdx.x; i < (I)NUM_STATES_LVL_0; i += BLOCK_SIZE)
     s_state_lvl_0_to_state_t[i] = ctx.d_state_lvl_0_to_state_t[i];
-#if HOT_MAX_LEVEL >= 1
   for (I i = threadIdx.x; i < (I)NUM_STATES_LVL_1; i += BLOCK_SIZE)
     s_state_lvl_1_to_state_t[i] = ctx.d_state_lvl_1_to_state_t[i];
-#endif
   // Head: Phase-A byte->L0 table.
   for (I i = threadIdx.x; i < (I)NUM_TRANS; i += BLOCK_SIZE)
     s_to_state_lvl_0[i] = ctx.d_to_state_lvl_0[i];
@@ -620,10 +617,12 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   // All hot tables visible to all threads before tile-fill begins.
   __syncthreads();
   // Head view for Phase B (aliased over Phase-A head after sync).
-#if HOT_MAX_LEVEL >= 1
   state_lvl_1_t* s_compose_lvl_1 =
       reinterpret_cast<state_lvl_1_t*>(hot_arena);
 #endif
+  // Note: at HOT_MAX_LEVEL == 0 (Variant J) no hot_arena is allocated.
+  // Phase A reads directly from ctx.d_to_state via __ldg() into the
+  // states[] tile, exactly as the pre-hot-level baseline did.
 
   // Main slots: ceil(ITEMS_PER_THREAD / 8) uint64_t registers per thread.
   // One extra slot is added to cover the single byte past the block boundary
@@ -661,6 +660,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     }
   }
 
+#if HOT_MAX_LEVEL >= 1
   // Phase A: map each byte to its L0 compact id.  glbToReg produced a
   // *striped* register layout (thread t's copy_reg[v] holds global bytes
   // [v*BLOCK_SIZE*EPV + t*EPV, +EPV)), so each thread's registers hold
@@ -703,6 +703,38 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
       lvl0_ids[i] = l0_shmem[off + i];
   }
   __syncthreads();
+#else
+  // Phase A (HOT_MAX_LEVEL == 0, Variant J): skip the byte->L0 compact-id
+  // detour and write full state_t directly into the states[] tile using
+  // ctx.toState(), which is __ldg-cached on the 256-entry d_to_state
+  // table.  Saves ~256+46 B of static shmem/block vs the hot-level path,
+  // which is exactly what keeps JSON under the 3-blocks/SM cliff on
+  // sm_75.  Layout matches the pre-hot-level baseline.
+  {
+    const I off = threadIdx.x * SHMEM_STRIDE;
+#pragma unroll
+    for (uint32_t i = 0; i < VPT; i++) {
+      I lid = (I)i * BLOCK_SIZE + threadIdx.x;
+      I _gid = glb_offs + (I)sizeof(uint64_t) * lid;
+      for (uint32_t j = 0; j < sizeof(uint64_t); j++) {
+        I gid = _gid + (I)j;
+        I lid_off = (I)sizeof(uint64_t) * lid + (I)j;
+        uint32_t reg_off = sizeof(uint64_t) * i + j;
+        bool is_in_block = lid_off < (I)(ITEMS_PER_THREAD * BLOCK_SIZE);
+        if (is_in_block) {
+          state_t s = (gid < size) ? ctx.toState(chars_reg[reg_off]) : IDENTITY;
+          I shmem_idx = (lid_off / ITEMS_PER_THREAD) * SHMEM_STRIDE
+                      + (lid_off % ITEMS_PER_THREAD);
+          states[shmem_idx] = s;
+        } else if (lid_off == (I)(ITEMS_PER_THREAD * BLOCK_SIZE) && gid < size) {
+          // First byte of the next block for boundary produce test.
+          next_block_first_state = ctx.toState(chars_reg[reg_off]);
+        }
+      }
+    }
+  }
+  __syncthreads();
+#endif
 
 #if HOT_MAX_LEVEL >= 1
   // Phase B: pairwise in-register reduction using shmem L1 compose table.
@@ -800,21 +832,17 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     __syncthreads();
   }
 #else
-  // HOT_MAX_LEVEL == 0: promote L0 ids to state_t and run the full scan.
-  // (Variant I: dropped a redundant __syncthreads() here — the reassembly
-  // sync at line ~705 already guarantees Phase-A shmem is stable before
-  // any promotion table reads below.)
+  // HOT_MAX_LEVEL == 0 (Variant J): the states[] tile was filled with
+  // state_t values directly in Phase A above.  Load our blocked slice into
+  // registers, run the block-local scan + inter-block lookback, then
+  // write the inclusive prefix back.
   {
     state_t st[ITEMS_PER_THREAD];
     const I off = threadIdx.x * SHMEM_STRIDE;
     bool is_first = (glb_offs == 0) && (threadIdx.x == 0);
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-      I gid = glb_offs + (I)threadIdx.x * ITEMS_PER_THREAD + (I)i;
-      // OOB positions become IDENTITY so the inclusive scan (which then
-      // composes each item with the running block prefix) yields the state
-      // after the last valid character for all OOB slots.
-      st[i] = (gid < size) ? s_state_lvl_0_to_state_t[lvl0_ids[i]] : IDENTITY;
+      st[i] = states[off + i];
       if (is_first && i == 0)
         st[i] = ctx(ctx.getLastState(), st[i]);
     }
