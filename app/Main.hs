@@ -3,11 +3,16 @@ module Main where
 import Alpacc.CFG
 import Alpacc.Types
 import Alpacc.Generator.Analyzer
-  ( Generator (..),
+  ( Analyzer (..),
+    AnalyzerKind (..),
+    Generator (..),
+    Lexer (..),
     mkLexer,
     mkLexerParser,
     mkParser,
   )
+import Alpacc.Analysis.CompositionHistogram qualified as CH
+import Alpacc.Lexer.Encode (IntParallelLexer (..))
 import Alpacc.Generator.C.Generator qualified as C
 import Alpacc.Generator.Cuda.Generator qualified as Cuda
 import Alpacc.Generator.Futhark.Generator qualified as Futhark
@@ -51,11 +56,16 @@ data Command
   = Generate !GeneratorParameters
   | Test !TestCommand
   | Random !RandomParameters
+  | Dev !DevCommand
   deriving (Show)
 
 data TestCommand
   = TestGenerate !TestGenerateParameters
   | TestCompare !TestCompareParameters
+  deriving (Show)
+
+data DevCommand
+  = DevCompositionHistogram !Input
   deriving (Show)
 
 combine :: Gen -> Gen -> Gen
@@ -324,6 +334,21 @@ testCommands =
         <> command "compare" (info testCompareParameters (progDesc "Inspect if test passed."))
     )
 
+devCompositionHistogramParameters :: Parser Command
+devCompositionHistogramParameters =
+  Dev . DevCompositionHistogram <$> inputParameter
+
+devCommands :: Parser Command
+devCommands =
+  subparser
+    ( command
+        "composition-histogram"
+        ( info
+            devCompositionHistogramParameters
+            (progDesc "Rank rule-based patterns (row/column constants and projections) in the parallel-lexer composition table.")
+        )
+    )
+
 commands :: Parser Command
 commands =
   subparser
@@ -332,6 +357,7 @@ commands =
         <> command "c" (info (generatorParameters C) (progDesc "Generate parsers written in C."))
         <> command "random" (info randomParameters (progDesc "Generate random parser that can be used for testing."))
         <> command "test" (info testCommands (progDesc "Test related commands."))
+        <> command "dev" (info devCommands (progDesc "Developer/analysis utilities."))
     )
 
 options :: ParserInfo Command
@@ -575,6 +601,20 @@ mainTestCompare params = do
     result = testCompareResult params
     index32 = testCompareIndex32 params
 
+mainDev :: DevCommand -> IO ()
+mainDev (DevCompositionHistogram input) = do
+  cfg <- readCfg input
+  analyzer <- eitherToIO $ mkLexer cfg
+  lx <- case analyzerKind analyzer of
+    Lex l -> pure l
+    Both l _ -> pure l
+    _ -> do
+      hPutStrLn stderr "dev composition-histogram: grammar produced no lexer."
+      exitFailure
+  let ipl = lexer (lx :: Lexer)
+      pl = parLexer ipl
+  TextIO.putStr $ CH.renderReport $ CH.analyze pl
+
 main :: IO ()
 main = do
   opts <- execParser options
@@ -584,3 +624,4 @@ main = do
     Test test -> case test of
       TestGenerate params -> mainTestGenerate params
       TestCompare params -> mainTestCompare params
+    Dev dev -> mainDev dev
