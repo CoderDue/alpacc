@@ -707,9 +707,12 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
 #if HOT_MAX_LEVEL >= 1
   // Phase B: pairwise in-register reduction using shmem L1 compose table.
   // Reload the hot_arena head with the L1 compose table, aliasing over the
-  // Phase-A byte->L0 table.  Safe after __syncthreads: no thread reads
-  // s_to_state_lvl_0 past this point.
-  __syncthreads();
+  // Phase-A byte->L0 table.  The __syncthreads() at the end of the
+  // reassembly block above already serves as the phase boundary: no thread
+  // reads s_to_state_lvl_0 past that barrier, and the block-wide sync
+  // guarantees every thread has finished its reassembly loads before the
+  // cooperative L1 compose write starts.  (Variant I: dropped a redundant
+  // second __syncthreads() that used to sit immediately here.)
   for (I i = threadIdx.x; i < (I)(NUM_STATES_LVL_0 * NUM_STATES_LVL_0); i += BLOCK_SIZE)
     s_compose_lvl_1[i] = ctx.d_compose_lvl_1[i];
   __syncthreads();
@@ -798,7 +801,9 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   }
 #else
   // HOT_MAX_LEVEL == 0: promote L0 ids to state_t and run the full scan.
-  __syncthreads();
+  // (Variant I: dropped a redundant __syncthreads() here — the reassembly
+  // sync at line ~705 already guarantees Phase-A shmem is stable before
+  // any promotion table reads below.)
   {
     state_t st[ITEMS_PER_THREAD];
     const I off = threadIdx.x * SHMEM_STRIDE;
