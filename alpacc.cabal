@@ -95,7 +95,6 @@ library
     Alpacc.Lexer.FSA
     Alpacc.Lexer.ParallelLexing
     Alpacc.Lexer.DFAParallelLexer
-    Alpacc.Lexer.HotLevels
     Alpacc.Lexer.Encode
     Alpacc.Test
     Alpacc.Test.Parser

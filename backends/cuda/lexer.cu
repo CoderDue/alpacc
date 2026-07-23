@@ -43,51 +43,6 @@ constexpr size_t lexer_shmem_variable(uint32_t items_per_thread) {
   return states_bytes + exch_bytes;
 }
 
-// ---------------------------------------------------------------------------
-// Hot-arena shmem: compact level-k DFA transformation tables loaded once
-// per block and reused across reduction depths.
-//
-// Layout: one contiguous byte arena split into two regions:
-//   HEAD — rolling working set, reused per depth (guarded by __syncthreads).
-//   TAIL — promotion tables that survive to Phase C.  Laid out as:
-//          [state_lvl_0_to_state_t | state_lvl_1_to_state_t | ...]
-//
-// When HOT_MAX_LEVEL >= 1 the head holds the L1 compose table during Phase B
-// (overwriting the Phase-A byte->id table after a __syncthreads).
-//
-// All sizes are compile-time constants from the emitter (NUM_STATES_LVL_k,
-// sizeof(state_lvl_k_t)) so the arena size folds to a constexpr.
-
-__host__ __device__ constexpr size_t hot_arena_head_bytes() {
-  size_t d0 = NUM_TRANS * sizeof(state_lvl_0_t);
-  size_t peak = d0;
-#if HOT_MAX_LEVEL >= 1
-  size_t d1 = (size_t)NUM_STATES_LVL_0 * NUM_STATES_LVL_0 * sizeof(state_lvl_1_t);
-  peak = peak > d1 ? peak : d1;
-#endif
-#if HOT_MAX_LEVEL >= 2
-  size_t d2 = (size_t)NUM_STATES_LVL_1 * NUM_STATES_LVL_1 * sizeof(state_lvl_2_t);
-  peak = peak > d2 ? peak : d2;
-#endif
-  // Round up to sizeof(state_t) so the tail's state_t* views are aligned.
-  return (peak + sizeof(state_t) - 1) / sizeof(state_t) * sizeof(state_t);
-}
-
-__host__ __device__ constexpr size_t hot_arena_tail_bytes() {
-  size_t s = NUM_STATES_LVL_0 * sizeof(state_t);
-#if HOT_MAX_LEVEL >= 1
-  s += NUM_STATES_LVL_1 * sizeof(state_t);
-#endif
-#if HOT_MAX_LEVEL >= 2
-  s += NUM_STATES_LVL_2 * sizeof(state_t);
-#endif
-  return s;
-}
-
-__host__ __device__ constexpr size_t hot_arena_bytes() {
-  return hot_arena_head_bytes() + hot_arena_tail_bytes();
-}
-
 template<typename I, typename state_t, uint32_t BLOCK_SIZE>
 constexpr size_t lexer_shmem_fixed() {
   // cub TempStorage: one for the state scan (state_t) and one shared between
@@ -101,7 +56,7 @@ constexpr size_t lexer_shmem_fixed() {
   size_t fixed_scalars = sizeof(state_t)      // next_block_first_state
                         + sizeof(I)           // last_start
                         + sizeof(I);          // num_sel_sh
-  return cub_state_temp + cub_u32_temp + lookback + fixed_scalars + hot_arena_bytes();
+  return cub_state_temp + cub_u32_temp + lookback + fixed_scalars;
 }
 
 // Largest ITEMS_PER_THREAD ≤ HARD_CAP whose per-block shmem footprint fits
@@ -265,36 +220,6 @@ bool is_produce_cpu(state_t state) {
   return (state & PRODUCE_MASK) >> PRODUCE_OFFSET;
 }
 
-// ---------------------------------------------------------------------------
-// HotLevel<N>: compile-time trait for each compact representation level.
-// Each specialisation provides:
-//   id_t  — the compact integer type for this level
-//   SIZE  — number of distinct IDs
-// The actual shmem pointers are kernel-local (cannot be stored here).
-//
-// NOTE: the register scan (LexerCtx::operator(), scanReg<LexerCtx>) still
-// operates on state_t and d_compose (global memory) in this landing.
-// Higher levels (HOT_MAX_LEVEL >= 1) will replace those paths in a
-// follow-up; the framework below is ready to receive them.
-template<int LEVEL> struct HotLevel;   // primary undefined
-
-template<> struct HotLevel<0> {
-  using id_t = state_lvl_0_t;
-  static constexpr size_t SIZE = NUM_STATES_LVL_0;
-};
-#if HOT_MAX_LEVEL >= 1
-template<> struct HotLevel<1> {
-  using id_t = state_lvl_1_t;
-  static constexpr size_t SIZE = NUM_STATES_LVL_1;
-};
-#endif
-#if HOT_MAX_LEVEL >= 2
-template<> struct HotLevel<2> {
-  using id_t = state_lvl_2_t;
-  static constexpr size_t SIZE = NUM_STATES_LVL_2;
-};
-#endif
-
 template<typename I, typename J>
 struct LexerCtx {
 
@@ -339,14 +264,6 @@ private:
 public:
   const I CHUNK_SIZE;
   States<I, state_t> d_state_states;
-  // Hot-level device tables: uploaded at construction, read by the kernel's
-  // cooperative-load phase into the per-block hot_arena.
-  state_lvl_0_t* d_to_state_lvl_0 = nullptr;
-  state_t*       d_state_lvl_0_to_state_t = nullptr;
-#if HOT_MAX_LEVEL >= 1
-  state_lvl_1_t* d_compose_lvl_1 = nullptr;
-  state_t*       d_state_lvl_1_to_state_t = nullptr;
-#endif
   // SoA inter-block buffer for the (max token-start, +produce-count) scan.
   // Both components are I (u32); keeping them in separate arrays avoids the
   // former packed-u64 layout that dragged 8-byte traffic through the warp
@@ -364,22 +281,6 @@ public:
     gpuAssert(cudaMalloc(&d_compose, sizeof(h_compose)));
     cudaMemcpy(d_compose, h_compose, sizeof(h_compose),
                  cudaMemcpyHostToDevice);
-    // Hot-level tables.
-    gpuAssert(cudaMalloc(&d_to_state_lvl_0, sizeof(h_to_state_lvl_0)));
-    cudaMemcpy(d_to_state_lvl_0, h_to_state_lvl_0, sizeof(h_to_state_lvl_0),
-               cudaMemcpyHostToDevice);
-    gpuAssert(cudaMalloc(&d_state_lvl_0_to_state_t, sizeof(h_state_lvl_0_to_state_t)));
-    cudaMemcpy(d_state_lvl_0_to_state_t, h_state_lvl_0_to_state_t, sizeof(h_state_lvl_0_to_state_t),
-               cudaMemcpyHostToDevice);
-#if HOT_MAX_LEVEL >= 1
-    gpuAssert(cudaMalloc(&d_compose_lvl_1, sizeof(h_compose_lvl_1)));
-    cudaMemcpy(d_compose_lvl_1, h_compose_lvl_1, sizeof(h_compose_lvl_1),
-               cudaMemcpyHostToDevice);
-    gpuAssert(cudaMalloc(&d_state_lvl_1_to_state_t, sizeof(h_state_lvl_1_to_state_t)));
-    cudaMemcpy(d_state_lvl_1_to_state_t, h_state_lvl_1_to_state_t, sizeof(h_state_lvl_1_to_state_t),
-               cudaMemcpyHostToDevice);
-#endif
-
     d_maxadd_states = PairStates<I, I, I>(num_blocks);
     d_state_states = States<I, state_t>(num_blocks);
 
@@ -415,12 +316,6 @@ public:
 
   void cleanUp() {
     if (d_to_state) cudaFree(d_to_state);
-    if (d_to_state_lvl_0) cudaFree(d_to_state_lvl_0);
-    if (d_state_lvl_0_to_state_t) cudaFree(d_state_lvl_0_to_state_t);
-#if HOT_MAX_LEVEL >= 1
-    if (d_compose_lvl_1) cudaFree(d_compose_lvl_1);
-    if (d_state_lvl_1_to_state_t) cudaFree(d_state_lvl_1_to_state_t);
-#endif
     if (d_new_last_start) cudaFree((void*)d_new_last_start);
     if (d_old_last_start) cudaFree((void*)d_old_last_start);
     if (d_compose) cudaFree(d_compose);
@@ -461,10 +356,6 @@ public:
   }
 
   __device__ __host__ __forceinline__
-  // Legacy byte->state_t path (used by host-side helpers and getLastState).
-  // The kernel tile-fill now goes through the shmem hot-level path
-  // (toState_hot lambda); this will be removed once all device call sites
-  // have migrated to the hot-level representation.
   state_t toState(const uint8_t &a) const {
 #ifdef __CUDA_ARCH__
     return __ldg(&d_to_state[a]);
@@ -579,50 +470,8 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   length_t*   exch_l = exch.as_l;
   __shared__ state_t next_block_first_state;
 
-  // ---------------------------------------------------------------------------
-  // Hot-arena: compact level-k DFA tables in shared memory.
-  //
-  // HEAD (byte 0..hot_arena_head_bytes()-1): rolling working set.
-  //   Phase A (tile-fill): byte->L0 id table.
-  //   Phase B (reduction): L1 compose table overwrites Phase-A after sync.
-  // TAIL (hot_arena_head_bytes()..): promotion tables (id -> state_t),
-  //   one per level.  Written once at entry, live until promotion step.
-  //
-  // Aliasing between phases is safe because each phase boundary is guarded
-  // by __syncthreads() and no thread reads a Phase-A table after that barrier.
-#if HOT_MAX_LEVEL >= 1
-  __shared__ __align__(8) unsigned char hot_arena[hot_arena_bytes()];
-
-  // Tail views: promotion tables (permanent for this kernel invocation).
-  state_t* s_state_lvl_0_to_state_t =
-      reinterpret_cast<state_t*>(hot_arena + hot_arena_head_bytes());
-  state_t* s_state_lvl_1_to_state_t =
-      reinterpret_cast<state_t*>(hot_arena + hot_arena_head_bytes()
-                                 + NUM_STATES_LVL_0 * sizeof(state_t));
-
-  // Head view for Phase A: byte -> L0 id.
-  state_lvl_0_t* s_to_state_lvl_0 =
-      reinterpret_cast<state_lvl_0_t*>(hot_arena);
-
-  // Cooperative population of the hot arena from global device pointers.
-  // Promotion tables (tail): written once, live for the full kernel.
-  for (I i = threadIdx.x; i < (I)NUM_STATES_LVL_0; i += BLOCK_SIZE)
-    s_state_lvl_0_to_state_t[i] = ctx.d_state_lvl_0_to_state_t[i];
-  for (I i = threadIdx.x; i < (I)NUM_STATES_LVL_1; i += BLOCK_SIZE)
-    s_state_lvl_1_to_state_t[i] = ctx.d_state_lvl_1_to_state_t[i];
-  // Head: Phase-A byte->L0 table.
-  for (I i = threadIdx.x; i < (I)NUM_TRANS; i += BLOCK_SIZE)
-    s_to_state_lvl_0[i] = ctx.d_to_state_lvl_0[i];
-
-  // All hot tables visible to all threads before tile-fill begins.
-  __syncthreads();
-  // Head view for Phase B (aliased over Phase-A head after sync).
-  state_lvl_1_t* s_compose_lvl_1 =
-      reinterpret_cast<state_lvl_1_t*>(hot_arena);
-#endif
-  // Note: at HOT_MAX_LEVEL == 0 (Variant J) no hot_arena is allocated.
   // Phase A reads directly from ctx.d_to_state via __ldg() into the
-  // states[] tile, exactly as the pre-hot-level baseline did.
+  // states[] tile.
 
   // Main slots: ceil(ITEMS_PER_THREAD / 8) uint64_t registers per thread.
   // One extra slot is added to cover the single byte past the block boundary
@@ -660,58 +509,9 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     }
   }
 
-#if HOT_MAX_LEVEL >= 1
-  // Phase A: map each byte to its L0 compact id.  glbToReg produced a
-  // *striped* register layout (thread t's copy_reg[v] holds global bytes
-  // [v*BLOCK_SIZE*EPV + t*EPV, +EPV)), so each thread's registers hold
-  // bytes that belong to *other* threads in blocked layout.  We route them
-  // through shmem: write in striped layout with shmem_idx =
-  //   (lid_off / IPT) * SHMEM_STRIDE + (lid_off % IPT)
-  // then each thread reads its own blocked slice back into registers.
-  // We reuse `states[]` (state_t tile, byte-addressable) as the transit
-  // buffer aliased as state_lvl_0_t.
-  state_lvl_0_t* l0_shmem = reinterpret_cast<state_lvl_0_t*>(states);
-#pragma unroll
-  for (uint32_t i = 0; i < VPT; i++) {
-    I lid = (I)i * BLOCK_SIZE + threadIdx.x;
-    I _gid = glb_offs + (I)sizeof(uint64_t) * lid;
-    for (uint32_t j = 0; j < sizeof(uint64_t); j++) {
-      I gid = _gid + (I)j;
-      I lid_off = (I)sizeof(uint64_t) * lid + (I)j;
-      uint32_t reg_off = sizeof(uint64_t) * i + j;
-      bool is_in_block = lid_off < (I)(ITEMS_PER_THREAD * BLOCK_SIZE);
-      if (is_in_block) {
-        state_lvl_0_t id = (gid < size) ? s_to_state_lvl_0[chars_reg[reg_off]]
-                                        : s_to_state_lvl_0[0]; // identity byte
-        I shmem_idx = (lid_off / ITEMS_PER_THREAD) * SHMEM_STRIDE
-                    + (lid_off % ITEMS_PER_THREAD);
-        l0_shmem[shmem_idx] = id;
-      } else if (lid_off == (I)(ITEMS_PER_THREAD * BLOCK_SIZE) && gid < size) {
-        // First byte of the next block for boundary produce test.
-        next_block_first_state = s_state_lvl_0_to_state_t[s_to_state_lvl_0[chars_reg[reg_off]]];
-      }
-    }
-  }
-  __syncthreads();
-
-  // Reassemble this thread's blocked-layout IPT L0 ids from shmem.
-  state_lvl_0_t lvl0_ids[ITEMS_PER_THREAD];
+  // Phase A: byte -> state_t written directly into the states[] tile via
+  // ctx.toState() (__ldg-cached on the 256-entry d_to_state table).
   {
-    const I off = threadIdx.x * SHMEM_STRIDE;
-#pragma unroll
-    for (I i = 0; i < ITEMS_PER_THREAD; i++)
-      lvl0_ids[i] = l0_shmem[off + i];
-  }
-  __syncthreads();
-#else
-  // Phase A (HOT_MAX_LEVEL == 0, Variant J): skip the byte->L0 compact-id
-  // detour and write full state_t directly into the states[] tile using
-  // ctx.toState(), which is __ldg-cached on the 256-entry d_to_state
-  // table.  Saves ~256+46 B of static shmem/block vs the hot-level path,
-  // which is exactly what keeps JSON under the 3-blocks/SM cliff on
-  // sm_75.  Layout matches the pre-hot-level baseline.
-  {
-    const I off = threadIdx.x * SHMEM_STRIDE;
 #pragma unroll
     for (uint32_t i = 0; i < VPT; i++) {
       I lid = (I)i * BLOCK_SIZE + threadIdx.x;
@@ -734,108 +534,10 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     }
   }
   __syncthreads();
-#endif
 
-#if HOT_MAX_LEVEL >= 1
-  // Phase B: pairwise in-register reduction using shmem L1 compose table.
-  // Reload the hot_arena head with the L1 compose table, aliasing over the
-  // Phase-A byte->L0 table.  The __syncthreads() at the end of the
-  // reassembly block above already serves as the phase boundary: no thread
-  // reads s_to_state_lvl_0 past that barrier, and the block-wide sync
-  // guarantees every thread has finished its reassembly loads before the
-  // cooperative L1 compose write starts.  (Variant I: dropped a redundant
-  // second __syncthreads() that used to sit immediately here.)
-  for (I i = threadIdx.x; i < (I)(NUM_STATES_LVL_0 * NUM_STATES_LVL_0); i += BLOCK_SIZE)
-    s_compose_lvl_1[i] = ctx.d_compose_lvl_1[i];
-  __syncthreads();
-
-  // Compose adjacent L0 pairs -> L1 ids; promote to state_t for the scan.
-  // The scan operates on a half-resolution tile (IPT/2 items per thread).
-  // OOB handling: characters past `size` must contribute IDENTITY to the
-  // scan (matching the baseline's `states[shmem_idx] = IDENTITY` for OOB
-  // positions).  For each pair (a, b):
-  //   both in-range  -> promote_L1(compose_L1(a, b))
-  //   a in-range only -> promote_L0(a)
-  //   b in-range only -> promote_L0(b)  [cannot happen: b > a in blocked layout]
-  //   neither in-range -> IDENTITY
-  constexpr uint32_t IPT1 = ITEMS_PER_THREAD / 2;
-  state_t scan_st[IPT1 > 0 ? IPT1 : 1];
-#pragma unroll
-  for (uint32_t i = 0; i < IPT1; i++) {
-    I gid_a = glb_offs + (I)threadIdx.x * ITEMS_PER_THREAD + (I)(2 * i);
-    I gid_b = gid_a + 1;
-    if (gid_b < size) {
-      state_lvl_0_t a = lvl0_ids[2 * i];
-      state_lvl_0_t b = lvl0_ids[2 * i + 1];
-      state_lvl_1_t composed = s_compose_lvl_1[(uint32_t)a * NUM_STATES_LVL_0 + (uint32_t)b];
-      scan_st[i] = s_state_lvl_1_to_state_t[composed];
-    } else if (gid_a < size) {
-      scan_st[i] = s_state_lvl_0_to_state_t[lvl0_ids[2 * i]];
-    } else {
-      scan_st[i] = IDENTITY;
-    }
-  }
-  // Carry the last (unpaired) L0 id as state_t when IPT is odd.
-#if (ITEMS_PER_THREAD % 2) == 1
-  {
-    I gid_last = glb_offs + (I)threadIdx.x * ITEMS_PER_THREAD + (I)(ITEMS_PER_THREAD - 1);
-    scan_st[IPT1] = (gid_last < size)
-        ? s_state_lvl_0_to_state_t[lvl0_ids[ITEMS_PER_THREAD - 1]]
-        : IDENTITY;
-  }
-#endif
-  constexpr uint32_t SCAN_IPT = IPT1 + (ITEMS_PER_THREAD % 2);
-
-  // Block-local exclusive scan + inter-block lookback on the reduced tile.
-  // excl_scan_st[i] gives the block-local exclusive prefix to pair i of this
-  // thread.  Composing with the inter-block pfx yields the full exclusive
-  // prefix to each pair, which we then expand back to per-character states.
-  {
-    using BlockScanSt = cub::BlockScan<state_t, BLOCK_SIZE>;
-    __shared__ typename BlockScanSt::TempStorage scan_temp_st;
-    state_t excl_scan_st[SCAN_IPT];
-    state_t agg_st;
-    BlockScanSt(scan_temp_st).ExclusiveScan(scan_st, excl_scan_st, IDENTITY, ctx, agg_st);
-    const state_t pfx = lookbackPrefix<state_t, I, LexerCtx<I, J>>(
-        ctx.d_state_states, ctx, IDENTITY, dyn_index, agg_st);
-
-    const I off = threadIdx.x * SHMEM_STRIDE;
-    for (uint32_t i = 0; i < SCAN_IPT; i++) {
-      uint32_t a = 2 * i;
-      uint32_t b = 2 * i + 1;
-      I gid_a = glb_offs + (I)threadIdx.x * ITEMS_PER_THREAD + (I)a;
-      I gid_b = gid_a + 1;
-      // Full exclusive prefix to pair i: inter-block pfx composed with the
-      // block-local exclusive prefix to this pair from prior threads/pairs.
-      // ctx(pfx, ...) issues an __ldg on d_compose; broadcast across the
-      // block keeps it in L1 across the loop iterations.
-      state_t excl_pair = ctx(pfx, excl_scan_st[i]);
-      // For the very first position of the whole chunk, prepend getLastState()
-      // to carry over the cross-chunk DFA state.
-      if (dyn_index == 0 && threadIdx.x == 0 && i == 0)
-        excl_pair = ctx(excl_pair, ctx.getLastState());
-      // OOB positions get IDENTITY-composed, which is a no-op — matching the
-      // baseline's "fill OOB tile slots with IDENTITY then inclusive-scan"
-      // pattern (state after any OOB slot equals the state after the last
-      // valid slot before it, since IDENTITY is the monoid identity).
-      state_t incl_a = (gid_a < size)
-          ? ctx(excl_pair, s_state_lvl_0_to_state_t[lvl0_ids[a]])
-          : excl_pair;
-      states[off + a] = incl_a;
-      if (b < (uint32_t)ITEMS_PER_THREAD) {
-        state_t incl_b = (gid_b < size)
-            ? ctx(incl_a, s_state_lvl_0_to_state_t[lvl0_ids[b]])
-            : incl_a;
-        states[off + b] = incl_b;
-      }
-    }
-    __syncthreads();
-  }
-#else
-  // HOT_MAX_LEVEL == 0 (Variant J): the states[] tile was filled with
-  // state_t values directly in Phase A above.  Load our blocked slice into
-  // registers, run the block-local scan + inter-block lookback, then
-  // write the inclusive prefix back.
+  // Phase B/C: load our blocked slice from states[] into registers, run the
+  // block-local scan + inter-block lookback, then write the inclusive
+  // prefix back.
   {
     state_t st[ITEMS_PER_THREAD];
     const I off = threadIdx.x * SHMEM_STRIDE;
@@ -853,7 +555,6 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
       states[off + i] = ctx(pfx, st[i]);
     __syncthreads();
   }
-#endif
 
   // Split (max, +) block-local scans over u32 registers in blocked layout
   // (thread t owns tile positions [t*IPT, (t+1)*IPT)): the token-start Max
