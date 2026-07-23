@@ -158,7 +158,7 @@ scanWarp(volatile T* values,
   for (uint8_t d = 0; d < LG_WARP; d++) {
     if ((h = 1 << d) <= lane) {
       bool is_not_aggregate = statuses[tid] != Aggregate;
-      values[tid] = is_not_aggregate ? values[tid] : op(values[tid - h], values[tid]);
+      if (!is_not_aggregate) values[tid] = op(values[tid - h], values[tid]);
       statuses[tid] = combine(statuses[tid - h], statuses[tid]);
     }
     __syncwarp();
@@ -269,8 +269,8 @@ scanWarpPair(volatile TA* a_values,
   for (uint8_t d = 0; d < LG_WARP; d++) {
     if ((h = 1 << d) <= lane) {
       bool is_not_aggregate = statuses[tid] != Aggregate;
-      a_values[tid] = is_not_aggregate ? a_values[tid] : op_a(a_values[tid - h], a_values[tid]);
-      b_values[tid] = is_not_aggregate ? b_values[tid] : op_b(b_values[tid - h], b_values[tid]);
+      if (!is_not_aggregate) a_values[tid] = op_a(a_values[tid - h], a_values[tid]);
+      if (!is_not_aggregate) b_values[tid] = op_b(b_values[tid - h], b_values[tid]);
       statuses[tid] = combine(statuses[tid - h], statuses[tid]);
     }
     __syncwarp();

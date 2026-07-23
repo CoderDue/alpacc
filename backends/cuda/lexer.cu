@@ -23,11 +23,11 @@ constexpr size_t exch_elem_bytes() {
 }
 
 template<typename I, typename endo_t, uint32_t BLOCK_SIZE>
-constexpr size_t shmem_pad_stride(uint32_t items_per_thread) {
-  // Mirror the SHMEM_PAD calculation from the kernel body: STRIDE picked so
-  // (STRIDE * sizeof(endo_t)) ≡ 4 (mod 8), yielding conflict-free reads for
-  // the blocked state layout.  Padding depends only on endo_t's byte width
-  // and IPT.
+__host__ __device__ constexpr size_t shmem_pad_stride(uint32_t items_per_thread) {
+  // STRIDE chosen so (STRIDE * sizeof(endo_t)) ≡ 4 (mod 8) for bank-conflict
+  // avoidance when sizeof(endo_t) <= 8.  When sizeof(endo_t) > 8 the element
+  // already spans multiple 4-byte banks so no padding is needed — use stride=IPT.
+  if (sizeof(endo_t) > 8u) return (size_t)items_per_thread;
   uint32_t shmem_mod    = 8u / (uint32_t)sizeof(endo_t);
   uint32_t shmem_target = 4u / (uint32_t)sizeof(endo_t);
   uint32_t shmem_rem    = items_per_thread % shmem_mod;
@@ -197,38 +197,65 @@ constexpr uint32_t arch_block_size() {
 // ---------------------------------------------------------------------------
 // Compact endomorphism helpers.
 //
-// An endo_t word encodes up to MAX_IMAGE_SIZE (in, out, producing) triples,
-// each occupying TRIPLE_BITS = 2*STATE_BITS + 1 bits, packed from LSB.
+// endo_t is a struct { uint64_t w[ENDO_WORDS]; } encoding up to MAX_IMAGE_SIZE
+// (in, out, producing) triples, each TRIPLE_BITS = 2*STATE_BITS+1 bits wide,
+// packed from the LSB of w[0] across word boundaries.
 // A triple with in==0 and out==0 is the dead/padding sentinel.
 //
-// STATE_BITS, TRIPLE_BITS, STATE_MASK, MAX_IMAGE_SIZE, INIT_STATE,
+// STATE_BITS, TRIPLE_BITS, STATE_MASK, MAX_IMAGE_SIZE, INIT_STATE, ENDO_WORDS,
 // ENDO_IDENTITY and the tables h_endo / h_accept are all baked in by the
 // Haskell code generator above.
 // ---------------------------------------------------------------------------
 
+// Extract BITS bits starting at bit offset OFF from an endo_t.
+// Returns the value as a uint64_t (BITS must be <= 64).
+__device__ __host__ __forceinline__
+uint64_t endo_extract(const endo_t& e, int off, int bits) {
+  int word = off / 64;
+  int bit  = off % 64;
+  uint64_t lo = e.w[word] >> bit;
+  // If the field spans two words, grab the high part.
+  uint64_t hi = (bit + bits > 64 && word + 1 < ENDO_WORDS)
+              ? (e.w[word + 1] << (64 - bit))
+              : 0;
+  uint64_t mask = (bits < 64) ? ((uint64_t(1) << bits) - 1) : ~uint64_t(0);
+  return (lo | hi) & mask;
+}
+
+// OR 'val' (BITS wide) into endo_t at bit offset OFF.
+__device__ __host__ __forceinline__
+void endo_insert(endo_t& e, int off, int bits, uint64_t val) {
+  int word = off / 64;
+  int bit  = off % 64;
+  e.w[word] |= val << bit;
+  if (bit + bits > 64 && word + 1 < ENDO_WORDS)
+    e.w[word + 1] |= val >> (64 - bit);
+}
+
 // Compose two endomorphisms f then g via linear search.
 __device__ __host__ __forceinline__
-endo_t endo_compose(endo_t f, endo_t g) {
-  endo_t result = 0;
+endo_t endo_compose(const endo_t& f, const endo_t& g) {
+  endo_t result;
+  for (int k = 0; k < ENDO_WORDS; k++) result.w[k] = 0;
   int out = 0;
 #pragma unroll
   for (int fi = 0; fi < MAX_IMAGE_SIZE; fi++) {
-    endo_t triple_f = f >> (fi * TRIPLE_BITS);
-    int fi_in  = (int)(triple_f        & STATE_MASK);
-    int fi_out = (int)((triple_f >> STATE_BITS) & STATE_MASK);
+    int off_f  = fi * TRIPLE_BITS;
+    int fi_in  = (int)endo_extract(f, off_f,              STATE_BITS);
+    int fi_out = (int)endo_extract(f, off_f + STATE_BITS, STATE_BITS);
     if (fi_in == 0 && fi_out == 0) break;
 #pragma unroll
     for (int gi = 0; gi < MAX_IMAGE_SIZE; gi++) {
-      endo_t triple_g = g >> (gi * TRIPLE_BITS);
-      int gi_in   = (int)(triple_g & STATE_MASK);
-      int gi_out  = (int)((triple_g >> STATE_BITS)       & STATE_MASK);
-      int gi_prod = (int)((triple_g >> (2 * STATE_BITS)) & 1);
+      int off_g  = gi * TRIPLE_BITS;
+      int gi_in  = (int)endo_extract(g, off_g,              STATE_BITS);
+      int gi_out = (int)endo_extract(g, off_g + STATE_BITS, STATE_BITS);
+      int gi_prod = (int)endo_extract(g, off_g + 2 * STATE_BITS, 1);
       if (gi_in == 0 && gi_out == 0) break;
       if (gi_in == fi_out) {
-        endo_t packed = ((endo_t)fi_in)
-                      | ((endo_t)gi_out  << STATE_BITS)
-                      | ((endo_t)gi_prod << (2 * STATE_BITS));
-        result |= packed << (out * TRIPLE_BITS);
+        int off_r = out * TRIPLE_BITS;
+        endo_insert(result, off_r,              STATE_BITS, (uint64_t)fi_in);
+        endo_insert(result, off_r + STATE_BITS, STATE_BITS, (uint64_t)gi_out);
+        endo_insert(result, off_r + 2*STATE_BITS, 1,        (uint64_t)gi_prod);
         out++;
         break;
       }
@@ -239,12 +266,12 @@ endo_t endo_compose(endo_t f, endo_t g) {
 
 // Evaluate an endomorphism on a query DFA state; returns 0 (dead) if not found.
 __device__ __host__ __forceinline__
-int eval_endo(endo_t e, int query) {
+int eval_endo(const endo_t& e, int query) {
 #pragma unroll
   for (int i = 0; i < MAX_IMAGE_SIZE; i++) {
-    endo_t t = e >> (i * TRIPLE_BITS);
-    int in  = (int)(t & STATE_MASK);
-    int out = (int)((t >> STATE_BITS) & STATE_MASK);
+    int off = i * TRIPLE_BITS;
+    int in  = (int)endo_extract(e, off,              STATE_BITS);
+    int out = (int)endo_extract(e, off + STATE_BITS, STATE_BITS);
     if (in == 0 && out == 0) break;
     if (in == query) return out;
   }
@@ -253,13 +280,14 @@ int eval_endo(endo_t e, int query) {
 
 // Extract the producing flag for a query DFA state from the endomorphism.
 __device__ __host__ __forceinline__
-bool eval_producing(endo_t e, int query) {
+bool eval_producing(const endo_t& e, int query) {
 #pragma unroll
   for (int i = 0; i < MAX_IMAGE_SIZE; i++) {
-    endo_t t = e >> (i * TRIPLE_BITS);
-    int in = (int)(t & STATE_MASK);
+    int off = i * TRIPLE_BITS;
+    int in  = (int)endo_extract(e, off, STATE_BITS);
     if (in == 0) break;
-    if (in == query) return (bool)((t >> (2 * STATE_BITS)) & 1);
+    if (in == query)
+      return (bool)endo_extract(e, off + 2 * STATE_BITS, 1);
   }
   return false;
 }
@@ -342,6 +370,7 @@ public:
     cudaMemset((void*)d_dyn_block_index, 0, sizeof(uint32_t));
     cudaMemset((void*)d_new_size, 0, sizeof(I));
     endo_t identity = ENDO_IDENTITY;
+    cudaMemcpyToSymbol(d_ENDO_IDENTITY, &identity, sizeof(endo_t));
     cudaMemcpy((void*)d_new_last_endo, &identity, sizeof(endo_t), cudaMemcpyHostToDevice);
     cudaMemcpy((void*)d_old_last_endo, &identity, sizeof(endo_t), cudaMemcpyHostToDevice);
     cudaMemset((void*)d_new_last_start, 0, sizeof(J));
@@ -385,14 +414,19 @@ public:
   // Volatile overload for scanWarp in lookbackPrefix.
   __device__ __host__ __forceinline__
   endo_t operator()(const volatile endo_t &a, const volatile endo_t &b) const {
-    return endo_compose((endo_t)a, (endo_t)b);
+    endo_t na, nb;
+    for (int k = 0; k < ENDO_WORDS; k++) { na.w[k] = a.w[k]; nb.w[k] = b.w[k]; }
+    return endo_compose(na, nb);
   }
 
   // Map a byte to its endomorphism word.
   __device__ __host__ __forceinline__
   endo_t toState(const uint8_t &a) const {
 #ifdef __CUDA_ARCH__
-    return __ldg(&d_endo[a]);
+    endo_t r;
+    for (int k = 0; k < ENDO_WORDS; k++)
+      r.w[k] = __ldg(&d_endo[a].w[k]);
+    return r;
 #else
     return d_endo[a];
 #endif
@@ -410,12 +444,14 @@ public:
 
   __device__ __host__ __forceinline__
   void setLastState(endo_t e) const {
-    *d_new_last_endo = e;
+    for (int k = 0; k < ENDO_WORDS; k++) d_new_last_endo->w[k] = e.w[k];
   }
 
   __device__ __host__ __forceinline__
   endo_t getLastState() const {
-    return *d_old_last_endo;
+    endo_t r;
+    for (int k = 0; k < ENDO_WORDS; k++) r.w[k] = d_old_last_endo->w[k];
+    return r;
   }
 
   __device__ __host__ __forceinline__
@@ -471,16 +507,10 @@ public:
 template<typename I, typename J, I BLOCK_SIZE, I ITEMS_PER_THREAD>
 __global__ void
 lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_starts, length_t* d_lengths, const I size, const bool is_last_chunk) {
-  // Bank-conflict-free padding: we need (STRIDE * sizeof(endo_t)) to be
-  // ≡ 4 (mod 8) so the stride in 4-byte banks is odd (coprime with 32).
-  // Works for endo_t ∈ {u32, u64}.
-  static_assert(sizeof(endo_t) == 4 || sizeof(endo_t) == 8, "unexpected endo_t size");
-  constexpr I SHMEM_MOD    = 8 / (I)sizeof(endo_t);
-  constexpr I SHMEM_TARGET = 4 / (I)sizeof(endo_t);
-  constexpr I SHMEM_REM    = (ITEMS_PER_THREAD % SHMEM_MOD);
-  constexpr I SHMEM_RAW    = (SHMEM_TARGET - SHMEM_REM + SHMEM_MOD) % SHMEM_MOD;
-  constexpr I SHMEM_PAD    = (SHMEM_RAW == 0) ? SHMEM_MOD : SHMEM_RAW;
-  constexpr I SHMEM_STRIDE = ITEMS_PER_THREAD + SHMEM_PAD;
+  // Bank-conflict-free padding via the compile-time helper (handles
+  // sizeof(endo_t) > 8 by returning ITEMS_PER_THREAD with no padding).
+  constexpr I SHMEM_STRIDE =
+      (I)shmem_pad_stride<I, endo_t, BLOCK_SIZE>(ITEMS_PER_THREAD);
   __shared__ endo_t states[SHMEM_STRIDE * BLOCK_SIZE];
   // Exchange buffer for the two-phase scatter on dense tiles.
   // exch_t (terminals), exch_j (starts), and exch_l (lengths) are never live
@@ -511,7 +541,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   I glb_offs = dyn_index * BLOCK_SIZE * ITEMS_PER_THREAD;
 
   if (threadIdx.x == I()) {
-    next_block_first_state = ENDO_IDENTITY;
+    next_block_first_state = d_ENDO_IDENTITY;
   }
 
   // Vectorized global → registers.  glbToReg covers the first VPT-1 slots
@@ -548,7 +578,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
         uint32_t reg_off = sizeof(uint64_t) * i + j;
         bool is_in_block = lid_off < (I)(ITEMS_PER_THREAD * BLOCK_SIZE);
         if (is_in_block) {
-          endo_t s = (gid < size) ? ctx.toState(chars_reg[reg_off]) : ENDO_IDENTITY;
+          endo_t s = (gid < size) ? ctx.toState(chars_reg[reg_off]) : d_ENDO_IDENTITY;
           I shmem_idx = (lid_off / ITEMS_PER_THREAD) * SHMEM_STRIDE
                       + (lid_off % ITEMS_PER_THREAD);
           states[shmem_idx] = s;
@@ -575,7 +605,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
         st[i] = ctx(ctx.getLastState(), st[i]);
     }
     const endo_t pfx = scanReg<endo_t, I, LexerCtx<I, J>, ITEMS_PER_THREAD, BLOCK_SIZE>(
-        st, ctx.d_state_states, ctx, ENDO_IDENTITY, dyn_index);
+        st, ctx.d_state_states, ctx, d_ENDO_IDENTITY, dyn_index);
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
       states[off + i] = ctx(pfx, st[i]);
