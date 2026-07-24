@@ -509,6 +509,7 @@ lexerTestsCompare cfg index32 input expected result = do
   Inputs inp <- decodeWith "Error: Could not parse input file." getInputs input
   Outputs ex <- decodeWith "Error: Could not parse expected output file." (getOutputs tw iw lw) expected
   Outputs res <- decodeWith "Error: Could not parse result output file." (getOutputs tw iw lw) result
+  failwith (not (null inp)) "Error: Input file contains no tests."
   failwith (length inp == length ex) "Error: Input and expected output file do not have the same number of tests."
   failwith (length inp == length res) "Error: Input and result output file do not have the same number of tests."
 
