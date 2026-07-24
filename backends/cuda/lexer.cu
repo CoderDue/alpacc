@@ -22,40 +22,32 @@ constexpr size_t exch_elem_bytes() {
   return (t > j ? (t > l ? t : l) : (j > l ? j : l));
 }
 
-template<typename I, typename endo_t, uint32_t BLOCK_SIZE>
+template<typename I, typename state_t, uint32_t BLOCK_SIZE>
 __host__ __device__ constexpr size_t shmem_pad_stride(uint32_t items_per_thread) {
-  // STRIDE chosen so (STRIDE * sizeof(endo_t)) ≡ 4 (mod 8) for bank-conflict
-  // avoidance when sizeof(endo_t) <= 8.  When sizeof(endo_t) > 8 the element
-  // already spans multiple 4-byte banks so no padding is needed — use stride=IPT.
-  if (sizeof(endo_t) > 8u) return (size_t)items_per_thread;
-  uint32_t shmem_mod    = 8u / (uint32_t)sizeof(endo_t);
-  uint32_t shmem_target = 4u / (uint32_t)sizeof(endo_t);
+  if (sizeof(state_t) >= 8u) return (size_t)items_per_thread;
+  uint32_t shmem_mod    = 8u / (uint32_t)sizeof(state_t);
+  uint32_t shmem_target = 4u / (uint32_t)sizeof(state_t);
   uint32_t shmem_rem    = items_per_thread % shmem_mod;
   uint32_t shmem_raw    = (shmem_target - shmem_rem + shmem_mod) % shmem_mod;
   uint32_t shmem_pad    = (shmem_raw == 0) ? shmem_mod : shmem_raw;
   return (size_t)(items_per_thread + shmem_pad);
 }
 
-template<typename I, typename endo_t, typename J, typename length_t, typename terminal_t, uint32_t BLOCK_SIZE>
+template<typename I, typename state_t, typename J, typename length_t, typename terminal_t, uint32_t BLOCK_SIZE>
 constexpr size_t lexer_shmem_variable(uint32_t items_per_thread) {
-  size_t states_bytes = sizeof(endo_t) * shmem_pad_stride<I, endo_t, BLOCK_SIZE>(items_per_thread) * BLOCK_SIZE;
-  size_t exch_bytes   = exch_elem_bytes<I, endo_t, J, length_t, terminal_t>() * items_per_thread * BLOCK_SIZE;
+  size_t states_bytes = sizeof(state_t) * shmem_pad_stride<I, state_t, BLOCK_SIZE>(items_per_thread) * BLOCK_SIZE;
+  size_t exch_bytes   = exch_elem_bytes<I, state_t, J, length_t, terminal_t>() * items_per_thread * BLOCK_SIZE;
   return states_bytes + exch_bytes;
 }
 
-template<typename I, typename endo_t, uint32_t BLOCK_SIZE>
+template<typename I, typename state_t, uint32_t BLOCK_SIZE>
 constexpr size_t lexer_shmem_fixed() {
-  // cub TempStorage: one for the endo scan (endo_t) and one shared between
-  // the two SoA scans (u32).  sizeof gives us the exact per-instantiation
-  // size cub picks for this (T, BLOCK_SIZE) pair.
-  size_t cub_state_temp = sizeof(typename cub::BlockScan<endo_t, BLOCK_SIZE>::TempStorage);
+  size_t cub_state_temp = sizeof(typename cub::BlockScan<state_t, BLOCK_SIZE>::TempStorage);
   size_t cub_u32_temp   = sizeof(typename cub::BlockScan<uint32_t,  BLOCK_SIZE>::TempStorage);
-  // lookbackPrefixPair shmem: two warp-sized value arrays (I each) + one
-  // status array + two shmem prefix scalars.
   size_t lookback = 2u * sizeof(I) * WARP + sizeof(uint8_t) * WARP + 2u * sizeof(I);
-  size_t fixed_scalars = sizeof(endo_t)      // next_block_first_state
-                        + sizeof(I)           // last_start
-                        + sizeof(I);          // num_sel_sh
+  size_t fixed_scalars = sizeof(state_t)    // next_block_first_state
+                        + sizeof(I)          // last_start
+                        + sizeof(I);         // num_sel_sh
   return cub_state_temp + cub_u32_temp + lookback + fixed_scalars;
 }
 
@@ -63,15 +55,15 @@ constexpr size_t lexer_shmem_fixed() {
 // in floor(SHARED_MEMORY * USABLE_PCT / 100) bytes.  Reserving 10% by
 // default (USABLE_PCT = 90) leaves headroom for cub internals and any small
 // implicit allocations we haven't modelled.
-template<typename I, typename endo_t, typename J, typename length_t, typename terminal_t,
+template<typename I, typename state_t, typename J, typename length_t, typename terminal_t,
          uint32_t BLOCK_SIZE, uint32_t SHARED_MEMORY,
          uint32_t HARD_CAP = 1024, uint32_t USABLE_PCT = 90>
 constexpr uint32_t max_items_per_thread() {
   size_t usable = (size_t)SHARED_MEMORY * USABLE_PCT / 100u;
-  size_t fixed = lexer_shmem_fixed<I, endo_t, BLOCK_SIZE>();
+  size_t fixed = lexer_shmem_fixed<I, state_t, BLOCK_SIZE>();
   uint32_t best = 1;
   for (uint32_t ipt = 1; ipt <= HARD_CAP; ipt++) {
-    size_t total = fixed + lexer_shmem_variable<I, endo_t, J, length_t, terminal_t, BLOCK_SIZE>(ipt);
+    size_t total = fixed + lexer_shmem_variable<I, state_t, J, length_t, terminal_t, BLOCK_SIZE>(ipt);
     if (total <= usable) best = ipt;
     else break;
   }
@@ -162,24 +154,25 @@ template<size_t ELEM> struct alpacc_ipt_tuning<100, ELEM> {
   static constexpr uint32_t block_size     = 128;
 };
 
-// Type-size bucket driver: sizeof(index_t).  The block-local max and add
-// scans run on I = uint32_t but their downstream register arrays
-// (`starts[IPT]`, `local_offs[IPT]`) and the SoA lookback buffers are
-// index_t-sized, which is what drives the scan's per-item register
-// pressure at the block boundary.  state_t affects a separate scan that
-// runs first; its impact on IPT is captured indirectly through the shmem
-// clamp in `max_items_per_thread()`.  length_t and terminal_t are always
-// narrower and don't move the optimum in practice.
+// Type-size bucket driver: sizeof(index_t).
+// The tuning table entries are measured at a fixed endo_t width (8 bytes,
+// one uint64_t word).  For wider endo_t the table no longer applies and
+// arch_ipt() returns 0, falling back to the shmem-budget search.
+// index_t drives register arrays (starts[], local_offs[]) and the SoA
+// lookback buffers; it is the right axis for the table when endo_t is narrow.
 template<typename endo_t, typename J>
 constexpr size_t elem_bytes() {
-  (void)sizeof(endo_t);  // silence unused-template-parameter warnings
   return sizeof(J);
 }
 
-// Table-driven IPT (0 if the arch is unknown, in which case callers fall
-// back to max_items_per_thread<>()).
+// Table-driven IPT (0 if the arch is unknown or endo_t is wider than the
+// measured baseline, in which case callers fall back to max_items_per_thread<>()).
 template<int SM_ARCH, typename endo_t, typename J>
 constexpr uint32_t arch_ipt() {
+  // Table entries were measured with sizeof(endo_t) == 8 (one uint64_t word).
+  // For wider endomorphisms the table is unreliable; return 0 to use the
+  // shmem-budget search instead.
+  if (sizeof(endo_t) > 8u) return 0;
   constexpr size_t bytes = elem_bytes<endo_t, J>();
   constexpr uint32_t nominal = alpacc_ipt_tuning<SM_ARCH, bytes>::nominal_ipt_4B;
   if (nominal == 0) return 0;
@@ -195,34 +188,35 @@ constexpr uint32_t arch_block_size() {
 }
 
 // ---------------------------------------------------------------------------
-// Compact endomorphism helpers.
+// Endomorphism helpers.
 //
 // endo_t is a struct { uint64_t w[ENDO_WORDS]; } encoding up to MAX_IMAGE_SIZE
 // (in, out, producing) triples, each TRIPLE_BITS = 2*STATE_BITS+1 bits wide,
-// packed from the LSB of w[0] across word boundaries.
-// A triple with in==0 and out==0 is the dead/padding sentinel.
+// packed from bit 0 of w[0] across word boundaries.
+// Bit 63 of w[0] is the identity flag. ENDO_IDENTITY has only this bit set.
+// Char endomorphisms always have bit 63 of w[0] clear.
 //
 // STATE_BITS, TRIPLE_BITS, STATE_MASK, MAX_IMAGE_SIZE, INIT_STATE, ENDO_WORDS,
 // ENDO_IDENTITY and the tables h_endo / h_accept are all baked in by the
 // Haskell code generator above.
 // ---------------------------------------------------------------------------
 
-// Extract BITS bits starting at bit offset OFF from an endo_t.
-// Returns the value as a uint64_t (BITS must be <= 64).
+__device__ __host__ __forceinline__
+bool endo_is_identity(const endo_t& e) {
+  return (e.w[0] >> 63) & 1;
+}
+
 __device__ __host__ __forceinline__
 uint64_t endo_extract(const endo_t& e, int off, int bits) {
   int word = off / 64;
   int bit  = off % 64;
   uint64_t lo = e.w[word] >> bit;
-  // If the field spans two words, grab the high part.
   uint64_t hi = (bit + bits > 64 && word + 1 < ENDO_WORDS)
-              ? (e.w[word + 1] << (64 - bit))
-              : 0;
+              ? (e.w[word + 1] << (64 - bit)) : 0;
   uint64_t mask = (bits < 64) ? ((uint64_t(1) << bits) - 1) : ~uint64_t(0);
   return (lo | hi) & mask;
 }
 
-// OR 'val' (BITS wide) into endo_t at bit offset OFF.
 __device__ __host__ __forceinline__
 void endo_insert(endo_t& e, int off, int bits, uint64_t val) {
   int word = off / 64;
@@ -232,9 +226,10 @@ void endo_insert(endo_t& e, int off, int bits, uint64_t val) {
     e.w[word + 1] |= val >> (64 - bit);
 }
 
-// Compose two endomorphisms f then g via linear search.
 __device__ __host__ __forceinline__
 endo_t endo_compose(const endo_t& f, const endo_t& g) {
+  if (endo_is_identity(f)) return g;
+  if (endo_is_identity(g)) return f;
   endo_t result;
   for (int k = 0; k < ENDO_WORDS; k++) result.w[k] = 0;
   int out = 0;
@@ -246,16 +241,16 @@ endo_t endo_compose(const endo_t& f, const endo_t& g) {
     if (fi_in == 0 && fi_out == 0) break;
 #pragma unroll
     for (int gi = 0; gi < MAX_IMAGE_SIZE; gi++) {
-      int off_g  = gi * TRIPLE_BITS;
-      int gi_in  = (int)endo_extract(g, off_g,              STATE_BITS);
-      int gi_out = (int)endo_extract(g, off_g + STATE_BITS, STATE_BITS);
+      int off_g   = gi * TRIPLE_BITS;
+      int gi_in   = (int)endo_extract(g, off_g,                  STATE_BITS);
+      int gi_out  = (int)endo_extract(g, off_g + STATE_BITS,     STATE_BITS);
       int gi_prod = (int)endo_extract(g, off_g + 2 * STATE_BITS, 1);
       if (gi_in == 0 && gi_out == 0) break;
       if (gi_in == fi_out) {
         int off_r = out * TRIPLE_BITS;
-        endo_insert(result, off_r,              STATE_BITS, (uint64_t)fi_in);
-        endo_insert(result, off_r + STATE_BITS, STATE_BITS, (uint64_t)gi_out);
-        endo_insert(result, off_r + 2*STATE_BITS, 1,        (uint64_t)gi_prod);
+        endo_insert(result, off_r,                  STATE_BITS, (uint64_t)fi_in);
+        endo_insert(result, off_r + STATE_BITS,     STATE_BITS, (uint64_t)gi_out);
+        endo_insert(result, off_r + 2 * STATE_BITS, 1,          (uint64_t)gi_prod);
         out++;
         break;
       }
@@ -264,9 +259,9 @@ endo_t endo_compose(const endo_t& f, const endo_t& g) {
   return result;
 }
 
-// Evaluate an endomorphism on a query DFA state; returns 0 (dead) if not found.
 __device__ __host__ __forceinline__
 int eval_endo(const endo_t& e, int query) {
+  if (endo_is_identity(e)) return query;
 #pragma unroll
   for (int i = 0; i < MAX_IMAGE_SIZE; i++) {
     int off = i * TRIPLE_BITS;
@@ -278,9 +273,9 @@ int eval_endo(const endo_t& e, int query) {
   return 0;
 }
 
-// Extract the producing flag for a query DFA state from the endomorphism.
 __device__ __host__ __forceinline__
 bool eval_producing(const endo_t& e, int query) {
+  if (endo_is_identity(e)) return false;
 #pragma unroll
   for (int i = 0; i < MAX_IMAGE_SIZE; i++) {
     int off = i * TRIPLE_BITS;
@@ -292,14 +287,11 @@ bool eval_producing(const endo_t& e, int query) {
   return false;
 }
 
-// Get terminal ID for the state that INIT_STATE maps to under endomorphism e.
-// h_terminal[s] maps DFA state s to its terminal id (baked in by codegen).
 __device__ __forceinline__
 terminal_t get_terminal(endo_t e) {
   return static_cast<terminal_t>(h_terminal[eval_endo(e, INIT_STATE)]);
 }
 
-// True if the transition from INIT_STATE under e is a producing transition.
 __device__ __forceinline__
 bool is_produce(endo_t e) {
   return eval_producing(e, INIT_STATE);
@@ -405,21 +397,18 @@ public:
     d_state_states.cleanUp();
   }
 
-  // Composition operator: apply f then g.
   __device__ __host__ __forceinline__
-  endo_t operator()(const endo_t &a, const endo_t &b) const {
+  endo_t operator()(const endo_t& a, const endo_t& b) const {
     return endo_compose(a, b);
   }
 
-  // Volatile overload for scanWarp in lookbackPrefix.
   __device__ __host__ __forceinline__
-  endo_t operator()(const volatile endo_t &a, const volatile endo_t &b) const {
+  endo_t operator()(const volatile endo_t& a, const volatile endo_t& b) const {
     endo_t na, nb;
     for (int k = 0; k < ENDO_WORDS; k++) { na.w[k] = a.w[k]; nb.w[k] = b.w[k]; }
     return endo_compose(na, nb);
   }
 
-  // Map a byte to its endomorphism word.
   __device__ __host__ __forceinline__
   endo_t toState(const uint8_t &a) const {
 #ifdef __CUDA_ARCH__
@@ -507,8 +496,6 @@ public:
 template<typename I, typename J, I BLOCK_SIZE, I ITEMS_PER_THREAD>
 __global__ void
 lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_starts, length_t* d_lengths, const I size, const bool is_last_chunk) {
-  // Bank-conflict-free padding via the compile-time helper (handles
-  // sizeof(endo_t) > 8 by returning ITEMS_PER_THREAD with no padding).
   constexpr I SHMEM_STRIDE =
       (I)shmem_pad_stride<I, endo_t, BLOCK_SIZE>(ITEMS_PER_THREAD);
   __shared__ endo_t states[SHMEM_STRIDE * BLOCK_SIZE];

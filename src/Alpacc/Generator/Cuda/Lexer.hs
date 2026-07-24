@@ -24,12 +24,14 @@ stateBits n
   | n <= 2    = 1
   | otherwise = ceiling (logBase 2 (fromIntegral n) :: Double)
 
--- | Emit endo_t constructor call: endo_t(w0ULL, w1ULL, ...)
-cudafyEndoT :: [Integer] -> Text
-cudafyEndoT ws =
-  "endo_t(" <> Text.intercalate ", " (map (\w -> Text.pack (show w) <> "ULL") ws) <> ")"
+-- | Number of uint64_t words needed for maxSlots triples of TRIPLE_BITS each.
+-- One extra bit in w[0] is reserved for the identity flag, but since
+-- TRIPLE_BITS * maxSlots <= 63 whenever this returns 1, no extra word is needed.
+endoWords :: Int -> Int -> Int
+endoWords sb maxSlots = max 1 $ ceiling ((fromIntegral (tb * maxSlots) :: Double) / 64)
+  where tb = 2 * sb + 1
 
--- | Emit a C++ arity-N constructor for endo_t accepting N uint64_t values.
+-- | Emit endo_t N-ary constructor.
 endoCtorN :: Int -> Text
 endoCtorN n =
   "  __device__ __host__ __forceinline__\n"
@@ -39,7 +41,12 @@ endoCtorN n =
     <> Text.concat ["w[" <> Text.pack (show k) <> "]=v" <> Text.pack (show k) <> "; " | k <- [0 .. n - 1]]
     <> "}"
 
--- | Extract non-dead (input, output, producing) triples from an Endomorphism.
+-- | Emit endo_t literal: endo_t(w0ULL, w1ULL, ...)
+cudafyEndoT :: [Integer] -> Text
+cudafyEndoT ws =
+  "endo_t(" <> Text.intercalate ", " (map (\w -> Text.pack (show w) <> "ULL") ws) <> ")"
+
+-- | Extract non-dead (in, out, producing) triples from an Endomorphism.
 endoToTriples :: Endomorphism -> [(Int, Int, Bool)]
 endoToTriples (Endomorphism arr bs) =
   [ (s, j, p)
@@ -52,20 +59,16 @@ endoToTriples (Endomorphism arr bs) =
   where
     (lo, hi) = UArray.bounds arr
 
--- | Number of uint64_t words needed to hold all triples.
-endoWords :: Int -> Int -> Int
-endoWords sb maxSlots = max 1 $ ceiling ((fromIntegral (tb * maxSlots) :: Double) / 64)
-  where tb = 2 * sb + 1
-
--- | Pack triples into a big-integer, then split into ENDO_WORDS uint64_t chunks.
+-- | Pack up to maxSlots triples into nWords uint64_t words.
+-- Bit 63 of w[0] is reserved for the identity flag and is always 0 here.
 packEndoWords :: Int -> Int -> Int -> [(Int, Int, Bool)] -> [Integer]
 packEndoWords sb maxSlots nWords triples =
   [ (bigWord `shiftR` (64 * k)) .&. mask64 | k <- [0 .. nWords - 1] ]
   where
-    mask64   = (1 `shiftL` 64) - 1
-    tb       = 2 * sb + 1
-    sm       = (1 :: Integer) `shiftL` sb - 1
-    bigWord  = List.foldl' insertTriple 0 (zip [0 ..] (take maxSlots triples))
+    mask64  = (1 `shiftL` 64) - 1
+    tb      = 2 * sb + 1
+    sm      = (1 :: Integer) `shiftL` sb - 1
+    bigWord = List.foldl' insertTriple 0 (zip [0 ..] (take maxSlots triples))
     insertTriple acc (slot, (ii, jj, p)) =
       let wi     = toInteger ii .&. sm
           wj     = toInteger jj .&. sm
@@ -73,16 +76,16 @@ packEndoWords sb maxSlots nWords triples =
           packed = wi .|. (wj `shiftL` sb) .|. (wp `shiftL` (2 * sb))
       in acc .|. (packed `shiftL` (slot * tb))
 
--- | Identity: (s, s, False) for every non-dead DFA state s.
-identityWords :: Int -> Int -> Int -> [Int] -> [Integer]
-identityWords sb maxSlots nWords nonDeadStates =
-  packEndoWords sb maxSlots nWords [(s, s, False) | s <- nonDeadStates]
+-- | Identity: bit 63 of w[0] set, all other bits zero.
+identityWords :: Int -> [Integer]
+identityWords nWords = (1 `shiftL` 63) : replicate (nWords - 1) 0
 
 generateLexer :: Lexer -> Text
 generateLexer lex =
   (Text.strip . Text.pack)
     [i|
-// Endomorphism type: ENDO_WORDS × uint64_t, bit-packing MAX_IMAGE_SIZE triples.
+// endo_t: ENDO_WORDS × uint64_t packing MAX_IMAGE_SIZE (in, out, producing) triples.
+// Bit 63 of w[0] is the identity flag; all char endos have this bit clear.
 const int ENDO_WORDS     = #{nWords};
 struct endo_t {
   uint64_t w[ENDO_WORDS];
@@ -112,15 +115,14 @@ struct endo_t {
 };
 
 const int NUM_STATES     = #{num_dfa_states};
-const int MAX_IMAGE_SIZE = #{max_slots};
+const int MAX_IMAGE_SIZE = #{max_image};
 const int STATE_BITS     = #{sb};
 const int TRIPLE_BITS    = #{tb};
 const int STATE_MASK     = #{state_mask};
 const int INIT_STATE     = #{initState :: Int};
-#{ignore_tok}
 const endo_t ENDO_IDENTITY = #{cudafyEndoT endo_identity};
 __device__ __constant__ endo_t d_ENDO_IDENTITY;
-
+#{ignore_tok}
 const endo_t h_endo[256] =
   #{cudafy (map (RawString . cudafyEndoT) h_endo_list)};
 
@@ -137,23 +139,26 @@ __constant__ int h_terminal[NUM_STATES] =
     num_dfa_states = n_dfa
     accept_set     = acceptingDfaStates lex
 
-    -- max_slots: number of triple slots per endo. Must cover ALL non-dead DFA
-    -- states as potential inputs (not just the image of single-char endos),
-    -- so that composition works correctly after any sequence of characters.
-    max_slots = n_dfa - 1
+    domainSize (Endomorphism arr _) =
+      List.length $ filter (\s -> arr UArray.! s /= deadState) [lo .. hi]
+      where (lo, hi) = UArray.bounds arr
+    max_slots = maximum $ 1 : map domainSize (Map.elems endo_tbl)
+
+    imageSize (Endomorphism arr _) =
+      List.length $ List.nub $ filter (/= deadState) $ UArray.elems arr
+    max_image = maximum $ 1 : map imageSize (Map.elems endo_tbl)
 
     sb         = stateBits n_dfa
     tb         = 2 * sb + 1
     state_mask = (1 `shiftL` sb) - 1 :: Int
-    nWords     = endoWords sb max_slots
+    nWords     = endoWords sb max_image
 
-    non_dead      = [1 .. n_dfa - 1]
-    endo_identity = identityWords sb max_slots nWords non_dead
+    endo_identity = identityWords nWords
 
     h_endo_list =
       [ case Map.lookup (fromIntegral c :: Word8) endo_tbl of
           Nothing -> replicate nWords (0 :: Integer)
-          Just e  -> packEndoWords sb max_slots nWords (endoToTriples e)
+          Just e  -> packEndoWords sb max_image nWords (endoToTriples e)
       | c <- [0 .. 255 :: Int]
       ]
 
