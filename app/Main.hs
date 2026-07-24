@@ -11,10 +11,7 @@ import Alpacc.Generator.Analyzer
     mkLexerParser,
     mkParser,
   )
-import Alpacc.Lexer.RegularExpression (unBytes)
 import Alpacc.Analysis.CompositionHistogram qualified as CH
-import Alpacc.Lexer.DFA (lexerDFA, mapSymbols)
-import Alpacc.Lexer.DFAParallelLexer (maxNonDeadImageSize)
 import Alpacc.Lexer.Encode (IntParallelLexer (..))
 import Alpacc.Generator.C.Generator qualified as C
 import Alpacc.Generator.Cuda.Generator qualified as Cuda
@@ -69,7 +66,6 @@ data TestCommand
 
 data DevCommand
   = DevCompositionHistogram !Input
-  | DevEndoImageSize !Input
   deriving (Show)
 
 combine :: Gen -> Gen -> Gen
@@ -342,10 +338,6 @@ devCompositionHistogramParameters :: Parser Command
 devCompositionHistogramParameters =
   Dev . DevCompositionHistogram <$> inputParameter
 
-devEndoImageSizeParameters :: Parser Command
-devEndoImageSizeParameters =
-  Dev . DevEndoImageSize <$> inputParameter
-
 devCommands :: Parser Command
 devCommands =
   subparser
@@ -355,12 +347,6 @@ devCommands =
             devCompositionHistogramParameters
             (progDesc "Rank rule-based patterns (row/column constants and projections) in the parallel-lexer composition table.")
         )
-        <> command
-          "endo-image-size"
-          ( info
-              devEndoImageSizeParameters
-              (progDesc "Report the maximum number of distinct non-dead output states in any single-character endomorphism image.")
-          )
     )
 
 commands :: Parser Command
@@ -628,12 +614,6 @@ mainDev (DevCompositionHistogram input) = do
   let ipl = lexer (lx :: Lexer)
       pl = parLexer ipl
   TextIO.putStr $ CH.renderReport $ CH.analyze pl
-mainDev (DevEndoImageSize input) = do
-  cfg <- readCfg input
-  spec <- eitherToIO $ cfgToDFALexerSpec cfg
-  let dfa = lexerDFA (0 :: Integer) $ mapSymbols unBytes spec
-      maxSize = maxNonDeadImageSize dfa
-  putStrLn $ "Max non-dead image size (max |image(f) \\ {dead}| over all chars): " ++ show maxSize
 
 main :: IO ()
 main = do

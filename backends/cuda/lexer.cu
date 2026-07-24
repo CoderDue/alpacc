@@ -23,8 +23,11 @@ constexpr size_t exch_elem_bytes() {
 }
 
 template<typename I, typename state_t, uint32_t BLOCK_SIZE>
-__host__ __device__ constexpr size_t shmem_pad_stride(uint32_t items_per_thread) {
-  if (sizeof(state_t) >= 8u) return (size_t)items_per_thread;
+constexpr size_t shmem_pad_stride(uint32_t items_per_thread) {
+  // Mirror the SHMEM_PAD calculation from the kernel body: STRIDE picked so
+  // (STRIDE * sizeof(state_t)) ≡ 4 (mod 8), yielding conflict-free reads for
+  // the blocked state layout.  Padding depends only on state_t's byte width
+  // and IPT.
   uint32_t shmem_mod    = 8u / (uint32_t)sizeof(state_t);
   uint32_t shmem_target = 4u / (uint32_t)sizeof(state_t);
   uint32_t shmem_rem    = items_per_thread % shmem_mod;
@@ -42,12 +45,17 @@ constexpr size_t lexer_shmem_variable(uint32_t items_per_thread) {
 
 template<typename I, typename state_t, uint32_t BLOCK_SIZE>
 constexpr size_t lexer_shmem_fixed() {
+  // cub TempStorage: one for the state scan (state_t) and one shared between
+  // the two SoA scans (u32).  sizeof gives us the exact per-instantiation
+  // size cub picks for this (T, BLOCK_SIZE) pair.
   size_t cub_state_temp = sizeof(typename cub::BlockScan<state_t, BLOCK_SIZE>::TempStorage);
   size_t cub_u32_temp   = sizeof(typename cub::BlockScan<uint32_t,  BLOCK_SIZE>::TempStorage);
+  // lookbackPrefixPair shmem: two warp-sized value arrays (I each) + one
+  // status array + two shmem prefix scalars.
   size_t lookback = 2u * sizeof(I) * WARP + sizeof(uint8_t) * WARP + 2u * sizeof(I);
-  size_t fixed_scalars = sizeof(state_t)    // next_block_first_state
-                        + sizeof(I)          // last_start
-                        + sizeof(I);         // num_sel_sh
+  size_t fixed_scalars = sizeof(state_t)      // next_block_first_state
+                        + sizeof(I)           // last_start
+                        + sizeof(I);          // num_sel_sh
   return cub_state_temp + cub_u32_temp + lookback + fixed_scalars;
 }
 
@@ -154,26 +162,25 @@ template<size_t ELEM> struct alpacc_ipt_tuning<100, ELEM> {
   static constexpr uint32_t block_size     = 128;
 };
 
-// Type-size bucket driver: sizeof(index_t).
-// The tuning table entries are measured at a fixed endo_t width (8 bytes,
-// one uint64_t word).  For wider endo_t the table no longer applies and
-// arch_ipt() returns 0, falling back to the shmem-budget search.
-// index_t drives register arrays (starts[], local_offs[]) and the SoA
-// lookback buffers; it is the right axis for the table when endo_t is narrow.
-template<typename endo_t, typename J>
+// Type-size bucket driver: sizeof(index_t).  The block-local max and add
+// scans run on I = uint32_t but their downstream register arrays
+// (`starts[IPT]`, `local_offs[IPT]`) and the SoA lookback buffers are
+// index_t-sized, which is what drives the scan's per-item register
+// pressure at the block boundary.  state_t affects a separate scan that
+// runs first; its impact on IPT is captured indirectly through the shmem
+// clamp in `max_items_per_thread()`.  length_t and terminal_t are always
+// narrower and don't move the optimum in practice.
+template<typename state_t, typename J>
 constexpr size_t elem_bytes() {
+  (void)sizeof(state_t);  // silence unused-template-parameter warnings
   return sizeof(J);
 }
 
-// Table-driven IPT (0 if the arch is unknown or endo_t is wider than the
-// measured baseline, in which case callers fall back to max_items_per_thread<>()).
-template<int SM_ARCH, typename endo_t, typename J>
+// Table-driven IPT (0 if the arch is unknown, in which case callers fall
+// back to max_items_per_thread<>()).
+template<int SM_ARCH, typename state_t, typename J>
 constexpr uint32_t arch_ipt() {
-  // Table entries were measured with sizeof(endo_t) == 8 (one uint64_t word).
-  // For wider endomorphisms the table is unreliable; return 0 to use the
-  // shmem-budget search instead.
-  if (sizeof(endo_t) > 8u) return 0;
-  constexpr size_t bytes = elem_bytes<endo_t, J>();
+  constexpr size_t bytes = elem_bytes<state_t, J>();
   constexpr uint32_t nominal = alpacc_ipt_tuning<SM_ARCH, bytes>::nominal_ipt_4B;
   if (nominal == 0) return 0;
   // Scale from 4B-work units to the actual per-thread element size.
@@ -181,120 +188,38 @@ constexpr uint32_t arch_ipt() {
   return scaled == 0 ? 1 : scaled;
 }
 
-template<int SM_ARCH, typename endo_t, typename J>
+template<int SM_ARCH, typename state_t, typename J>
 constexpr uint32_t arch_block_size() {
-  constexpr size_t bytes = elem_bytes<endo_t, J>();
+  constexpr size_t bytes = elem_bytes<state_t, J>();
   return alpacc_ipt_tuning<SM_ARCH, bytes>::block_size;
 }
 
-// ---------------------------------------------------------------------------
-// Endomorphism helpers.
-//
-// endo_t is a struct { uint64_t w[ENDO_WORDS]; } encoding up to MAX_IMAGE_SIZE
-// (in, out, producing) triples, each TRIPLE_BITS = 2*STATE_BITS+1 bits wide,
-// packed from bit 0 of w[0] across word boundaries.
-// Bit 63 of w[0] is the identity flag. ENDO_IDENTITY has only this bit set.
-// Char endomorphisms always have bit 63 of w[0] clear.
-//
-// STATE_BITS, TRIPLE_BITS, STATE_MASK, MAX_IMAGE_SIZE, INIT_STATE, ENDO_WORDS,
-// ENDO_IDENTITY and the tables h_endo / h_accept are all baked in by the
-// Haskell code generator above.
-// ---------------------------------------------------------------------------
-
 __device__ __host__ __forceinline__
-bool endo_is_identity(const endo_t& e) {
-  return (e.w[0] >> 63) & 1;
+state_t get_index(state_t state) {
+  return (state & ENDO_MASK) >> ENDO_OFFSET;
 }
 
 __device__ __host__ __forceinline__
-uint64_t endo_extract(const endo_t& e, int off, int bits) {
-  int word = off / 64;
-  int bit  = off % 64;
-  uint64_t lo = e.w[word] >> bit;
-  uint64_t hi = (bit + bits > 64 && word + 1 < ENDO_WORDS)
-              ? (e.w[word + 1] << (64 - bit)) : 0;
-  uint64_t mask = (bits < 64) ? ((uint64_t(1) << bits) - 1) : ~uint64_t(0);
-  return (lo | hi) & mask;
+terminal_t get_terminal(state_t state) {
+  return static_cast<terminal_t>((state & TERMINAL_MASK) >> TERMINAL_OFFSET);
 }
 
 __device__ __host__ __forceinline__
-void endo_insert(endo_t& e, int off, int bits, uint64_t val) {
-  int word = off / 64;
-  int bit  = off % 64;
-  e.w[word] |= val << bit;
-  if (bit + bits > 64 && word + 1 < ENDO_WORDS)
-    e.w[word + 1] |= val >> (64 - bit);
+bool is_produce(state_t state) {
+  return (state & PRODUCE_MASK) >> PRODUCE_OFFSET;
 }
 
-__device__ __host__ __forceinline__
-endo_t endo_compose(const endo_t& f, const endo_t& g) {
-  if (endo_is_identity(f)) return g;
-  if (endo_is_identity(g)) return f;
-  endo_t result;
-  for (int k = 0; k < ENDO_WORDS; k++) result.w[k] = 0;
-  int out = 0;
-#pragma unroll
-  for (int fi = 0; fi < MAX_IMAGE_SIZE; fi++) {
-    int off_f  = fi * TRIPLE_BITS;
-    int fi_in  = (int)endo_extract(f, off_f,              STATE_BITS);
-    int fi_out = (int)endo_extract(f, off_f + STATE_BITS, STATE_BITS);
-    if (fi_in == 0 && fi_out == 0) break;
-#pragma unroll
-    for (int gi = 0; gi < MAX_IMAGE_SIZE; gi++) {
-      int off_g   = gi * TRIPLE_BITS;
-      int gi_in   = (int)endo_extract(g, off_g,                  STATE_BITS);
-      int gi_out  = (int)endo_extract(g, off_g + STATE_BITS,     STATE_BITS);
-      int gi_prod = (int)endo_extract(g, off_g + 2 * STATE_BITS, 1);
-      if (gi_in == 0 && gi_out == 0) break;
-      if (gi_in == fi_out) {
-        int off_r = out * TRIPLE_BITS;
-        endo_insert(result, off_r,                  STATE_BITS, (uint64_t)fi_in);
-        endo_insert(result, off_r + STATE_BITS,     STATE_BITS, (uint64_t)gi_out);
-        endo_insert(result, off_r + 2 * STATE_BITS, 1,          (uint64_t)gi_prod);
-        out++;
-        break;
-      }
-    }
-  }
-  return result;
+// CPU-only versions (if you still need them separately)
+state_t get_index_cpu(state_t state) {
+  return (state & ENDO_MASK) >> ENDO_OFFSET;
 }
 
-__device__ __host__ __forceinline__
-int eval_endo(const endo_t& e, int query) {
-  if (endo_is_identity(e)) return query;
-#pragma unroll
-  for (int i = 0; i < MAX_IMAGE_SIZE; i++) {
-    int off = i * TRIPLE_BITS;
-    int in  = (int)endo_extract(e, off,              STATE_BITS);
-    int out = (int)endo_extract(e, off + STATE_BITS, STATE_BITS);
-    if (in == 0 && out == 0) break;
-    if (in == query) return out;
-  }
-  return 0;
+terminal_t get_terminal_cpu(state_t state) {
+  return static_cast<terminal_t>((state & TERMINAL_MASK) >> TERMINAL_OFFSET);
 }
 
-__device__ __host__ __forceinline__
-bool eval_producing(const endo_t& e, int query) {
-  if (endo_is_identity(e)) return false;
-#pragma unroll
-  for (int i = 0; i < MAX_IMAGE_SIZE; i++) {
-    int off = i * TRIPLE_BITS;
-    int in  = (int)endo_extract(e, off, STATE_BITS);
-    if (in == 0) break;
-    if (in == query)
-      return (bool)endo_extract(e, off + 2 * STATE_BITS, 1);
-  }
-  return false;
-}
-
-__device__ __forceinline__
-terminal_t get_terminal(endo_t e) {
-  return static_cast<terminal_t>(h_terminal[eval_endo(e, INIT_STATE)]);
-}
-
-__device__ __forceinline__
-bool is_produce(endo_t e) {
-  return eval_producing(e, INIT_STATE);
+bool is_produce_cpu(state_t state) {
+  return (state & PRODUCE_MASK) >> PRODUCE_OFFSET;
 }
 
 template<typename I, typename J>
@@ -302,14 +227,15 @@ struct LexerCtx {
 
 private:
   J offset = 0;
-  endo_t* d_endo;                       // device copy of h_endo[256]
+  state_t* d_to_state;
+  state_t* d_compose;
   volatile uint32_t* d_dyn_block_index;
-  volatile endo_t* d_new_last_endo;
-  volatile endo_t* d_old_last_endo;
+  volatile state_t* d_new_last_state;
+  volatile state_t* d_old_last_state;
   I* d_new_size;
   volatile J* d_new_last_start;
   volatile J* d_old_last_start;
-  volatile uint32_t* d_len_overflow;
+  volatile uint32_t* d_len_overflow;  // set to 1 by kernel on length_t overflow
 
   void swapLastStart() {
     J h_last_start;
@@ -318,12 +244,12 @@ private:
     gpuAssert(cudaMemcpy((void *) d_old_last_start, &h_last_start, sizeof(J), cudaMemcpyHostToDevice));
   }
 
-  void swapLastEndo() {
-    endo_t h_last_endo;
-    gpuAssert(cudaMemcpy(&h_last_endo, (const void*) d_new_last_endo, sizeof(endo_t), cudaMemcpyDeviceToHost));
-    gpuAssert(cudaMemcpy((void *) d_new_last_endo, (const void*) d_old_last_endo, sizeof(endo_t), cudaMemcpyDeviceToDevice));
-    gpuAssert(cudaMemcpy((void *) d_old_last_endo, &h_last_endo, sizeof(endo_t), cudaMemcpyHostToDevice));
-  }
+  void swapLastState() {
+  state_t h_last_state;
+  gpuAssert(cudaMemcpy(&h_last_state, (const void*) d_new_last_state, sizeof(state_t), cudaMemcpyDeviceToHost));
+  gpuAssert(cudaMemcpy((void *) d_new_last_state, (const void*) d_old_last_state, sizeof(state_t), cudaMemcpyDeviceToDevice));
+  gpuAssert(cudaMemcpy((void *) d_old_last_state, &h_last_state, sizeof(state_t), cudaMemcpyHostToDevice));
+}
 
   void resetDynamicIndex() const {
     cudaMemset((void*)d_dyn_block_index, 0, sizeof(uint32_t));
@@ -339,34 +265,41 @@ private:
 
 public:
   const I CHUNK_SIZE;
-  States<I, endo_t> d_state_states;
+  States<I, state_t> d_state_states;
+  // SoA inter-block buffer for the (max token-start, +produce-count) scan.
+  // Both components are I (u32); keeping them in separate arrays avoids the
+  // former packed-u64 layout that dragged 8-byte traffic through the warp
+  // scan for two 4-byte values, and matches how the block-local scan runs
+  // them as independent scalar reductions.
   PairStates<I, I, I> d_maxadd_states;
 
   LexerCtx(const I chunk_size,
            const I block_size,
            const I items_per_thread) : CHUNK_SIZE(chunk_size) {
     I num_blocks = numBlocks(chunk_size, block_size, items_per_thread);
-    gpuAssert(cudaMalloc(&d_endo, sizeof(h_endo)));
-    cudaMemcpy(d_endo, h_endo, sizeof(h_endo), cudaMemcpyHostToDevice);
+    gpuAssert(cudaMalloc(&d_to_state, sizeof(h_to_state)));
+    cudaMemcpy(d_to_state, h_to_state, sizeof(h_to_state),
+                 cudaMemcpyHostToDevice);
+    gpuAssert(cudaMalloc(&d_compose, sizeof(h_compose)));
+    cudaMemcpy(d_compose, h_compose, sizeof(h_compose),
+                 cudaMemcpyHostToDevice);
     d_maxadd_states = PairStates<I, I, I>(num_blocks);
-    d_state_states = States<I, endo_t>(num_blocks);
+    d_state_states = States<I, state_t>(num_blocks);
 
     gpuAssert(cudaMalloc((void**)&d_dyn_block_index, sizeof(uint32_t)));
     gpuAssert(cudaMalloc((void**)&d_new_size, sizeof(I)));
-    gpuAssert(cudaMalloc((void**)&d_new_last_endo, sizeof(endo_t)));
-    gpuAssert(cudaMalloc((void**)&d_old_last_endo, sizeof(endo_t)));
+    gpuAssert(cudaMalloc((void**)&d_new_last_state, sizeof(state_t)));
+    gpuAssert(cudaMalloc((void**)&d_old_last_state, sizeof(state_t)));
     gpuAssert(cudaMalloc((void**)&d_new_last_start, sizeof(J)));
     gpuAssert(cudaMalloc((void**)&d_old_last_start, sizeof(J)));
     gpuAssert(cudaMalloc((void**)&d_len_overflow, sizeof(uint32_t)));
 
     cudaMemset((void*)d_dyn_block_index, 0, sizeof(uint32_t));
-    cudaMemset((void*)d_new_size, 0, sizeof(I));
-    endo_t identity = ENDO_IDENTITY;
-    cudaMemcpyToSymbol(d_ENDO_IDENTITY, &identity, sizeof(endo_t));
-    cudaMemcpy((void*)d_new_last_endo, &identity, sizeof(endo_t), cudaMemcpyHostToDevice);
-    cudaMemcpy((void*)d_old_last_endo, &identity, sizeof(endo_t), cudaMemcpyHostToDevice);
-    cudaMemset((void*)d_new_last_start, 0, sizeof(J));
-    cudaMemset((void*)d_old_last_start, 0, sizeof(J));
+    cudaMemset((void*)d_new_size, I(), sizeof(I));
+    cudaMemset((void*)d_new_last_state, IDENTITY, sizeof(state_t));
+    cudaMemset((void*)d_old_last_state, IDENTITY, sizeof(state_t));
+    cudaMemset((void*)d_new_last_start, J(), sizeof(J));
+    cudaMemset((void*)d_old_last_start, J(), sizeof(J));
     cudaMemset((void*)d_len_overflow, 0, sizeof(uint32_t));
   }
 
@@ -374,9 +307,8 @@ public:
     offset = 0;
     cudaMemset((void*)d_dyn_block_index, 0, sizeof(uint32_t));
     cudaMemset((void*)d_new_size, 0, sizeof(I));
-    endo_t identity = ENDO_IDENTITY;
-    cudaMemcpy((void*)d_new_last_endo, &identity, sizeof(endo_t), cudaMemcpyHostToDevice);
-    cudaMemcpy((void*)d_old_last_endo, &identity, sizeof(endo_t), cudaMemcpyHostToDevice);
+    cudaMemset((void*)d_new_last_state, IDENTITY, sizeof(state_t));
+    cudaMemset((void*)d_old_last_state, IDENTITY, sizeof(state_t));
     cudaMemset((void*)d_new_last_start, 0, sizeof(J));
     cudaMemset((void*)d_old_last_start, 0, sizeof(J));
     cudaMemset((void*)d_len_overflow, 0, sizeof(uint32_t));
@@ -385,39 +317,52 @@ public:
   }
 
   void cleanUp() {
-    if (d_endo) cudaFree(d_endo);
+    if (d_to_state) cudaFree(d_to_state);
     if (d_new_last_start) cudaFree((void*)d_new_last_start);
     if (d_old_last_start) cudaFree((void*)d_old_last_start);
+    if (d_compose) cudaFree(d_compose);
     if (d_dyn_block_index) cudaFree((void*)d_dyn_block_index);
     if (d_new_size) cudaFree((void*)d_new_size);
-    if (d_new_last_endo) cudaFree((void*)d_new_last_endo);
-    if (d_old_last_endo) cudaFree((void*)d_old_last_endo);
+    if (d_new_last_state) cudaFree((void*)d_new_last_state);
+    if (d_old_last_state) cudaFree((void*)d_old_last_state);
     if (d_len_overflow) cudaFree((void*)d_len_overflow);
     d_maxadd_states.cleanUp();
     d_state_states.cleanUp();
   }
 
   __device__ __host__ __forceinline__
-  endo_t operator()(const endo_t& a, const endo_t& b) const {
-    return endo_compose(a, b);
-  }
-
-  __device__ __host__ __forceinline__
-  endo_t operator()(const volatile endo_t& a, const volatile endo_t& b) const {
-    endo_t na, nb;
-    for (int k = 0; k < ENDO_WORDS; k++) { na.w[k] = a.w[k]; nb.w[k] = b.w[k]; }
-    return endo_compose(na, nb);
-  }
-
-  __device__ __host__ __forceinline__
-  endo_t toState(const uint8_t &a) const {
+  state_t operator()(const state_t &a, const state_t &b) const {
 #ifdef __CUDA_ARCH__
-    endo_t r;
-    for (int k = 0; k < ENDO_WORDS; k++)
-      r.w[k] = __ldg(&d_endo[a].w[k]);
-    return r;
+    return __ldg(&d_compose[get_index(a) * NUM_STATES + get_index(b)]);
 #else
-    return d_endo[a];
+    return d_compose[get_index(a) * NUM_STATES + get_index(b)];
+#endif
+  }
+
+  // Volatile-arg overload retained for scanWarp in lookbackPrefix, which
+  // still holds its intermediates in volatile shmem (small buffers, ordered
+  // by __syncwarp).  Dropping volatile in the lexer body — the state tile
+  // and exchange union — has no effect here.
+  __device__ __host__ __forceinline__
+  state_t operator()(const volatile state_t &a, const volatile state_t &b) const {
+#ifdef __CUDA_ARCH__
+    return __ldg(&d_compose[get_index(a) * NUM_STATES + get_index(b)]);
+#else
+    return d_compose[get_index(a) * NUM_STATES + get_index(b)];
+#endif
+  }
+
+  __device__ __forceinline__
+  const state_t* d_compose_row(state_t a) const {
+    return d_compose + (size_t)get_index(a) * NUM_STATES;
+  }
+
+  __device__ __host__ __forceinline__
+  state_t toState(const uint8_t &a) const {
+#ifdef __CUDA_ARCH__
+    return __ldg(&d_to_state[a]);
+#else
+    return d_to_state[a];
 #endif
   }
 
@@ -432,15 +377,13 @@ public:
   }
 
   __device__ __host__ __forceinline__
-  void setLastState(endo_t e) const {
-    for (int k = 0; k < ENDO_WORDS; k++) d_new_last_endo->w[k] = e.w[k];
+  void setLastState(state_t state) const {
+    *d_new_last_state = state;
   }
 
   __device__ __host__ __forceinline__
-  endo_t getLastState() const {
-    endo_t r;
-    for (int k = 0; k < ENDO_WORDS; k++) r.w[k] = d_old_last_endo->w[k];
-    return r;
+  state_t getLastState() const {
+    return *d_old_last_state;
   }
 
   __device__ __host__ __forceinline__
@@ -471,9 +414,9 @@ public:
   }
 
   bool isAccept() const {
-    endo_t h_last_endo;
-    gpuAssert(cudaMemcpy(&h_last_endo, (const void*) d_new_last_endo, sizeof(endo_t), cudaMemcpyDeviceToHost));
-    return h_accept[eval_endo(h_last_endo, INIT_STATE)];
+    state_t h_last_state;
+    gpuAssert(cudaMemcpy(&h_last_state, (const void*) d_new_last_state, sizeof(state_t), cudaMemcpyDeviceToHost));
+    return h_accept[get_index_cpu(h_last_state)];
   }
 
   I terminalsSize() const {
@@ -485,7 +428,7 @@ public:
   void update() {
     resetDynamicIndex();
     swapLastStart();
-    swapLastEndo();
+    swapLastState();
     updateOffset();
   }
 };
@@ -496,9 +439,25 @@ public:
 template<typename I, typename J, I BLOCK_SIZE, I ITEMS_PER_THREAD>
 __global__ void
 lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_starts, length_t* d_lengths, const I size, const bool is_last_chunk) {
-  constexpr I SHMEM_STRIDE =
-      (I)shmem_pad_stride<I, endo_t, BLOCK_SIZE>(ITEMS_PER_THREAD);
-  __shared__ endo_t states[SHMEM_STRIDE * BLOCK_SIZE];
+  // Bank-conflict-free padding: we need (STRIDE * sizeof(state_t)) to be
+  // ≡ 4 (mod 8) so the stride in 4-byte banks is odd (coprime with 32).
+  // Required: STRIDE ≡ 4/sizeof(state_t) (mod 8/sizeof(state_t)), clamped to ≥ 1.
+  // Works for state_t ∈ {u8, u16, u32, u64}.
+  static_assert(sizeof(state_t) == 1 || sizeof(state_t) == 2 ||
+                sizeof(state_t) == 4 || sizeof(state_t) == 8, "unexpected state_t");
+  constexpr I SHMEM_MOD    = 8 / (I)sizeof(state_t);
+  constexpr I SHMEM_TARGET = 4 / (I)sizeof(state_t);
+  constexpr I SHMEM_REM    = (ITEMS_PER_THREAD % SHMEM_MOD);
+  constexpr I SHMEM_RAW    = (SHMEM_TARGET - SHMEM_REM + SHMEM_MOD) % SHMEM_MOD;
+  constexpr I SHMEM_PAD    = (SHMEM_RAW == 0) ? SHMEM_MOD : SHMEM_RAW;
+  constexpr I SHMEM_STRIDE = ITEMS_PER_THREAD + SHMEM_PAD;
+  // Non-volatile: every read/write of the state tile is fenced by an
+  // explicit __syncthreads() at the boundaries; cub::BlockScan handles its
+  // own barriers internally.  Dropping volatile lets nvcc merge adjacent
+  // loads and hoist them across independent compute, eliminating one of
+  // the top stalls reported by ncu (~30% est speedup on shmem stores,
+  // ~19% on shmem loads at HEAD).
+  __shared__ state_t states[SHMEM_STRIDE * BLOCK_SIZE];
   // Exchange buffer for the two-phase scatter on dense tiles.
   // exch_t (terminals), exch_j (starts), and exch_l (lengths) are never live
   // simultaneously, so they share one shmem region via a union.
@@ -511,7 +470,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   terminal_t* exch_t = exch.as_t;
   J*          exch_j = exch.as_j;
   length_t*   exch_l = exch.as_l;
-  __shared__ endo_t next_block_first_state;
+  __shared__ state_t next_block_first_state;
 
   // Phase A reads directly from ctx.d_to_state via __ldg() into the
   // states[] tile.
@@ -528,7 +487,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   I glb_offs = dyn_index * BLOCK_SIZE * ITEMS_PER_THREAD;
 
   if (threadIdx.x == I()) {
-    next_block_first_state = d_ENDO_IDENTITY;
+    next_block_first_state = IDENTITY;
   }
 
   // Vectorized global → registers.  glbToReg covers the first VPT-1 slots
@@ -565,7 +524,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
         uint32_t reg_off = sizeof(uint64_t) * i + j;
         bool is_in_block = lid_off < (I)(ITEMS_PER_THREAD * BLOCK_SIZE);
         if (is_in_block) {
-          endo_t s = (gid < size) ? ctx.toState(chars_reg[reg_off]) : d_ENDO_IDENTITY;
+          state_t s = (gid < size) ? ctx.toState(chars_reg[reg_off]) : IDENTITY;
           I shmem_idx = (lid_off / ITEMS_PER_THREAD) * SHMEM_STRIDE
                       + (lid_off % ITEMS_PER_THREAD);
           states[shmem_idx] = s;
@@ -582,7 +541,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   // block-local scan + inter-block lookback, then write the inclusive
   // prefix back.
   {
-    endo_t st[ITEMS_PER_THREAD];
+    state_t st[ITEMS_PER_THREAD];
     const I off = threadIdx.x * SHMEM_STRIDE;
     bool is_first = (glb_offs == 0) && (threadIdx.x == 0);
 #pragma unroll
@@ -591,8 +550,8 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
       if (is_first && i == 0)
         st[i] = ctx(ctx.getLastState(), st[i]);
     }
-    const endo_t pfx = scanReg<endo_t, I, LexerCtx<I, J>, ITEMS_PER_THREAD, BLOCK_SIZE>(
-        st, ctx.d_state_states, ctx, d_ENDO_IDENTITY, dyn_index);
+    const state_t pfx = scanReg<state_t, I, LexerCtx<I, J>, ITEMS_PER_THREAD, BLOCK_SIZE>(
+        st, ctx.d_state_states, ctx, IDENTITY, dyn_index);
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
       states[off + i] = ctx(pfx, st[i]);
@@ -627,7 +586,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
                    ? shmem_cur + 1
                    : ((I)threadIdx.x + 1) * (SHMEM_STRIDE);
     if (gid < size) {
-      endo_t state = states[shmem_cur];
+      state_t state = states[shmem_cur];
 #ifdef IGNORE_TOKEN
       bool is_not_ignore = get_terminal(state) != IGNORE_TOKEN;
 #else
@@ -702,7 +661,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
 
   if (dyn_index == gridDim.x - 1 && threadIdx.x == blockDim.x - 1) {
     ctx.setNewSize(Add<I>()(prefix, num_sel));
-    ctx.setLastState(states[(BLOCK_SIZE - 1) * SHMEM_STRIDE + (ITEMS_PER_THREAD - 1)]);  // stores endo_t
+    ctx.setLastState(states[(BLOCK_SIZE - 1) * SHMEM_STRIDE + (ITEMS_PER_THREAD - 1)]);
 
     if (last_start != I()) {
       ctx.setLastStart(ctx.addOffset(last_start - 1));

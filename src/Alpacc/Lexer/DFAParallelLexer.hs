@@ -1,11 +1,6 @@
 module Alpacc.Lexer.DFAParallelLexer
   ( intDfaParallelLexer,
     dfaParallelLexer,
-    maxNonDeadImageSize,
-    Endomorphism (..),
-    endomorphismTable,
-    deadState,
-    initState,
   )
 where
 
@@ -17,7 +12,6 @@ import Alpacc.Lexer.ParallelLexing
 import Data.Array.Base (IArray (..))
 import Data.Array.Unboxed (UArray)
 import Data.Array.Unboxed qualified as UArray hiding (UArray)
-import Data.List qualified as List
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map hiding (Map)
 import Data.Maybe
@@ -109,18 +103,3 @@ intDfaParallelLexer ::
   DFALexer t s k ->
   Either Text (IntParallelLexer t)
 intDfaParallelLexer e = intParallelLexer e . dfaParallelLexer
-
--- | For each character's endomorphism, count the number of distinct
--- non-dead states in its image.  Returns the maximum over all
--- endomorphisms.  "Dead" is state 0 (deadState).
-maxNonDeadImageSize ::
-  (Enum t, Bounded t, Ord t, Ord s, Ord k) =>
-  DFALexer t s k ->
-  Int
-maxNonDeadImageSize lexer' =
-  maximum $ 0 : map nonDeadCount (Map.elems tbl)
-  where
-    lexer = enumerateLexer initState lexer'
-    tbl = endomorphismTable lexer
-    nonDeadCount (Endomorphism arr _) =
-      List.length $ List.nub $ filter (/= deadState) $ UArray.elems arr
