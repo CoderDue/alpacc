@@ -48,7 +48,13 @@ template<typename I, typename state_t, typename J, typename length_t, typename t
 constexpr size_t lexer_shmem_variable(uint32_t items_per_thread) {
   size_t states_bytes = sizeof(state_t) * shmem_pad_stride<I, state_t, BLOCK_SIZE>(items_per_thread) * BLOCK_SIZE;
   size_t exch_bytes   = exch_elem_bytes<I, state_t, J, length_t, terminal_t>() * items_per_thread * BLOCK_SIZE;
-  return states_bytes + exch_bytes;
+  // s_boundary[BLOCK_SIZE+1]: one int per thread plus one for next-block state.
+  size_t boundary_bytes = sizeof(int) * (BLOCK_SIZE + 1);
+  // states[] and exch overlap in time; s_boundary[] lives after exch within states[].
+  // Total = max(states_bytes, exch_bytes + boundary_bytes).
+  size_t overlap = states_bytes > (exch_bytes + boundary_bytes)
+                 ? states_bytes : (exch_bytes + boundary_bytes);
+  return overlap;
 }
 
 template<typename I, typename state_t, uint32_t BLOCK_SIZE>
@@ -503,19 +509,48 @@ __global__ void
 lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_starts, length_t* d_lengths, const I size, const bool is_last_chunk) {
   constexpr I SHMEM_STRIDE =
       (I)shmem_pad_stride<I, endo_t, BLOCK_SIZE>(ITEMS_PER_THREAD);
+
+  // Phase A tile: striped layout, written then read in blocked layout for scan.
+  // After the scan the full endo shmem is no longer needed — we keep scanned
+  // endos in registers and only exchange one int (evaluated state) per thread
+  // boundary via s_boundary[].  The endo tile and exch union therefore overlap
+  // in time; we put the exch union first so it aliases the endo tile memory.
+  //
+  // Layout in shmem (all fields at the same address, used at different times):
+  //
+  //  [0 .. EXCH_BYTES)        exch union  (terminals / starts / lengths)
+  //  [0 .. ENDO_TILE_BYTES)   states[]    (only during phase A + scan)
+  //  [EXCH_BYTES .. +BS*4)    s_boundary[]  (int per thread, after scan)
+  //
+  // ENDO_TILE_BYTES = sizeof(endo_t) * SHMEM_STRIDE * BLOCK_SIZE
+  // EXCH_BYTES      = max(sizeof(terminal_t), sizeof(J), sizeof(length_t))
+  //                   * ITEMS_PER_THREAD * BLOCK_SIZE
+  //
+  // Since ENDO_TILE_BYTES >= EXCH_BYTES for all grammars with ENDO_WORDS >= 1
+  // and max(exch_elem) <= 8 = sizeof(endo_t), we declare states[] and overlay
+  // the exch pointers onto it.  s_boundary[] lives right after EXCH_BYTES.
+
   __shared__ endo_t states[SHMEM_STRIDE * BLOCK_SIZE];
-  // Exchange buffer for the two-phase scatter on dense tiles.
-  // exch_t (terminals), exch_j (starts), and exch_l (lengths) are never live
-  // simultaneously, so they share one shmem region via a union.
+
+  // Overlay exch union onto states[] memory — safe because the endo tile is
+  // only live during phase A and the scan; exch is only live after the scan.
   constexpr I EXCH_ELEMS = ITEMS_PER_THREAD * BLOCK_SIZE;
-  union {
-    terminal_t as_t[EXCH_ELEMS];
-    J          as_j[EXCH_ELEMS];
-    length_t   as_l[EXCH_ELEMS];
-  } __shared__ exch;
-  terminal_t* exch_t = exch.as_t;
-  J*          exch_j = exch.as_j;
-  length_t*   exch_l = exch.as_l;
+  terminal_t* exch_t = reinterpret_cast<terminal_t*>(states);
+  J*          exch_j = reinterpret_cast<J*>(states);
+  length_t*   exch_l = reinterpret_cast<length_t*>(states);
+
+  // s_boundary[t] holds eval_endo(st[IPT-1], INIT_STATE) for thread t —
+  // the last evaluated state of each thread, needed by thread t+1 for s_prev
+  // at i==0, and by thread t-1 for is_next_produce at i==IPT-1.
+  // Also s_boundary[BLOCK_SIZE] holds the next-block boundary state.
+  // Placed after the exch region to avoid aliasing conflicts during scatter.
+  constexpr size_t EXCH_BYTES = sizeof(J) * EXCH_ELEMS;  // J dominates exch elem size
+  // Align s_boundary to int boundary after EXCH_BYTES within the states[] shmem.
+  // We need BLOCK_SIZE+1 ints: [0..BS-1] = last state of each thread,
+  // [BS] = first state of next block (for the last thread's is_next_produce).
+  int* s_boundary = reinterpret_cast<int*>(
+      reinterpret_cast<char*>(states) + EXCH_BYTES);
+
   __shared__ endo_t next_block_first_state;
 
   // Phase A reads directly from ctx.d_to_state via __ldg() into the
@@ -557,8 +592,8 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     }
   }
 
-  // Phase A: byte -> state_t written directly into the states[] tile via
-  // ctx.toState() (__ldg-cached on the 256-entry d_to_state table).
+  // Phase A: byte -> endo_t written into the states[] tile (striped layout
+  // from glbToReg, re-indexed to blocked layout for the scan).
   {
 #pragma unroll
     for (uint32_t i = 0; i < VPT; i++) {
@@ -583,11 +618,16 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   }
   __syncthreads();
 
-  // Phase B/C: load our blocked slice from states[] into registers, run the
-  // block-local scan + inter-block lookback, then write the inclusive
-  // prefix back.
+  // Phase B/C: load blocked slice into registers, scan, keep in registers.
+  // After scanReg, st[i] holds the inclusive prefix endo for position
+  // threadIdx.x*IPT+i.  We evaluate each to a DFA state in registers and
+  // exchange only the boundary states (one int per thread) via s_boundary[],
+  // avoiding writing the full endo tile back to shmem.
+  endo_t st[ITEMS_PER_THREAD];
+  int    s[ITEMS_PER_THREAD];   // s[i] = eval_endo(st[i], INIT_STATE)
+  endo_t last_endo;             // st[IPT-1] of last thread of last block
+
   {
-    endo_t st[ITEMS_PER_THREAD];
     const I off = threadIdx.x * SHMEM_STRIDE;
     bool is_first = (glb_offs == 0) && (threadIdx.x == 0);
 #pragma unroll
@@ -599,24 +639,24 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     const endo_t pfx = scanReg<endo_t, I, LexerCtx<I, J>, ITEMS_PER_THREAD, BLOCK_SIZE>(
         st, ctx.d_state_states, ctx, d_ENDO_IDENTITY, dyn_index);
 #pragma unroll
-    for (I i = 0; i < ITEMS_PER_THREAD; i++)
-      states[off + i] = ctx(pfx, st[i]);
-    __syncthreads();
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+      st[i] = ctx(pfx, st[i]);
+      s[i]  = eval_endo(st[i], INIT_STATE);
+    }
+    last_endo = st[ITEMS_PER_THREAD - 1];
   }
 
-  // Split (max, +) block-local scans over u32 registers in blocked layout
-  // (thread t owns tile positions [t*IPT, (t+1)*IPT)): the token-start Max
-  // scan runs over start codes (0 = "no start seen", produce at gid encodes
-  // gid + 1) and the compaction Add scan runs over produce flags.  The two
-  // block-local scans are independent so we run them separately with scalar
-  // operators — the former fused u64 MaxAdd combine had ~4 dependent
-  // operations per reduction step (shift/mask/max/add threading through
-  // cub's binary tree), whereas the split u32 scalar operators run at one
-  // instruction per combine and give the compiler ILP across the two scans.
-  // The inter-block handshake then runs *once* over the SoA PairStates
-  // buffer via lookbackPrefixPair, so we don't pay for two lookback rounds.
-  // All loops below use blocked indexing so registers, the produce bitmask,
-  // and shmem stay consistent.
+  // Publish each thread's last evaluated state so adjacent threads can read
+  // cross-boundary s_prev / s_next without re-reading the full endo tile.
+  // Also publish the next-block boundary state for the last thread.
+  s_boundary[threadIdx.x] = s[ITEMS_PER_THREAD - 1];
+  if (threadIdx.x == BLOCK_SIZE - 1) {
+    s_boundary[BLOCK_SIZE] = eval_endo(ctx(last_endo, next_block_first_state), INIT_STATE);
+  }
+  __syncthreads();
+
+  // Produce detection and start-code computation from register s[] and
+  // s_boundary[], no endo shmem reads needed.
   uint32_t start_codes[ITEMS_PER_THREAD];
   uint32_t produce_flags[ITEMS_PER_THREAD];
 
@@ -626,31 +666,24 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     I gid = glb_offs + lid;
     bool is_next_produce = false;
     uint32_t start_code = 0;
-    // Padded shmem indices for this item and adjacent items.
-    I shmem_cur  = (I)threadIdx.x * (SHMEM_STRIDE) + i;
-    I shmem_next = (i < ITEMS_PER_THREAD - 1)
-                   ? shmem_cur + 1
-                   : ((I)threadIdx.x + 1) * (SHMEM_STRIDE);
-    I shmem_prev = (i > 0)
-                   ? shmem_cur - 1
-                   : (threadIdx.x > 0)
-                     ? (I)(threadIdx.x - 1) * (SHMEM_STRIDE) + (ITEMS_PER_THREAD - 1)
-                     : (I)-1;
+
     if (gid < size) {
-      endo_t state = states[shmem_cur];
-      int s_cur = eval_endo(state, INIT_STATE);
+      int s_cur = s[i];
 #ifdef IGNORE_TOKEN
-      bool is_not_ignore = get_terminal(state) != IGNORE_TOKEN;
+      bool is_not_ignore = (terminal_t)h_terminal[s_cur] != IGNORE_TOKEN;
 #else
       bool is_not_ignore = true;
 #endif
+      // s_next: next position's state (register if within thread, else s_boundary)
+      int s_next;
       if (lid == ITEMS_PER_THREAD * BLOCK_SIZE - 1) {
-        int s_next = eval_endo(ctx(state, next_block_first_state), INIT_STATE);
-        is_next_produce = is_produce_transition(s_cur, s_next);
+        s_next = s_boundary[BLOCK_SIZE];
+      } else if (i < ITEMS_PER_THREAD - 1) {
+        s_next = s[i + 1];
       } else {
-        int s_next = eval_endo(states[shmem_next], INIT_STATE);
-        is_next_produce = is_produce_transition(s_cur, s_next);
+        s_next = s_boundary[threadIdx.x + 1];
       }
+      is_next_produce = is_produce_transition(s_cur, s_next);
 
       if (is_last_chunk) {
         is_next_produce |= gid == size - 1;
@@ -659,9 +692,15 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
         is_next_produce &= is_not_ignore;
       }
 
-      // start_code: produce at this position means a token ends here.
-      // A produce occurs when the transition from s_prev to s_cur emits a token.
-      int s_prev = (lid == 0) ? INIT_STATE : eval_endo(states[shmem_prev], INIT_STATE);
+      // s_prev: previous position's state
+      int s_prev;
+      if (lid == 0) {
+        s_prev = INIT_STATE;
+      } else if (i > 0) {
+        s_prev = s[i - 1];
+      } else {
+        s_prev = s_boundary[threadIdx.x - 1];
+      }
       bool this_produce = is_produce_transition(s_prev, s_cur);
       start_code = this_produce ? (uint32_t)(gid + 1) : 0u;
     }
@@ -683,11 +722,6 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
           produce_flags, scan_temp, Add<uint32_t>());
 
   // Single fused decoupled-lookback round over the SoA PairStates buffer.
-  // The two component aggregates live in separate arrays and the block
-  // status is shared, so the inter-block warp scan reads both components in
-  // parallel with one status atomic per predecessor tile — same handshake
-  // cost as the former packed-u64 layout but without paying for a u64 load
-  // when u32 will do.
   I max_prefix, prefix;
   lookbackPrefixPair<I, I, I, Max<I>, Add<I>>(
       ctx.d_maxadd_states, Max<I>(), Add<I>(), (I)0, (I)0, dyn_index,
@@ -719,7 +753,7 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
 
   if (dyn_index == gridDim.x - 1 && threadIdx.x == blockDim.x - 1) {
     ctx.setNewSize(Add<I>()(prefix, num_sel));
-    ctx.setLastState(states[(BLOCK_SIZE - 1) * SHMEM_STRIDE + (ITEMS_PER_THREAD - 1)]);  // stores endo_t
+    ctx.setLastState(last_endo);
 
     if (last_start != I()) {
       ctx.setLastStart(ctx.addOffset(last_start - 1));
@@ -728,27 +762,20 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     }
   }
 
+  // Scatter: terminals from register s[], starts/lengths from register arrays.
+  // The exch union aliases the states[] shmem (safe: endo tile is no longer needed).
   if (num_sel > BLOCK_SIZE) {
-    // Dense tile: two-phase scatter for terminals, starts, and lengths.
-    // Each array is compacted into the shmem exchange at tile-local offsets,
-    // then written out as coalesced wide stores.
+    // Dense tile: two-phase scatter.
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
       if ((is_produce_state >> i) & 1) {
-        I shmem_cur = (I)threadIdx.x * (SHMEM_STRIDE) + i;
-        exch_t[local_offs[i]] = get_terminal(states[shmem_cur]);
+        exch_t[local_offs[i]] = (terminal_t)h_terminal[s[i]];
       }
     }
     __syncthreads();
     shmemToGlbVec<terminal_t, uint64_t, BLOCK_SIZE, I>(prefix, num_sel, d_terminals, exch_t);
     __syncthreads();
 
-    // Compute the tok_start values into per-thread registers *and* into
-    // exch_j in the same pass.  Keeping them in registers means the length
-    // loop below reads its own thread's register value directly instead of
-    // going through shmem — that avoids the extra sync we'd otherwise need
-    // between shmemToGlbVec's exch_j reads and the exch_l writes below
-    // (exch_l aliases exch_j via the union).
     J tok_starts[ITEMS_PER_THREAD];
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
@@ -768,12 +795,6 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     shmemToGlbVec<J, uint64_t, BLOCK_SIZE, I>(prefix, num_sel, d_starts, exch_j);
     __syncthreads();
 
-    // Compute lengths directly from the per-thread tok_starts registers
-    // and write straight to exch_l.  Since we already have tok_starts[i]
-    // in a register, no shmem read is needed here.  With no exch_j read
-    // to protect, we can write exch_l (aliased to exch_j) as soon as the
-    // shmemToGlbVec above is fenced by the sync above — one fewer sync
-    // than the previous three-shmem-pass scheme.
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
       if ((is_produce_state >> i) & 1) {
@@ -786,15 +807,14 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     __syncthreads();
     shmemToGlbVec<length_t, uint64_t, BLOCK_SIZE, I>(prefix, num_sel, d_lengths, exch_l);
   } else {
-    // Sparse tile: direct scatter.
+    // Sparse tile: direct scatter from registers, no shmem needed.
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
       I lid = threadIdx.x * ITEMS_PER_THREAD + i;
       I gid = glb_offs + lid;
       if ((is_produce_state >> i) & 1) {
-        I shmem_cur = (I)threadIdx.x * (SHMEM_STRIDE) + i;
         I offset = Add<I>()(prefix, local_offs[i]);
-        d_terminals[offset] = get_terminal(states[shmem_cur]);
+        d_terminals[offset] = (terminal_t)h_terminal[s[i]];
         J tok_start, tok_end, tok_len;
         if (offset == I() && starts[i] == I()) {
           tok_start = ctx.getLastStart();
