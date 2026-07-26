@@ -24,7 +24,18 @@ constexpr size_t exch_elem_bytes() {
 
 template<typename I, typename state_t, uint32_t BLOCK_SIZE>
 __host__ __device__ constexpr size_t shmem_pad_stride(uint32_t items_per_thread) {
-  if (sizeof(state_t) >= 8u) return (size_t)items_per_thread;
+  if (sizeof(state_t) >= 8u) {
+    // Each element occupies sizeof(state_t)/4 bank slots (4-byte banks, sm_75+).
+    // Stride in banks = items_per_thread * (sizeof(state_t)/4).
+    // GCD(stride_banks, 32) gives the conflict factor; we want it == 2 (minimum
+    // achievable for even-sized types).  For 8-byte types, stride_banks = IPT*2;
+    // GCD is 2 iff IPT is odd.  Add 1 pad when IPT is even to make stride odd.
+    uint32_t banks_per_elem = (uint32_t)(sizeof(state_t) / 4u);
+    uint32_t stride_banks   = items_per_thread * banks_per_elem;
+    // Pad until stride_banks is odd * banks_per_elem (i.e. stride_banks/banks_per_elem is odd)
+    uint32_t pad = (items_per_thread % 2u == 0u) ? 1u : 0u;
+    return (size_t)(items_per_thread + pad);
+  }
   uint32_t shmem_mod    = 8u / (uint32_t)sizeof(state_t);
   uint32_t shmem_target = 4u / (uint32_t)sizeof(state_t);
   uint32_t shmem_rem    = items_per_thread % shmem_mod;
@@ -191,15 +202,23 @@ constexpr uint32_t arch_block_size() {
 // Endomorphism helpers.
 //
 // endo_t is a struct { uint64_t w[ENDO_WORDS]; } encoding up to MAX_IMAGE_SIZE
-// (in, out, producing) triples, each TRIPLE_BITS = 2*STATE_BITS+1 bits wide,
-// packed from bit 0 of w[0] across word boundaries.
+// (in, out) pairs, each PAIR_BITS = 2*STATE_BITS bits wide, packed from
+// bit 0 of w[0] across word boundaries.
 // Bit 63 of w[0] is the identity flag. ENDO_IDENTITY has only this bit set.
 // Char endomorphisms always have bit 63 of w[0] clear.
 //
-// STATE_BITS, TRIPLE_BITS, STATE_MASK, MAX_IMAGE_SIZE, INIT_STATE, ENDO_WORDS,
-// ENDO_IDENTITY and the tables h_endo / h_accept are all baked in by the
-// Haskell code generator above.
+// Produce detection uses d_produce_matrix: after the inclusive prefix scan,
+// the transition at position i is (s_before, s_after) where
+//   s_before = eval_endo(prefix[i-1], INIT_STATE)
+//   s_after  = eval_endo(prefix[i],   INIT_STATE)
+// and is_produce = (d_produce_matrix[s_before] >> s_after) & 1.
+//
+// STATE_BITS, PAIR_BITS, STATE_MASK, MAX_IMAGE_SIZE, INIT_STATE, ENDO_WORDS,
+// ENDO_IDENTITY and the tables h_endo / h_accept / h_produce_matrix are all
+// baked in by the Haskell code generator above.
 // ---------------------------------------------------------------------------
+
+__device__ __constant__ uint64_t d_produce_matrix[NUM_STATES];
 
 __device__ __host__ __forceinline__
 bool endo_is_identity(const endo_t& e) {
@@ -235,22 +254,20 @@ endo_t endo_compose(const endo_t& f, const endo_t& g) {
   int out = 0;
 #pragma unroll
   for (int fi = 0; fi < MAX_IMAGE_SIZE; fi++) {
-    int off_f  = fi * TRIPLE_BITS;
+    int off_f  = fi * PAIR_BITS;
     int fi_in  = (int)endo_extract(f, off_f,              STATE_BITS);
     int fi_out = (int)endo_extract(f, off_f + STATE_BITS, STATE_BITS);
     if (fi_in == 0 && fi_out == 0) break;
 #pragma unroll
     for (int gi = 0; gi < MAX_IMAGE_SIZE; gi++) {
-      int off_g   = gi * TRIPLE_BITS;
-      int gi_in   = (int)endo_extract(g, off_g,                  STATE_BITS);
-      int gi_out  = (int)endo_extract(g, off_g + STATE_BITS,     STATE_BITS);
-      int gi_prod = (int)endo_extract(g, off_g + 2 * STATE_BITS, 1);
+      int off_g   = gi * PAIR_BITS;
+      int gi_in   = (int)endo_extract(g, off_g,              STATE_BITS);
+      int gi_out  = (int)endo_extract(g, off_g + STATE_BITS, STATE_BITS);
       if (gi_in == 0 && gi_out == 0) break;
       if (gi_in == fi_out) {
-        int off_r = out * TRIPLE_BITS;
-        endo_insert(result, off_r,                  STATE_BITS, (uint64_t)fi_in);
-        endo_insert(result, off_r + STATE_BITS,     STATE_BITS, (uint64_t)gi_out);
-        endo_insert(result, off_r + 2 * STATE_BITS, 1,          (uint64_t)gi_prod);
+        int off_r = out * PAIR_BITS;
+        endo_insert(result, off_r,              STATE_BITS, (uint64_t)fi_in);
+        endo_insert(result, off_r + STATE_BITS, STATE_BITS, (uint64_t)gi_out);
         out++;
         break;
       }
@@ -264,7 +281,7 @@ int eval_endo(const endo_t& e, int query) {
   if (endo_is_identity(e)) return query;
 #pragma unroll
   for (int i = 0; i < MAX_IMAGE_SIZE; i++) {
-    int off = i * TRIPLE_BITS;
+    int off = i * PAIR_BITS;
     int in  = (int)endo_extract(e, off,              STATE_BITS);
     int out = (int)endo_extract(e, off + STATE_BITS, STATE_BITS);
     if (in == 0 && out == 0) break;
@@ -273,28 +290,15 @@ int eval_endo(const endo_t& e, int query) {
   return 0;
 }
 
-__device__ __host__ __forceinline__
-bool eval_producing(const endo_t& e, int query) {
-  if (endo_is_identity(e)) return false;
-#pragma unroll
-  for (int i = 0; i < MAX_IMAGE_SIZE; i++) {
-    int off = i * TRIPLE_BITS;
-    int in  = (int)endo_extract(e, off, STATE_BITS);
-    if (in == 0) break;
-    if (in == query)
-      return (bool)endo_extract(e, off + 2 * STATE_BITS, 1);
-  }
-  return false;
-}
-
 __device__ __forceinline__
 terminal_t get_terminal(endo_t e) {
   return static_cast<terminal_t>(h_terminal[eval_endo(e, INIT_STATE)]);
 }
 
+// Returns true if the transition s_before -> s_after produces a token.
 __device__ __forceinline__
-bool is_produce(endo_t e) {
-  return eval_producing(e, INIT_STATE);
+bool is_produce_transition(int s_before, int s_after) {
+  return (d_produce_matrix[s_before] >> s_after) & 1;
 }
 
 template<typename I, typename J>
@@ -363,6 +367,7 @@ public:
     cudaMemset((void*)d_new_size, 0, sizeof(I));
     endo_t identity = ENDO_IDENTITY;
     cudaMemcpyToSymbol(d_ENDO_IDENTITY, &identity, sizeof(endo_t));
+    cudaMemcpyToSymbol(d_produce_matrix, h_produce_matrix, sizeof(h_produce_matrix));
     cudaMemcpy((void*)d_new_last_endo, &identity, sizeof(endo_t), cudaMemcpyHostToDevice);
     cudaMemcpy((void*)d_old_last_endo, &identity, sizeof(endo_t), cudaMemcpyHostToDevice);
     cudaMemset((void*)d_new_last_start, 0, sizeof(J));
@@ -621,22 +626,30 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     I gid = glb_offs + lid;
     bool is_next_produce = false;
     uint32_t start_code = 0;
-    // Padded shmem indices for this item and the next global item.
+    // Padded shmem indices for this item and adjacent items.
     I shmem_cur  = (I)threadIdx.x * (SHMEM_STRIDE) + i;
     I shmem_next = (i < ITEMS_PER_THREAD - 1)
                    ? shmem_cur + 1
                    : ((I)threadIdx.x + 1) * (SHMEM_STRIDE);
+    I shmem_prev = (i > 0)
+                   ? shmem_cur - 1
+                   : (threadIdx.x > 0)
+                     ? (I)(threadIdx.x - 1) * (SHMEM_STRIDE) + (ITEMS_PER_THREAD - 1)
+                     : (I)-1;
     if (gid < size) {
       endo_t state = states[shmem_cur];
+      int s_cur = eval_endo(state, INIT_STATE);
 #ifdef IGNORE_TOKEN
       bool is_not_ignore = get_terminal(state) != IGNORE_TOKEN;
 #else
       bool is_not_ignore = true;
 #endif
       if (lid == ITEMS_PER_THREAD * BLOCK_SIZE - 1) {
-        is_next_produce = is_produce(ctx(state, next_block_first_state));
+        int s_next = eval_endo(ctx(state, next_block_first_state), INIT_STATE);
+        is_next_produce = is_produce_transition(s_cur, s_next);
       } else {
-        is_next_produce = is_produce(states[shmem_next]);
+        int s_next = eval_endo(states[shmem_next], INIT_STATE);
+        is_next_produce = is_produce_transition(s_cur, s_next);
       }
 
       if (is_last_chunk) {
@@ -646,7 +659,11 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
         is_next_produce &= is_not_ignore;
       }
 
-      start_code = is_produce(state) ? (uint32_t)(gid + 1) : 0u;
+      // start_code: produce at this position means a token ends here.
+      // A produce occurs when the transition from s_prev to s_cur emits a token.
+      int s_prev = (lid == 0) ? INIT_STATE : eval_endo(states[shmem_prev], INIT_STATE);
+      bool this_produce = is_produce_transition(s_prev, s_cur);
+      start_code = this_produce ? (uint32_t)(gid + 1) : 0u;
     }
     is_produce_state |= is_next_produce << i;
     start_codes[i]   = start_code;
