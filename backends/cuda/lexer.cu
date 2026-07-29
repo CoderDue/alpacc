@@ -31,7 +31,7 @@ __host__ __device__ constexpr size_t shmem_pad_stride(uint32_t items_per_thread)
     // achievable for even-sized types).  For 8-byte types, stride_banks = IPT*2;
     // GCD is 2 iff IPT is odd.  Add 1 pad when IPT is even to make stride odd.
     uint32_t banks_per_elem = (uint32_t)(sizeof(state_t) / 4u);
-    uint32_t stride_banks   = items_per_thread * banks_per_elem;
+    (void)(items_per_thread * banks_per_elem); // stride_banks: used only in comment above
     // Pad until stride_banks is odd * banks_per_elem (i.e. stride_banks/banks_per_elem is odd)
     uint32_t pad = (items_per_thread % 2u == 0u) ? 1u : 0u;
     return (size_t)(items_per_thread + pad);
@@ -55,11 +55,14 @@ template<typename I, typename state_t, uint32_t BLOCK_SIZE>
 constexpr size_t lexer_shmem_fixed() {
   size_t cub_state_temp = sizeof(typename cub::BlockScan<state_t, BLOCK_SIZE>::TempStorage);
   size_t cub_u32_temp   = sizeof(typename cub::BlockScan<uint32_t,  BLOCK_SIZE>::TempStorage);
-  size_t lookback = 2u * sizeof(I) * WARP + sizeof(uint8_t) * WARP + 2u * sizeof(I);
+  // fusedLookback: single endo_t broadcast slot (thread 0 walks serially).
+  size_t lookback = sizeof(state_t);
+  // Fused B_max/B_add aggregate + prefix in shared memory (NUM_STATES-wide).
+  size_t b_tables = 4 * (size_t)NUM_STATES * sizeof(uint32_t);
   size_t fixed_scalars = sizeof(state_t)    // next_block_first_state
                         + sizeof(I)          // last_start
                         + sizeof(I);         // num_sel_sh
-  return cub_state_temp + cub_u32_temp + lookback + fixed_scalars;
+  return cub_state_temp + cub_u32_temp + lookback + b_tables + fixed_scalars;
 }
 
 // Largest ITEMS_PER_THREAD ≤ HARD_CAP whose per-block shmem footprint fits
@@ -204,8 +207,8 @@ constexpr uint32_t arch_block_size() {
 // endo_t is a struct { uint64_t w[ENDO_WORDS]; } encoding up to MAX_IMAGE_SIZE
 // (in, out) pairs, each PAIR_BITS = 2*STATE_BITS bits wide, packed from
 // bit 0 of w[0] across word boundaries.
-// Bit 63 of w[0] is the identity flag. ENDO_IDENTITY has only this bit set.
-// Char endomorphisms always have bit 63 of w[0] clear.
+// Bit 63 of w[ENDO_WORDS-1] is the identity flag. ENDO_IDENTITY has only this bit set.
+// Char endomorphisms always have this bit clear (pair data never reaches it).
 //
 // Produce detection uses d_produce_matrix: after the inclusive prefix scan,
 // the transition at position i is (s_before, s_after) where
@@ -222,7 +225,7 @@ __device__ __constant__ uint64_t d_produce_matrix[NUM_STATES];
 
 __device__ __host__ __forceinline__
 bool endo_is_identity(const endo_t& e) {
-  return (e.w[0] >> 63) & 1;
+  return (e.w[ENDO_WORDS - 1] >> 63) & 1;
 }
 
 __device__ __host__ __forceinline__
@@ -301,6 +304,263 @@ bool is_produce_transition(int s_before, int s_after) {
   return (d_produce_matrix[s_before] >> s_after) & 1;
 }
 
+// ---------------------------------------------------------------------------
+// Fused (endo, max, add) decoupled lookback via monoid composition.
+//
+// Defined here (after endo_compose / eval_endo) so those helpers are in scope.
+// scan.cu (emitted earlier, before grammar defines) contains only fully-generic
+// helpers and must not reference endo_t / NUM_STATES / ENDO_WORDS.
+//
+// Elements: (f, B_max[NUM_STATES], B_add[NUM_STATES])
+//   Monoid: (f1,B1) ★ (f2,B2) = ( f1∘f2,
+//                                   q ↦ max(B1_max[q], B2_max[f1[q]]),
+//                                   q ↦ B1_add[q]  + B2_add[f1[q]]  )
+//
+// Per-block state buffer: a single SoA lookback buffer carrying the endo
+// aggregate/prefix plus NUM_STATES-wide B_max and B_add tables (aggregate
+// and prefix, both u32).  One status atomic per block covers all three
+// components — endo, B_max, B_add — via a single release/acquire pair.
+// ---------------------------------------------------------------------------
+
+struct FusedStates {
+  volatile endo_t*   endo_aggregates = nullptr;
+  volatile endo_t*   endo_prefixes   = nullptr;
+  volatile uint32_t* bmax_aggregates = nullptr;   // [num_blocks * NUM_STATES]
+  volatile uint32_t* bmax_prefixes   = nullptr;
+  volatile uint32_t* badd_aggregates = nullptr;
+  volatile uint32_t* badd_prefixes   = nullptr;
+  AtomicStatus*      statuses        = nullptr;
+  uint32_t num_blocks = 0;
+
+  FusedStates() {}
+
+  FusedStates(uint32_t nb) : num_blocks(nb) {
+    size_t b_bytes = (size_t)nb * NUM_STATES * sizeof(uint32_t);
+    cudaMalloc((void**)&endo_aggregates, nb * sizeof(endo_t));
+    cudaMalloc((void**)&endo_prefixes,   nb * sizeof(endo_t));
+    cudaMalloc((void**)&bmax_aggregates, b_bytes);
+    cudaMalloc((void**)&bmax_prefixes,   b_bytes);
+    cudaMalloc((void**)&badd_aggregates, b_bytes);
+    cudaMalloc((void**)&badd_prefixes,   b_bytes);
+    cudaMalloc((void**)&statuses,        nb * sizeof(AtomicStatus));
+    cudaMemset((void*)statuses, Invalid, nb * sizeof(AtomicStatus));
+  }
+
+  void reset() {
+    if (statuses) cudaMemset((void*)statuses, Invalid, num_blocks * sizeof(AtomicStatus));
+  }
+
+  void cleanUp() {
+    if (endo_aggregates) cudaFree((void*)endo_aggregates);
+    if (endo_prefixes)   cudaFree((void*)endo_prefixes);
+    if (bmax_aggregates) cudaFree((void*)bmax_aggregates);
+    if (bmax_prefixes)   cudaFree((void*)bmax_prefixes);
+    if (badd_aggregates) cudaFree((void*)badd_aggregates);
+    if (badd_prefixes)   cudaFree((void*)badd_prefixes);
+    if (statuses)        cudaFree((void*)statuses);
+    endo_aggregates = nullptr; endo_prefixes = nullptr;
+    bmax_aggregates = nullptr; bmax_prefixes = nullptr;
+    badd_aggregates = nullptr; badd_prefixes = nullptr;
+    statuses = nullptr;
+  }
+};
+
+struct LexerScanStates {
+  FusedStates fused;
+
+  LexerScanStates() {}
+  LexerScanStates(uint32_t nb) : fused(nb) {}
+  void reset()    { fused.reset(); }
+  void cleanUp()  { fused.cleanUp(); }
+};
+
+struct EndoOp {
+  __device__ __forceinline__
+  endo_t operator()(const endo_t& a, const endo_t& b) const {
+    return endo_compose(a, b);
+  }
+  __device__ __forceinline__
+  endo_t operator()(const volatile endo_t& a, const volatile endo_t& b) const {
+    endo_t na, nb;
+    for (int k = 0; k < ENDO_WORDS; k++) { na.w[k] = a.w[k]; nb.w[k] = b.w[k]; }
+    return endo_compose(na, nb);
+  }
+};
+
+// Fused decoupled lookback: publishes this block's (endo, B_max, B_add)
+// aggregate under one status atomic, then walks predecessors oldest-first
+// via a plain serial loop on thread 0, implementing the semiring
+// composition monoid
+//   (a1,b1) ★ (a2,b2) := (a1∘a2,  b1 ⊕ a1·b2)
+// from docs/fused-lookback-monoid.md.
+//
+// This is the simplest correct version: no warp parallelism, no early
+// termination — thread 0 waits for each predecessor's status to become
+// Prefix, then folds it into the running (F, C) via ★ in oldest → newest
+// order.  When the walk hits a predecessor whose status is Prefix, that
+// predecessor's `*_prefixes` arrays already absorb everything to its left,
+// so we start the walk at the *highest* p with Prefix (thread 0 scans
+// backwards to find it first) and then fold p, p+1, …, dyn_idx-1 in order.
+__device__ inline void
+fusedLookback(FusedStates states,
+              uint32_t dyn_idx,
+              const endo_t& endo_agg,
+              const uint32_t* bmax_agg,   // shmem [NUM_STATES]
+              const uint32_t* badd_agg,   // shmem [NUM_STATES]
+              uint32_t* bmax_pfx_sh,      // shmem [NUM_STATES] — running C
+              uint32_t* badd_pfx_sh,      // shmem [NUM_STATES] — running C
+              endo_t& out_endo_pfx,
+              uint32_t& out_bmax_scalar,  // = running_C[INIT_STATE]
+              uint32_t& out_badd_scalar) {
+  volatile __shared__ endo_t shmem_endo_pfx;
+  const bool is_first = threadIdx.x == 0;
+
+  if (is_first) {
+    states.statuses[dyn_idx].store(Invalid, cuda::memory_order_relaxed);
+  }
+  __syncthreads();
+
+  // Publish this block's aggregate: endo (thread 0), B_max/B_add (all threads
+  // cooperate across NUM_STATES).
+  if (is_first) {
+    for (int k = 0; k < ENDO_WORDS; k++)
+      states.endo_aggregates[dyn_idx].w[k] = endo_agg.w[k];
+  }
+  {
+    const uint32_t base = dyn_idx * (uint32_t)NUM_STATES;
+    for (int q = threadIdx.x; q < NUM_STATES; q += blockDim.x) {
+      states.bmax_aggregates[base + q] = bmax_agg[q];
+      states.badd_aggregates[base + q] = badd_agg[q];
+    }
+  }
+
+  // Zero the running B prefix.
+  for (int q = threadIdx.x; q < NUM_STATES; q += blockDim.x) {
+    bmax_pfx_sh[q] = 0u;
+    badd_pfx_sh[q] = 0u;
+  }
+
+  // Block 0: aggregate = prefix; publish and mark Prefix directly.
+  if (dyn_idx == 0) {
+    if (is_first) {
+      for (int k = 0; k < ENDO_WORDS; k++)
+        states.endo_prefixes[dyn_idx].w[k] = endo_agg.w[k];
+    }
+    const uint32_t base = dyn_idx * (uint32_t)NUM_STATES;
+    for (int q = threadIdx.x; q < NUM_STATES; q += blockDim.x) {
+      states.bmax_prefixes[base + q] = bmax_agg[q];
+      states.badd_prefixes[base + q] = badd_agg[q];
+    }
+    __threadfence();
+    if (is_first) states.statuses[dyn_idx].store(Prefix, cuda::memory_order_release);
+
+    if (is_first) shmem_endo_pfx = d_ENDO_IDENTITY;
+    __syncthreads();
+    endo_t r;
+    for (int k = 0; k < ENDO_WORDS; k++) r.w[k] = shmem_endo_pfx.w[k];
+    out_endo_pfx = r;
+    out_bmax_scalar = 0u;
+    out_badd_scalar = 0u;
+    return;
+  }
+
+  // Non-block-0: mark Aggregate, then thread 0 does a plain serial walk.
+  __threadfence();
+  if (is_first) states.statuses[dyn_idx].store(Aggregate, cuda::memory_order_release);
+  __syncthreads();
+
+  // Thread 0: find the highest p < dyn_idx whose status is Prefix (spin
+  // until each candidate resolves).  Walk backwards from dyn_idx-1 down;
+  // the first Prefix we see is our start.  If no p in the whole range has
+  // Prefix (only possible when dyn_idx == 0, already handled), we'd start
+  // at 0 — but there's always at least block 0, which eventually reaches
+  // Prefix.
+  if (is_first) {
+    // Step A: wait for every predecessor's status to be at least Aggregate
+    // (which means its endo/B aggregates are visible), then find the
+    // highest Prefix predecessor by scanning back.  Simplest: scan back
+    // from dyn_idx-1, and for each p spin until status != Invalid.  Stop
+    // at first Prefix.
+    int start_p = 0;
+    for (int p = (int)dyn_idx - 1; p >= 0; p--) {
+      Status s;
+      do {
+        s = states.statuses[p].load(cuda::memory_order_acquire);
+      } while (s == Invalid);
+      if (s == Prefix) { start_p = p; break; }
+      // else Aggregate — keep scanning back.
+    }
+
+    // Step B: fold predecessors start_p, start_p+1, …, dyn_idx-1 in ★
+    // order (oldest→newest).  At start_p, if its status is Prefix use its
+    // *_prefixes (absorbs everything ≤ start_p); at later p's, we spin
+    // until status resolves to at least Aggregate.
+    endo_t running_F = d_ENDO_IDENTITY;
+    for (int p = start_p; p < (int)dyn_idx; p++) {
+      Status s;
+      if (p == start_p) {
+        // Already known Prefix from Step A (or start_p == 0 with any status).
+        s = states.statuses[p].load(cuda::memory_order_acquire);
+      } else {
+        do {
+          s = states.statuses[p].load(cuda::memory_order_acquire);
+        } while (s == Invalid);
+      }
+      bool use_pfx = (p == start_p) && (s == Prefix);
+      const uint32_t base = (uint32_t)p * (uint32_t)NUM_STATES;
+      volatile uint32_t* bmax_src = use_pfx ? states.bmax_prefixes : states.bmax_aggregates;
+      volatile uint32_t* badd_src = use_pfx ? states.badd_prefixes : states.badd_aggregates;
+      volatile endo_t*   endo_src = use_pfx ? states.endo_prefixes : states.endo_aggregates;
+      // running_C[q] ⊕= B_p[running_F(q)]
+      for (int q = 0; q < NUM_STATES; q++) {
+        int qp = eval_endo(running_F, q);
+        uint32_t vm = bmax_src[base + qp];
+        uint32_t va = badd_src[base + qp];
+        if (vm > bmax_pfx_sh[q]) bmax_pfx_sh[q] = vm;
+        badd_pfx_sh[q] += va;
+      }
+      // running_F = running_F ∘ f_p
+      endo_t e_p;
+      for (int k = 0; k < ENDO_WORDS; k++) e_p.w[k] = endo_src[p].w[k];
+      running_F = endo_compose(running_F, e_p);
+    }
+    for (int k = 0; k < ENDO_WORDS; k++) shmem_endo_pfx.w[k] = running_F.w[k];
+  }
+  __syncthreads();
+
+  endo_t f_pfx_bcast;
+  for (int k = 0; k < ENDO_WORDS; k++) f_pfx_bcast.w[k] = shmem_endo_pfx.w[k];
+  out_endo_pfx = f_pfx_bcast;
+
+  // Publish this block's prefix: prefix = pfx ★ agg per the monoid rule.
+  //   endo_prefix[q]  = f_pfx ∘ endo_agg
+  //   bmax_prefix[q]  = max(bmax_pfx[q], bmax_agg[f_pfx(q)])
+  //   badd_prefix[q]  = badd_pfx[q]  +  badd_agg[f_pfx(q)]
+  if (is_first) {
+    endo_t combined = endo_compose(f_pfx_bcast, endo_agg);
+    for (int k = 0; k < ENDO_WORDS; k++)
+      states.endo_prefixes[dyn_idx].w[k] = combined.w[k];
+  }
+  {
+    const uint32_t base = dyn_idx * (uint32_t)NUM_STATES;
+    for (int q = threadIdx.x; q < NUM_STATES; q += blockDim.x) {
+      int qp = eval_endo(f_pfx_bcast, q);
+      uint32_t m  = bmax_pfx_sh[q];
+      uint32_t am = bmax_agg[qp];
+      uint32_t pm = (m > am) ? m : am;
+      uint32_t pa = badd_pfx_sh[q] + badd_agg[qp];
+      states.bmax_prefixes[base + q] = pm;
+      states.badd_prefixes[base + q] = pa;
+    }
+  }
+  __threadfence();
+  if (is_first) states.statuses[dyn_idx].store(Prefix, cuda::memory_order_release);
+
+  // Extract the scalar prefixes at INIT_STATE for this block.
+  out_bmax_scalar = bmax_pfx_sh[INIT_STATE];
+  out_badd_scalar = badd_pfx_sh[INIT_STATE];
+}
+
 template<typename I, typename J>
 struct LexerCtx {
 
@@ -343,8 +603,7 @@ private:
 
 public:
   const I CHUNK_SIZE;
-  States<I, endo_t> d_state_states;
-  PairStates<I, I, I> d_maxadd_states;
+  LexerScanStates d_scan_states;
 
   LexerCtx(const I chunk_size,
            const I block_size,
@@ -352,8 +611,7 @@ public:
     I num_blocks = numBlocks(chunk_size, block_size, items_per_thread);
     gpuAssert(cudaMalloc(&d_endo, sizeof(h_endo)));
     cudaMemcpy(d_endo, h_endo, sizeof(h_endo), cudaMemcpyHostToDevice);
-    d_maxadd_states = PairStates<I, I, I>(num_blocks);
-    d_state_states = States<I, endo_t>(num_blocks);
+    d_scan_states = LexerScanStates(num_blocks);
 
     gpuAssert(cudaMalloc((void**)&d_dyn_block_index, sizeof(uint32_t)));
     gpuAssert(cudaMalloc((void**)&d_new_size, sizeof(I)));
@@ -385,8 +643,7 @@ public:
     cudaMemset((void*)d_new_last_start, 0, sizeof(J));
     cudaMemset((void*)d_old_last_start, 0, sizeof(J));
     cudaMemset((void*)d_len_overflow, 0, sizeof(uint32_t));
-    d_maxadd_states.reset();
-    d_state_states.reset();
+    d_scan_states.reset();
   }
 
   void cleanUp() {
@@ -398,8 +655,7 @@ public:
     if (d_new_last_endo) cudaFree((void*)d_new_last_endo);
     if (d_old_last_endo) cudaFree((void*)d_old_last_endo);
     if (d_len_overflow) cudaFree((void*)d_len_overflow);
-    d_maxadd_states.cleanUp();
-    d_state_states.cleanUp();
+    d_scan_states.cleanUp();
   }
 
   __device__ __host__ __forceinline__
@@ -583,58 +839,136 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   }
   __syncthreads();
 
-  // Phase B/C: load our blocked slice from states[] into registers, run the
-  // block-local scan + inter-block lookback, then write the inclusive
-  // prefix back.
+  // Phase B: block-local endo scan (no inter-block prefix applied yet).
+  // st[i] becomes the inclusive local scan; f_agg is the block aggregate.
+  // Phase B: block-local endo scan, B_agg computation, fused lookback,
+  // produce detection, and block-local u32 scans — all in flat scope.
+  endo_t st[ITEMS_PER_THREAD];
+  uint32_t start_codes[ITEMS_PER_THREAD];
+  uint32_t produce_flags[ITEMS_PER_THREAD];
+  I max_prefix = I();
+  I prefix     = I();
   {
-    endo_t st[ITEMS_PER_THREAD];
     const I off = threadIdx.x * SHMEM_STRIDE;
-    bool is_first = (glb_offs == 0) && (threadIdx.x == 0);
+    bool is_chunk_first = (glb_offs == 0) && (threadIdx.x == 0);
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
       st[i] = states[off + i];
-      if (is_first && i == 0)
+      if (is_chunk_first && i == 0)
         st[i] = ctx(ctx.getLastState(), st[i]);
     }
-    const endo_t pfx = scanReg<endo_t, I, LexerCtx<I, J>, ITEMS_PER_THREAD, BLOCK_SIZE>(
-        st, ctx.d_state_states, ctx, d_ENDO_IDENTITY, dyn_index);
+    using BlockScanE = cub::BlockScan<endo_t, BLOCK_SIZE>;
+    __shared__ typename BlockScanE::TempStorage endo_temp;
+    endo_t f_agg;
+    BlockScanE(endo_temp).InclusiveScan(st, st, ctx, f_agg);
+
+    // Write local endo scan back to shmem so thread 0 can iterate all items
+    // to compute B_max[q] and B_add[q] aggregates for each starting state q.
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
-      states[off + i] = ctx(pfx, st[i]);
+      states[threadIdx.x * SHMEM_STRIDE + i] = st[i];
     __syncthreads();
-  }
 
-  // Split (max, +) block-local scans over u32 registers in blocked layout
-  // (thread t owns tile positions [t*IPT, (t+1)*IPT)): the token-start Max
-  // scan runs over start codes (0 = "no start seen", produce at gid encodes
-  // gid + 1) and the compaction Add scan runs over produce flags.  The two
-  // block-local scans are independent so we run them separately with scalar
-  // operators — the former fused u64 MaxAdd combine had ~4 dependent
-  // operations per reduction step (shift/mask/max/add threading through
-  // cub's binary tree), whereas the split u32 scalar operators run at one
-  // instruction per combine and give the compiler ILP across the two scans.
-  // The inter-block handshake then runs *once* over the SoA PairStates
-  // buffer via lookbackPrefixPair, so we don't pay for two lookback rounds.
-  // All loops below use blocked indexing so registers, the produce bitmask,
-  // and shmem stay consistent.
-  uint32_t start_codes[ITEMS_PER_THREAD];
-  uint32_t produce_flags[ITEMS_PER_THREAD];
+    // Build B_max[q], B_add[q] aggregates in shmem via shmem atomics.
+    // Each thread walks its own IPT items and does atomicMax / atomicAdd
+    // into bmax_agg_sh[q] / badd_agg_sh[q].  For numfmt (NUM_STATES=458)
+    // the serial thread-0 loop would be ~1M ops on one thread; distributing
+    // across 256 threads via shmem atomics is a much shorter critical path.
+    __shared__ uint32_t bmax_agg_sh[NUM_STATES];
+    __shared__ uint32_t badd_agg_sh[NUM_STATES];
+    __shared__ uint32_t bmax_pfx_sh[NUM_STATES];
+    __shared__ uint32_t badd_pfx_sh[NUM_STATES];
+    for (int q = threadIdx.x; q < NUM_STATES; q += BLOCK_SIZE) {
+      bmax_agg_sh[q] = 0u;
+      badd_agg_sh[q] = 0u;
+    }
+    __syncthreads();
 
+    // Thread 0 iterates all items in the block to compute B_agg[q] for all q.
+    // (Simple serial version; parallelise later once correctness is established.)
+    if (threadIdx.x == 0) {
+      for (I lid = 0; lid < (I)(BLOCK_SIZE * ITEMS_PER_THREAD); lid++) {
+        I gid = glb_offs + lid;
+        if (gid >= size) break;
+        I ti = lid / ITEMS_PER_THREAD;
+        I ii = lid % ITEMS_PER_THREAD;
+        endo_t cur = states[ti * SHMEM_STRIDE + ii];
+        endo_t prev_endo = (lid > 0)
+            ? states[(lid-1)/ITEMS_PER_THREAD * SHMEM_STRIDE + (lid-1)%ITEMS_PER_THREAD]
+            : d_ENDO_IDENTITY;
+        endo_t nxt;
+        bool has_next;
+        if (lid == (I)(BLOCK_SIZE * ITEMS_PER_THREAD) - 1) {
+          nxt = ctx(cur, next_block_first_state);
+          has_next = true;
+        } else {
+          I ti_n = (lid + 1) / ITEMS_PER_THREAD;
+          I ii_n = (lid + 1) % ITEMS_PER_THREAD;
+          nxt = (gid + 1 < size) ? states[ti_n * SHMEM_STRIDE + ii_n] : cur;
+          has_next = (gid + 1 < size);
+        }
+#ifdef IGNORE_TOKEN
+        bool cur_is_ignore = (get_terminal(cur) == IGNORE_TOKEN);
+#endif
+        for (int q = 0; q < NUM_STATES; q++) {
+          int s_cur  = eval_endo(cur, q);
+          int s_prev = (lid == 0) ? q : eval_endo(prev_endo, q);
+          if (is_produce_transition(s_prev, s_cur)) {
+            if ((uint32_t)(gid + 1) > bmax_agg_sh[q])
+              bmax_agg_sh[q] = (uint32_t)(gid + 1);
+          }
+          bool is_next_p = false;
+          if (has_next) {
+            int s_next = eval_endo(nxt, q);
+            is_next_p = is_produce_transition(s_cur, s_next);
+          }
+          if (is_last_chunk && gid == size - 1) is_next_p = true;
+#ifdef IGNORE_TOKEN
+          if (is_next_p && cur_is_ignore) is_next_p = false;
+#endif
+          if (is_next_p) badd_agg_sh[q] += 1u;
+        }
+      }
+    }
+    __syncthreads();
+
+    // Wrap shmem aggregates as raw pointers (uniform read across threads).
+    // Note the fused-lookback API takes `const uint32_t*`; shmem arrays
+    // satisfy this once __syncthreads() above has published the writes.
+    endo_t f_pfx;
+    uint32_t raw_max_prefix, raw_add_prefix;
+    fusedLookback(ctx.d_scan_states.fused,
+                  dyn_index,
+                  f_agg,
+                  bmax_agg_sh, badd_agg_sh,
+                  bmax_pfx_sh, badd_pfx_sh,
+                  f_pfx,
+                  raw_max_prefix, raw_add_prefix);
+    max_prefix = (I)raw_max_prefix;
+    prefix     = (I)raw_add_prefix;
+
+    // Apply endo prefix to shmem for produce detection and scatter.
+#pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++)
+      states[threadIdx.x * SHMEM_STRIDE + i] = ctx(f_pfx, st[i]);
+    __syncthreads();
+  } // end Phase B
+
+  // Produce detection over post-prefix shmem endos.
 #pragma unroll
   for (I i = 0; i < ITEMS_PER_THREAD; i++) {
     I lid = threadIdx.x * ITEMS_PER_THREAD + i;
     I gid = glb_offs + lid;
     bool is_next_produce = false;
     uint32_t start_code = 0;
-    // Padded shmem indices for this item and adjacent items.
-    I shmem_cur  = (I)threadIdx.x * (SHMEM_STRIDE) + i;
+    I shmem_cur  = (I)threadIdx.x * SHMEM_STRIDE + i;
     I shmem_next = (i < ITEMS_PER_THREAD - 1)
                    ? shmem_cur + 1
-                   : ((I)threadIdx.x + 1) * (SHMEM_STRIDE);
+                   : ((I)threadIdx.x + 1) * SHMEM_STRIDE;
     I shmem_prev = (i > 0)
                    ? shmem_cur - 1
                    : (threadIdx.x > 0)
-                     ? (I)(threadIdx.x - 1) * (SHMEM_STRIDE) + (ITEMS_PER_THREAD - 1)
+                     ? (I)(threadIdx.x - 1) * SHMEM_STRIDE + (ITEMS_PER_THREAD - 1)
                      : (I)-1;
     if (gid < size) {
       endo_t state = states[shmem_cur];
@@ -651,16 +985,12 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
         int s_next = eval_endo(states[shmem_next], INIT_STATE);
         is_next_produce = is_produce_transition(s_cur, s_next);
       }
-
       if (is_last_chunk) {
         is_next_produce |= gid == size - 1;
         is_next_produce &= is_not_ignore;
       } else {
         is_next_produce &= is_not_ignore;
       }
-
-      // start_code: produce at this position means a token ends here.
-      // A produce occurs when the transition from s_prev to s_cur emits a token.
       int s_prev = (lid == 0) ? INIT_STATE : eval_endo(states[shmem_prev], INIT_STATE);
       bool this_produce = is_produce_transition(s_prev, s_cur);
       start_code = this_produce ? (uint32_t)(gid + 1) : 0u;
@@ -670,29 +1000,13 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
     produce_flags[i] = is_next_produce ? 1u : 0u;
   }
 
-  // Two independent block-local scans on scalar u32 monoids.  Both cub
-  // BlockScans share one TempStorage — they run sequentially in the same
-  // thread, so the storage is only live during one at a time.
+  // Block-local u32 scans (inter-block prefix already in max_prefix/prefix).
   using BlockScan32 = cub::BlockScan<uint32_t, BLOCK_SIZE>;
   __shared__ typename BlockScan32::TempStorage scan_temp;
-  const uint32_t max_agg =
-      scanRegLocal<uint32_t, I, Max<uint32_t>, ITEMS_PER_THREAD, BLOCK_SIZE>(
-          start_codes, scan_temp, Max<uint32_t>());
-  const uint32_t add_agg =
-      scanRegLocal<uint32_t, I, Add<uint32_t>, ITEMS_PER_THREAD, BLOCK_SIZE>(
-          produce_flags, scan_temp, Add<uint32_t>());
-
-  // Single fused decoupled-lookback round over the SoA PairStates buffer.
-  // The two component aggregates live in separate arrays and the block
-  // status is shared, so the inter-block warp scan reads both components in
-  // parallel with one status atomic per predecessor tile — same handshake
-  // cost as the former packed-u64 layout but without paying for a u64 load
-  // when u32 will do.
-  I max_prefix, prefix;
-  lookbackPrefixPair<I, I, I, Max<I>, Add<I>>(
-      ctx.d_maxadd_states, Max<I>(), Add<I>(), (I)0, (I)0, dyn_index,
-      (I)max_agg, (I)add_agg,
-      max_prefix, prefix);
+  scanRegLocal<uint32_t, I, Max<uint32_t>, ITEMS_PER_THREAD, BLOCK_SIZE>(
+      start_codes, scan_temp, Max<uint32_t>());
+  scanRegLocal<uint32_t, I, Add<uint32_t>, ITEMS_PER_THREAD, BLOCK_SIZE>(
+      produce_flags, scan_temp, Add<uint32_t>());
 
   I starts[ITEMS_PER_THREAD];
   I local_offs[ITEMS_PER_THREAD];

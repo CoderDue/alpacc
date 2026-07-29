@@ -73,26 +73,28 @@ packEndoWords sb maxSlots nWords pairs =
           packed = wi .|. (wj `shiftL` sb)
       in acc .|. (packed `shiftL` (slot * tb))
 
--- | Identity: bit 63 of w[0] set, all other bits zero.
+-- | Identity: bit 63 of the last word set, all other bits zero.
+-- Pair data occupies bits 0..(2*STATE_BITS*MAX_IMAGE_SIZE - 1); placing the
+-- flag in the top bit of the last word keeps it clear of any pair encoding.
 identityWords :: Int -> [Integer]
-identityWords nWords = (1 `shiftL` 63) : replicate (nWords - 1) 0
+identityWords nWords = replicate (nWords - 1) 0 ++ [1 `shiftL` 63]
 
--- | Compute the max non-dead image size over the full endomorphism monoid closure.
--- This is tighter than maxNonDeadImageSize (single-char only) for grammars
--- whose composed endos have smaller images than K-1.
+-- | Max non-dead (in, out) pair count over the full endomorphism monoid closure.
+-- Composition is lossy so composed endos have fewer pairs than single-char ones;
+-- the closure gives the tightest (smallest) bound on slot count.
 maxMonoidImageSize :: Map.Map Word8 Endomorphism -> Int -> Int
-maxMonoidImageSize tbl nStates =
-  maximum $ 1 : map imageSize (Map.elems closed)
+maxMonoidImageSize tbl _nStates =
+  maximum $ 1 : map pairCount (Map.elems closed)
   where
-    imageSize (Endomorphism arr _) =
-      List.length $ List.nub $ filter (/= deadState) $ UArray.elems arr
-    -- BFS over the monoid: start with single-char endos, close under composition
+    pairCount (Endomorphism arr _) =
+      List.length $ filter (\(s, j) -> s /= deadState && j /= deadState)
+                  $ UArray.assocs arr
     singles = Map.elems tbl
     initSet = Set.fromList singles
     closed  = go initSet (Set.toList initSet)
     go seen []     = Map.fromList [(e, e) | e <- Set.toList seen]
     go seen (e:queue) =
-      let new = [ e <> s | s <- singles
+      let new = [ c | s <- singles
                 , let c = e <> s
                 , c `Set.notMember` seen ]
       in go (List.foldl' (flip Set.insert) seen new) (queue ++ new)
@@ -120,7 +122,7 @@ generateLexer lex =
   (Text.strip . Text.pack)
     [i|
 // endo_t: ENDO_WORDS × uint64_t packing MAX_IMAGE_SIZE (in, out) pairs.
-// Bit 63 of w[0] is the identity flag; all char endos have this bit clear.
+// Bit 63 of w[ENDO_WORDS-1] is the identity flag; all char endos have this bit clear.
 // Produce detection uses h_produce_matrix: bit (s_out) of row (s_in) is set
 // when transitioning s_in -> s_out emits a token.
 const int ENDO_WORDS     = #{nWords};
