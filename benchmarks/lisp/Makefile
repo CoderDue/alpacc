@@ -90,7 +90,7 @@ build-cuda: lexer.cu parser.cu
 	@nvcc $(NVCCFLAGS) -o parser-cuda parser.cu
 	@printf "$(H)Build complete [$(GRAMMAR_NAME)].$(E)\n"
 
-bench-lexer-cuda: $(DATA)
+bench-lexer-cuda: $(DATA) lexer-cuda
 	@printf "$(H)Benchmarking CUDA lexer [$(GRAMMAR_NAME)]:$(E)\n"
 	@./lexer-cuda --benchmark 10 --warmup 3 < $(DATA)
 
@@ -107,7 +107,7 @@ bench-lexer:
 	@printf "$(H)Lisp Lexer Benchmark [$(GRAMMAR_NAME)]:$(E)\n"
 	@$(MAKE) --no-print-directory bench-lexer-c bench-lexer-cuda bench-lexer-futhark
 
-bench-parser-cuda: $(DATA)
+bench-parser-cuda: $(DATA) parser-cuda
 	@printf "$(H)Benchmarking CUDA parser [$(GRAMMAR_NAME)]:$(E)\n"
 	@./parser-cuda --benchmark 10 --warmup 3 < $(DATA)
 
