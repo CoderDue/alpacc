@@ -165,6 +165,16 @@ scanWarp(volatile T* values,
   }
 }
 
+// __nanosleep is available on sm_70+ (Volta, Turing, Ampere, …).
+// For older arches it compiles away to nothing.
+#if __CUDA_ARCH__ >= 700
+#define LOOKBACK_INITIAL_DELAY() __nanosleep(450u)
+#define LOOKBACK_SPIN_DELAY()    __nanosleep(350u)
+#else
+#define LOOKBACK_INITIAL_DELAY() __threadfence_block()
+#define LOOKBACK_SPIN_DELAY()    __threadfence_block()
+#endif
+
 // Computes this block's exclusive prefix via decoupled lookback, given the
 // block-wide aggregate (valid in all threads). Returns the prefix to all
 // threads.
@@ -208,6 +218,9 @@ lookbackPrefix(States<I, T> states,
     I lookback_idx = threadIdx.x + dyn_idx;
     I lookback_warp = WARP;
     Status status = Aggregate;
+    // Initial delay: give predecessor blocks time to write their aggregate
+    // before we poll, matching CUB's L2WriteLatency delay heuristic.
+    LOOKBACK_INITIAL_DELAY();
     do {
       if (lookback_warp <= lookback_idx) {
         I idx = lookback_idx - lookback_warp;
@@ -226,8 +239,12 @@ lookbackPrefix(States<I, T> states,
       T result = values[WARP - 1];
       status = statuses[WARP - 1];
 
-      if (status == Invalid)
+      if (status == Invalid) {
+        // Any lane saw Invalid — spin-delay before re-polling to avoid
+        // hammering the L2 and monopolising the memory bus.
+        LOOKBACK_SPIN_DELAY();
         continue;
+      }
 
       if (is_first) {
         prefix = op(result, prefix);
@@ -331,6 +348,7 @@ lookbackPrefixPair(PairStates<I, TA, TB> states,
     I lookback_idx = threadIdx.x + dyn_idx;
     I lookback_warp = WARP;
     Status status = Aggregate;
+    LOOKBACK_INITIAL_DELAY();
     do {
       if (lookback_warp <= lookback_idx) {
         I idx = lookback_idx - lookback_warp;
@@ -350,8 +368,10 @@ lookbackPrefixPair(PairStates<I, TA, TB> states,
       TB result_b = b_values[WARP - 1];
       status = statuses[WARP - 1];
 
-      if (status == Invalid)
+      if (status == Invalid) {
+        LOOKBACK_SPIN_DELAY();
         continue;
+      }
 
       if (is_first) {
         prefix_a = op_a(result_a, prefix_a);
