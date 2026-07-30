@@ -1012,7 +1012,15 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
 
   if (dyn_index == gridDim.x - 1 && threadIdx.x == blockDim.x - 1) {
     ctx.setNewSize(Add<I>()(prefix, num_sel));
-    ctx.setLastState(states[(BLOCK_SIZE - 1) * SHMEM_STRIDE + (ITEMS_PER_THREAD - 1)]);  // stores endo_t
+    // Last-block-last-thread publishes the endo at the *logical* last input
+    // position (size - 1), not the last shmem slot: when size < BS*IPT that
+    // slot holds ENDO_IDENTITY (Phase A's out-of-range fill), which composes
+    // to INIT_STATE and mis-reports non-accept.
+    const I last_gid = size - 1;
+    const I last_lid = last_gid - glb_offs;
+    const I last_ti  = last_lid / ITEMS_PER_THREAD;
+    const I last_ii  = last_lid % ITEMS_PER_THREAD;
+    ctx.setLastState(states[last_ti * SHMEM_STRIDE + last_ii]);  // stores endo_t
 
     if (last_start != I()) {
       ctx.setLastStart(ctx.addOffset(last_start - 1));
