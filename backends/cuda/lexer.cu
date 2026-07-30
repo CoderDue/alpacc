@@ -451,6 +451,10 @@ fusedLookback(FusedStates states,
       states.bmax_prefixes[base + q] = bmax_agg[q];
       states.badd_prefixes[base + q] = badd_agg[q];
     }
+    // All threads must finish the strided writes before thread 0's
+    // release-store of Prefix — otherwise successor blocks may load
+    // partial/stale prefix arrays.
+    __syncthreads();
     __threadfence();
     if (is_first) states.statuses[dyn_idx].store(Prefix, cuda::memory_order_release);
 
@@ -464,67 +468,28 @@ fusedLookback(FusedStates states,
     return;
   }
 
-  // Non-block-0: mark Aggregate, then thread 0 does a plain serial walk.
-  __threadfence();
-  if (is_first) states.statuses[dyn_idx].store(Aggregate, cuda::memory_order_release);
-  __syncthreads();
-
-  // Thread 0: find the highest p < dyn_idx whose status is Prefix (spin
-  // until each candidate resolves).  Walk backwards from dyn_idx-1 down;
-  // the first Prefix we see is our start.  If no p in the whole range has
-  // Prefix (only possible when dyn_idx == 0, already handled), we'd start
-  // at 0 — but there's always at least block 0, which eventually reaches
-  // Prefix.
+  // Non-block-0: canonical single-predecessor decoupled lookback.  Skip the
+  // Aggregate stage entirely — every block just waits for its immediate
+  // predecessor's Prefix to be published (which by induction already
+  // accumulates blocks 0..p), copies it into `running`, then falls through
+  // to the shared publish path below which folds this block's aggregate
+  // via ★ and publishes its own Prefix.  One linear dependency chain, no
+  // walk-order non-determinism.
   if (is_first) {
-    // Step A: wait for every predecessor's status to be at least Aggregate
-    // (which means its endo/B aggregates are visible), then find the
-    // highest Prefix predecessor by scanning back.  Simplest: scan back
-    // from dyn_idx-1, and for each p spin until status != Invalid.  Stop
-    // at first Prefix.
-    int start_p = 0;
-    for (int p = (int)dyn_idx - 1; p >= 0; p--) {
-      Status s;
-      do {
-        s = states.statuses[p].load(cuda::memory_order_acquire);
-      } while (s == Invalid);
-      if (s == Prefix) { start_p = p; break; }
-      // else Aggregate — keep scanning back.
+    const uint32_t p = dyn_idx - 1;
+    Status s;
+    do {
+      s = states.statuses[p].load(cuda::memory_order_acquire);
+    } while (s != Prefix);
+    // Copy predecessor's prefix into running.
+    endo_t f_prev;
+    for (int k = 0; k < ENDO_WORDS; k++) f_prev.w[k] = states.endo_prefixes[p].w[k];
+    const uint32_t base = p * (uint32_t)NUM_STATES;
+    for (int q = 0; q < NUM_STATES; q++) {
+      bmax_pfx_sh[q] = states.bmax_prefixes[base + q];
+      badd_pfx_sh[q] = states.badd_prefixes[base + q];
     }
-
-    // Step B: fold predecessors start_p, start_p+1, …, dyn_idx-1 in ★
-    // order (oldest→newest).  At start_p, if its status is Prefix use its
-    // *_prefixes (absorbs everything ≤ start_p); at later p's, we spin
-    // until status resolves to at least Aggregate.
-    endo_t running_F = d_ENDO_IDENTITY;
-    for (int p = start_p; p < (int)dyn_idx; p++) {
-      Status s;
-      if (p == start_p) {
-        // Already known Prefix from Step A (or start_p == 0 with any status).
-        s = states.statuses[p].load(cuda::memory_order_acquire);
-      } else {
-        do {
-          s = states.statuses[p].load(cuda::memory_order_acquire);
-        } while (s == Invalid);
-      }
-      bool use_pfx = (p == start_p) && (s == Prefix);
-      const uint32_t base = (uint32_t)p * (uint32_t)NUM_STATES;
-      volatile uint32_t* bmax_src = use_pfx ? states.bmax_prefixes : states.bmax_aggregates;
-      volatile uint32_t* badd_src = use_pfx ? states.badd_prefixes : states.badd_aggregates;
-      volatile endo_t*   endo_src = use_pfx ? states.endo_prefixes : states.endo_aggregates;
-      // running_C[q] ⊕= B_p[running_F(q)]
-      for (int q = 0; q < NUM_STATES; q++) {
-        int qp = eval_endo(running_F, q);
-        uint32_t vm = bmax_src[base + qp];
-        uint32_t va = badd_src[base + qp];
-        if (vm > bmax_pfx_sh[q]) bmax_pfx_sh[q] = vm;
-        badd_pfx_sh[q] += va;
-      }
-      // running_F = running_F ∘ f_p
-      endo_t e_p;
-      for (int k = 0; k < ENDO_WORDS; k++) e_p.w[k] = endo_src[p].w[k];
-      running_F = endo_compose(running_F, e_p);
-    }
-    for (int k = 0; k < ENDO_WORDS; k++) shmem_endo_pfx.w[k] = running_F.w[k];
+    for (int k = 0; k < ENDO_WORDS; k++) shmem_endo_pfx.w[k] = f_prev.w[k];
   }
   __syncthreads();
 
@@ -553,6 +518,10 @@ fusedLookback(FusedStates states,
       states.badd_prefixes[base + q] = pa;
     }
   }
+  // All threads must finish their strided writes to bmax/badd_prefixes
+  // before thread 0's release-store — otherwise a successor block that sees
+  // Prefix may load partial/stale data.
+  __syncthreads();
   __threadfence();
   if (is_first) states.statuses[dyn_idx].store(Prefix, cuda::memory_order_release);
 
@@ -848,6 +817,10 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
   uint32_t produce_flags[ITEMS_PER_THREAD];
   I max_prefix = I();
   I prefix     = I();
+  // State at the end of prior blocks (== entering this block's position 0),
+  // evaluated at INIT_STATE.  Used by produce-detection at lid == 0 below.
+  // For block 0 it stays as INIT_STATE (identity applied to INIT_STATE).
+  int block_entry_state = INIT_STATE;
   {
     const I off = threadIdx.x * SHMEM_STRIDE;
     bool is_chunk_first = (glb_offs == 0) && (threadIdx.x == 0);
@@ -951,6 +924,11 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
 #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
       states[threadIdx.x * SHMEM_STRIDE + i] = ctx(f_pfx, st[i]);
+    // Record the state at the end of prior blocks (== entering this block
+    // at position 0), evaluated at INIT_STATE.  Needed for produce
+    // detection at lid == 0 in the loop below.  For block 0, f_pfx is
+    // identity so this stays INIT_STATE.
+    block_entry_state = eval_endo(f_pfx, INIT_STATE);
     __syncthreads();
   } // end Phase B
 
@@ -991,7 +969,8 @@ lexer(LexerCtx<I, J> ctx, uint8_t* d_string, terminal_t* d_terminals, J* d_start
       } else {
         is_next_produce &= is_not_ignore;
       }
-      int s_prev = (lid == 0) ? INIT_STATE : eval_endo(states[shmem_prev], INIT_STATE);
+      int s_prev = (lid == 0) ? block_entry_state
+                              : eval_endo(states[shmem_prev], INIT_STATE);
       bool this_produce = is_produce_transition(s_prev, s_cur);
       start_code = this_produce ? (uint32_t)(gid + 1) : 0u;
     }
