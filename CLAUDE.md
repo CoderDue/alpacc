@@ -12,8 +12,10 @@ Alpacc (Array Language Parallelism-Accelerated Compiler Compiler) is a parallel 
 cabal build all              # Build library and executable
 cabal build alpacc           # Build just the executable
 cabal build lib:alpacc       # Build just the library
-cabal install --installdir=~/bin --overwrite-policy=always  # Install binary
+cabal install --installdir=$HOME/.local/bin --overwrite-policy=always exe:alpacc  # Install binary
 ```
+
+**Never install to `~/bin`** — always use `~/.local/bin`. A stale `~/bin/alpacc` shadows the correct copy on PATH and causes benchmarks/tests to silently run against outdated codegen.
 
 Run the tool directly during development:
 ```bash

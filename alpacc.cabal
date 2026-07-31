@@ -143,6 +143,7 @@ executable alpacc
     , process
     , directory
     , temporary
+    , array
 
   hs-source-dirs:     app
 

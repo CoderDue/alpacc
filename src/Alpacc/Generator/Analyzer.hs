@@ -19,7 +19,7 @@ import Alpacc.Lexer.Encode (IntParallelLexer (..), intParallelLexer, stateIntTyp
 import Alpacc.Lexer.ParallelLexing
 import Alpacc.Lexer.RegularExpression
 import Alpacc.Types
-import Alpacc.Lexer.FSA (accepting, enumerateLexer, fsa, states, tokenMap)
+import Alpacc.Lexer.FSA (accepting, enumerateLexer, fsa, producesToken, states, tokenMap)
 import Data.Either.Extra
 import Data.Map qualified as Map
 import Data.Set qualified as Set
@@ -42,7 +42,8 @@ data Lexer
     rawEndoTable :: Map.Map Word8 Endomorphism,
     numDfaStates :: Int,
     acceptingDfaStates :: Set.Set Int,
-    dfaStateTerminals :: Map.Map Int Integer
+    dfaStateTerminals :: Map.Map Int Integer,
+    producingTransitions :: Set.Set (Int, Word8)
   }
   deriving (Show)
 
@@ -139,7 +140,8 @@ mkLexer cfg = do
                 rawEndoTable = raw_endo,
                 numDfaStates = n_dfa_states,
                 acceptingDfaStates = accept_states,
-                dfaStateTerminals = state_terminal_map
+                dfaStateTerminals = state_terminal_map,
+                producingTransitions = producesToken enum_dfa
               },
         terminalToName = terminal_to_name,
         terminalType = terminal_type,
@@ -249,7 +251,8 @@ mkLexerParser cfg = do
                   rawEndoTable = raw_endo,
                   numDfaStates = n_dfa_states,
                   acceptingDfaStates = accept_states,
-                  dfaStateTerminals = state_terminal_map
+                  dfaStateTerminals = state_terminal_map,
+                  producingTransitions = producesToken enum_dfa
                 }
             )
             ( Parser
