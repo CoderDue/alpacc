@@ -4,7 +4,7 @@
 #
 # Usage:
 #   sweep-cuda-lexer.sh <grammar.alp> [dataset.inputs] \
-#                       [BS_LIST] [IPT_LIST] [STATE_LIST] [INDEX_LIST]
+#                       [BS_LIST] [IPT_LIST] [STATE_LIST] [INDEX_LIST] [MAXREG_LIST]
 #
 # All list arguments are space-separated inside a single argv slot, e.g.
 #   sweep-cuda-lexer.sh json.alp data.inputs "128 256" "2 4 8 16" ...
@@ -15,6 +15,8 @@
 #   IPT_LIST    = "8 12 16 20"
 #   STATE_LIST  = "uint8_t"   (state_t is now endo_t fixed by codegen; this is a dummy)
 #   INDEX_LIST  = "int32_t"
+#   MAXREG_LIST = "none"      (values are integers passed to nvcc as
+#                              -maxrregcount=N; "none" leaves the flag off)
 #
 # For each (state_t, index_t) the script:
 #   1. Generates the .cu once via `alpacc cuda --lexer` (no --index32 flag —
@@ -35,7 +37,7 @@ set -euo pipefail
 
 show_usage() {
     cat <<EOF
-Usage: $0 <grammar.alp> [dataset.inputs] [BS_LIST] [IPT_LIST] [STATE_LIST] [INDEX_LIST]
+Usage: $0 <grammar.alp> [dataset.inputs] [BS_LIST] [IPT_LIST] [STATE_LIST] [INDEX_LIST] [MAXREG_LIST]
 
 Positional args:
   grammar.alp   grammar to lex
@@ -48,6 +50,8 @@ Positional args:
                 (default: "uint8_t"; state_t is now endo_t fixed by codegen, this is a dummy)
   INDEX_LIST    space-separated C++ typedefs for index_t
                 (default: "int32_t")
+  MAXREG_LIST   space-separated -maxrregcount values, or "none" to omit
+                the flag entirely (default: "none")
 
 Environment:
   INPUT_SIZE    passed to the sibling Makefile when generating the dataset
@@ -82,6 +86,8 @@ IPT_LIST="${1:-8 12 16 20}"
 STATE_LIST="${1:-uint8_t}"
 [ $# -ge 1 ] && shift
 INDEX_LIST="${1:-int32_t}"
+[ $# -ge 1 ] && shift
+MAXREG_LIST="${1:-none}"
 [ $# -ge 1 ] && shift
 
 INPUT_SIZE="${INPUT_SIZE:-10485760}"
@@ -123,7 +129,7 @@ fi
 ARTIFACT_DIR="$REPO_ROOT/.claude-artifacts/sweep-${GRAMMAR_NAME}-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$ARTIFACT_DIR"
 SUMMARY_TSV="$ARTIFACT_DIR/summary.tsv"
-printf 'state_t\tindex_t\tblock_size\titems_per_thread\tkernel_us\tinput_gbps\tbytes\n' > "$SUMMARY_TSV"
+printf 'state_t\tindex_t\tblock_size\titems_per_thread\tmaxreg\tkernel_us\tinput_gbps\tbytes\n' > "$SUMMARY_TSV"
 
 echo "[info] grammar   : $GRAMMAR"
 echo "[info] dataset   : $INPUT_FILE"
@@ -132,6 +138,7 @@ echo "[info] BS list   : $BS_LIST"
 echo "[info] IPT list  : $IPT_LIST"
 echo "[info] STATE list: $STATE_LIST"
 echo "[info] INDEX list: $INDEX_LIST"
+echo "[info] MAXREG list: $MAXREG_LIST"
 
 # Detect the SM arch once so we can pin it across the sweep (avoids the
 # arch table changing under our feet if the auto-probe ever picked
@@ -155,8 +162,8 @@ generate_cu() {
 
 # Format-preserving `printf` for the winner line.
 print_winner() {
-    printf '  → best: BS=%-3s IPT=%-3s kernel=%s us (%s GB/s input)\n' \
-           "$1" "$2" "$3" "$4"
+    printf '  → best: BS=%-3s IPT=%-3s MAXREG=%-4s kernel=%s us (%s GB/s input)\n' \
+           "$1" "$2" "$3" "$4" "$5"
 }
 
 # For each (state_t, index_t) combo, generate the .cu once and sweep.
@@ -175,70 +182,76 @@ for state_t in $STATE_LIST; do
         best_gbps=""
         best_bs=""
         best_ipt=""
+        best_maxreg=""
         best_bytes=""
         echo
         echo "=== state_t=$state_t  index_t=$index_t ==="
 
         for bs in $BS_LIST; do
             for ipt in $IPT_LIST; do
-                bin="$combo_dir/lexer-${bs}-${ipt}"
-                buildlog="$combo_dir/build-${bs}-${ipt}.log"
+                for maxreg in $MAXREG_LIST; do
+                    bin="$combo_dir/lexer-${bs}-${ipt}-${maxreg}"
+                    buildlog="$combo_dir/build-${bs}-${ipt}-${maxreg}.log"
 
-                if ! nvcc -O3 -std=c++17 -arch=native \
-                        -DALPACC_STATE_T="$state_t" \
-                        -DALPACC_INDEX_T="$index_t" \
-                        -DALPACC_BLOCK_SIZE="$bs" \
-                        -DALPACC_ITEMS_PER_THREAD="$ipt" \
-                        -o "$bin" "$cu_file" \
-                        >"$buildlog" 2>&1; then
-                    if grep -q "uses too much shared data" "$buildlog"; then
-                        printf '  BS=%-3s IPT=%-3s : shmem-overflow, skipped\n' "$bs" "$ipt"
-                    elif grep -q "static assertion failed" "$buildlog"; then
-                        printf '  BS=%-3s IPT=%-3s : static_assert (illegal config), skipped\n' "$bs" "$ipt"
-                    else
-                        printf '  BS=%-3s IPT=%-3s : build failed (see %s)\n' "$bs" "$ipt" "$buildlog"
+                    nvcc_maxreg_flag=()
+                    if [ "$maxreg" != "none" ]; then
+                        nvcc_maxreg_flag=(-maxrregcount="$maxreg")
                     fi
-                    continue
-                fi
 
-                runlog="$combo_dir/run-${bs}-${ipt}.log"
-                if ! "$bin" --benchmark "$BENCH_RUNS" --warmup "$BENCH_WARMUP" \
-                        < "$INPUT_FILE" > "$runlog" 2>&1; then
-                    printf '  BS=%-3s IPT=%-3s : runtime failure (see %s)\n' "$bs" "$ipt" "$runlog"
-                    continue
-                fi
+                    if ! nvcc -O3 -std=c++17 -arch=native \
+                            "${nvcc_maxreg_flag[@]}" \
+                            -DALPACC_STATE_T="$state_t" \
+                            -DALPACC_INDEX_T="$index_t" \
+                            -DALPACC_BLOCK_SIZE="$bs" \
+                            -DALPACC_ITEMS_PER_THREAD="$ipt" \
+                            -o "$bin" "$cu_file" \
+                            >"$buildlog" 2>&1; then
+                        if grep -q "uses too much shared data" "$buildlog"; then
+                            printf '  BS=%-3s IPT=%-3s MAXREG=%-4s : shmem-overflow, skipped\n' "$bs" "$ipt" "$maxreg"
+                        elif grep -q "static assertion failed" "$buildlog"; then
+                            printf '  BS=%-3s IPT=%-3s MAXREG=%-4s : static_assert (illegal config), skipped\n' "$bs" "$ipt" "$maxreg"
+                        else
+                            printf '  BS=%-3s IPT=%-3s MAXREG=%-4s : build failed (see %s)\n' "$bs" "$ipt" "$maxreg" "$buildlog"
+                        fi
+                        continue
+                    fi
 
-                # Parse the kernel-only line, e.g.:
-                #   lex_int (cuda, 22198933 bytes, 10535757 tokens):
-                #           2926μs (95% CI: [...]); 33GB/s (8GB/s input-only)
-                local_line=$(grep -m1 -E "lex_int .cuda," "$runlog" || true)
-                data_line=$(grep -A1 -m1 -E "lex_int .cuda," "$runlog" | tail -1 || true)
-                us=$(echo "$data_line" | grep -oE '^[[:space:]]*[0-9]+μs' | head -1 | grep -oE '[0-9]+')
-                gbps=$(echo "$data_line" | grep -oE '[0-9]+GB/s \([0-9]+GB/s input-only\)' | head -1 | grep -oE '\([0-9]+GB/s' | grep -oE '[0-9]+')
-                bytes=$(echo "$local_line" | grep -oE '[0-9]+ bytes' | head -1 | grep -oE '[0-9]+')
-                if [ -z "$us" ]; then
-                    printf '  BS=%-3s IPT=%-3s : could not parse timing (see %s)\n' "$bs" "$ipt" "$runlog"
-                    continue
-                fi
+                    runlog="$combo_dir/run-${bs}-${ipt}-${maxreg}.log"
+                    if ! "$bin" --benchmark "$BENCH_RUNS" --warmup "$BENCH_WARMUP" \
+                            < "$INPUT_FILE" > "$runlog" 2>&1; then
+                        printf '  BS=%-3s IPT=%-3s MAXREG=%-4s : runtime failure (see %s)\n' "$bs" "$ipt" "$maxreg" "$runlog"
+                        continue
+                    fi
 
-                printf '  BS=%-3s IPT=%-3s : %6s us, %s GB/s input-only\n' "$bs" "$ipt" "$us" "$gbps"
-                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-                    "$state_t" "$index_t" "$bs" "$ipt" "$us" "$gbps" "$bytes" \
-                    >> "$SUMMARY_TSV"
+                    local_line=$(grep -m1 -E "lex_int .cuda," "$runlog" || true)
+                    data_line=$(grep -A1 -m1 -E "lex_int .cuda," "$runlog" | tail -1 || true)
+                    us=$(echo "$data_line" | grep -oE '^[[:space:]]*[0-9]+μs' | head -1 | grep -oE '[0-9]+')
+                    gbps=$(echo "$data_line" | grep -oE '[0-9]+GB/s \([0-9]+GB/s input-only\)' | head -1 | grep -oE '\([0-9]+GB/s' | grep -oE '[0-9]+')
+                    bytes=$(echo "$local_line" | grep -oE '[0-9]+ bytes' | head -1 | grep -oE '[0-9]+')
+                    if [ -z "$us" ]; then
+                        printf '  BS=%-3s IPT=%-3s MAXREG=%-4s : could not parse timing (see %s)\n' "$bs" "$ipt" "$maxreg" "$runlog"
+                        continue
+                    fi
 
-                if [ -z "$best_us" ] || [ "$us" -lt "$best_us" ]; then
-                    best_us="$us"; best_gbps="$gbps"
-                    best_bs="$bs"; best_ipt="$ipt"; best_bytes="$bytes"
-                fi
+                    printf '  BS=%-3s IPT=%-3s MAXREG=%-4s : %6s us, %s GB/s input-only\n' "$bs" "$ipt" "$maxreg" "$us" "$gbps"
+                    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                        "$state_t" "$index_t" "$bs" "$ipt" "$maxreg" "$us" "$gbps" "$bytes" \
+                        >> "$SUMMARY_TSV"
 
-                if [ "$KEEP_LOGS" != "1" ]; then
-                    rm -f "$buildlog" "$runlog"
-                fi
+                    if [ -z "$best_us" ] || [ "$us" -lt "$best_us" ]; then
+                        best_us="$us"; best_gbps="$gbps"
+                        best_bs="$bs"; best_ipt="$ipt"; best_maxreg="$maxreg"; best_bytes="$bytes"
+                    fi
+
+                    if [ "$KEEP_LOGS" != "1" ]; then
+                        rm -f "$buildlog" "$runlog"
+                    fi
+                done
             done
         done
 
         if [ -n "$best_us" ]; then
-            print_winner "$best_bs" "$best_ipt" "$best_us" "$best_gbps"
+            print_winner "$best_bs" "$best_ipt" "$best_maxreg" "$best_us" "$best_gbps"
         else
             echo "  (no successful build for this combo)"
         fi
@@ -262,18 +275,18 @@ if command -v awk >/dev/null 2>&1; then
     winners="$ARTIFACT_DIR/winners.tsv"
     awk -F'\t' 'NR>1 {
         key = $1"\t"$2
-        if (!(key in best) || $5+0 < best[key]+0) {
-            best[key] = $5; bs[key] = $3; ipt[key] = $4; gb[key] = $6
+        if (!(key in best) || $6+0 < best[key]+0) {
+            best[key] = $6; bs[key] = $3; ipt[key] = $4; mr[key] = $5; gb[key] = $7
         }
     } END {
         for (k in best) {
             split(k, p, "\t")
-            printf "%s\t%s\t%s\t%s\t%s\t%s\n", p[1], p[2], bs[k], ipt[k], best[k], gb[k]
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", p[1], p[2], bs[k], ipt[k], mr[k], best[k], gb[k]
         }
     }' "$SUMMARY_TSV" | sort > "$winners"
-    printf '  %-10s %-10s %-4s %-4s %-10s %-8s\n' \
-        "state_t" "index_t" "BS" "IPT" "kernel_us" "GB/s"
-    awk -F'\t' '{ printf "  %-10s %-10s %-4s %-4s %-10s %-8s\n", $1, $2, $3, $4, $5, $6 }' \
+    printf '  %-10s %-10s %-4s %-4s %-6s %-10s %-8s\n' \
+        "state_t" "index_t" "BS" "IPT" "MAXREG" "kernel_us" "GB/s"
+    awk -F'\t' '{ printf "  %-10s %-10s %-4s %-4s %-6s %-10s %-8s\n", $1, $2, $3, $4, $5, $6, $7 }' \
         "$winners"
 fi
 
