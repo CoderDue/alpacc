@@ -28,6 +28,7 @@
 #   IPT_LIST     items-per-thread values (default: "2 4 6 8 12 16 20 26 32")
 #   STATE_LIST   state_t typedefs       (default: "uint16_t uint32_t")
 #   INDEX_LIST   index_t typedefs       (default: "int32_t int64_t")
+#   MAXREG_LIST  nvcc -maxrregcount values or "none" (default: "none")
 #   BENCH_RUNS   --benchmark N per config (default: 5)
 #   BENCH_WARMUP --warmup N              (default: 2)
 #
@@ -71,6 +72,7 @@ BS_LIST="${BS_LIST:-128 256}"
 IPT_LIST="${IPT_LIST:-2 4 6 8 12 16 20 26 32}"
 STATE_LIST="${STATE_LIST:-uint16_t uint32_t}"
 INDEX_LIST="${INDEX_LIST:-int32_t int64_t}"
+MAXREG_LIST="${MAXREG_LIST:-none}"
 export BENCH_RUNS="${BENCH_RUNS:-5}"
 export BENCH_WARMUP="${BENCH_WARMUP:-2}"
 export INPUT_SIZE
@@ -93,9 +95,10 @@ echo "    BS_LIST    = $BS_LIST"
 echo "    IPT_LIST   = $IPT_LIST"
 echo "    STATE_LIST = $STATE_LIST"
 echo "    INDEX_LIST = $INDEX_LIST"
+echo "    MAXREG_LIST= $MAXREG_LIST"
 
 bash benchmarks/sweep-cuda-lexer.sh "$GRAMMAR" "$DATASET" \
-     "$BS_LIST" "$IPT_LIST" "$STATE_LIST" "$INDEX_LIST"
+     "$BS_LIST" "$IPT_LIST" "$STATE_LIST" "$INDEX_LIST" "$MAXREG_LIST"
 
 # --- Bundle artifacts for retrieval ---
 LATEST_ARTIFACTS=$(ls -1dt .claude-artifacts/sweep-${GRAMMAR_NAME}-* 2>/dev/null | head -1)
